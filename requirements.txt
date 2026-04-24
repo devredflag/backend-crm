@@ -4,3 +4,5 @@ sqlalchemy
 psycopg2-binary
 passlib[bcrypt]
 PyJWT
+python-multipart
+fastapi-mail
