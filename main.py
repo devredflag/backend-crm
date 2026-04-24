@@ -18,6 +18,8 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 # CONFIG
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("🚨 DATABASE_URL não encontrada!")
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
