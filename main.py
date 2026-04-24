@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 import uuid
 import jwt
 import os
-
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+
+print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
 
 # =========================
 # CONFIG
@@ -20,6 +21,7 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("🚨 DATABASE_URL não encontrada!")
+    print("ENV:", dict(os.environ))
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
