@@ -10,13 +10,14 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import uuid
 import jwt
+import os
 
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 
 # =========================
 # CONFIG
 # =========================
-DATABASE_URL = "postgresql://admin:123456@localhost:5432/prospeccao_inteligente"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
