@@ -3,6 +3,7 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 passlib[bcrypt]
+pydantic[email]
 PyJWT
-python-multipart
 resend
+email-validator
