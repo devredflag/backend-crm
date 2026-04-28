@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import uuid
 import jwt
 import os
-from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+import resend
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
 
@@ -21,11 +21,12 @@ print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("🚨 DATABASE_URL não encontrada!")
-    print("ENV:", dict(os.environ))
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+resend.api_key = os.getenv("RESEND_API_KEY")
 
 engine = create_engine(DATABASE_URL)
 
@@ -40,21 +41,6 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-)
-
-# =========================
-# EMAIL CONFIG
-# =========================
-conf = ConnectionConfig(
-    MAIL_USERNAME="gabrielsantos2411.gs@gmail.com",
-    MAIL_PASSWORD="guxehvelkmnosjqd",
-    MAIL_FROM="gabrielsantos2411.gs@gmail.com",
-    MAIL_PORT=587,
-    MAIL_SERVER="smtp.gmail.com",
-    MAIL_STARTTLS=True,
-    MAIL_SSL_TLS=False,
-    USE_CREDENTIALS=True,
-    VALIDATE_CERTS=True
 )
 
 # =========================
@@ -80,21 +66,16 @@ def criar_token_acesso(data: dict):
 async def enviar_email(destino: str, token: str):
     link = f"http://localhost:3000/ativar?token={token}"
 
-    message = MessageSchema(
-        subject="Ative sua conta 🚀",
-        recipients=[destino],
-        body=f"""
-        Olá!
-
-        Clique no link abaixo para criar sua senha:
-
-        {link}
-        """,
-        subtype="plain"
-    )
-
-    fm = FastMail(conf)
-    await fm.send_message(message)
+    resend.Emails.send({
+        "from": "onboarding@resend.dev",
+        "to": destino,
+        "subject": "Ative sua conta 🚀",
+        "html": f"""
+            <p>Olá!</p>
+            <p>Clique no link abaixo para criar sua senha:</p>
+            <p><a href="{link}">{link}</a></p>
+        """
+    })
 
 # =========================
 # MODELOS
@@ -314,7 +295,6 @@ def criar_contato(contato: dict):
                 "email": contato.get("email"),
                 "celular": contato.get("celular"),
                 "observacoes": contato.get("observacoes"),
-
                 "prioridade": contato.get("prioridade"),
                 "whatsapp": contato.get("whatsapp"),
                 "linkedin": contato.get("linkedin"),
