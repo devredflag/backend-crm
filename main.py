@@ -64,7 +64,7 @@ def criar_token_acesso(data: dict):
 # EMAIL
 # =========================
 async def enviar_email(destino: str, token: str):
-    link = f"http://localhost:3000/ativar?token={token}"
+    link = f"https://frontend-crm-xi-plum.vercel.app/ativar?token={token}"
 
     resend.Emails.send({
         "from": "onboarding@resend.dev",
