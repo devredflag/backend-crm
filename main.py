@@ -280,22 +280,12 @@ async def criar_usuario(usuario: UsuarioCreate):
             conn.execute(
                 text("""
                     INSERT INTO usuarios (
-                        usuario_id,
-                        nome,
-                        email,
-                        telefone,
-                        ativo,
-                        token_ativacao,
-                        data_criacao
+                        usuario_id, nome, email, telefone,
+                        ativo, token_ativacao, data_criacao
                     )
                     VALUES (
-                        :usuario_id,
-                        :nome,
-                        :email,
-                        :telefone,
-                        FALSE,
-                        :token,
-                        NOW()
+                        :usuario_id, :nome, :email, :telefone,
+                        FALSE, :token, NOW()
                     )
                 """),
                 {
@@ -308,7 +298,6 @@ async def criar_usuario(usuario: UsuarioCreate):
             )
 
         await enviar_email(usuario.email, token_ativacao)
-
         return {"msg": "Usuário criado. Verifique seu email 📩"}
 
     except IntegrityError:
@@ -365,10 +354,21 @@ def criar_empresa(empresa: EmpresaCreate):
             }
         )
 
-    return {
-        "msg": "Empresa criada com sucesso 🚀",
-        "id": empresa_id
-    }
+    return {"msg": "Empresa criada com sucesso 🚀", "id": empresa_id}
+
+
+# =========================
+# LISTAR CONTATOS DA EMPRESA
+# =========================
+@app.get("/contatos/{empresa_id}")
+def listar_contatos_empresa(empresa_id: str):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM contatos WHERE empresa_id = :id"),
+            {"id": empresa_id}
+        )
+        contatos = [dict(row._mapping) for row in result]
+    return contatos
 
 
 # =========================
@@ -381,36 +381,14 @@ def criar_contato(contato: dict):
         conn.execute(
             text("""
                 INSERT INTO contatos (
-                    contato_id,
-                    empresa_id,
-                    nome,
-                    funcao,
-                    email,
-                    celular,
-                    observacoes,
-                    prioridade,
-                    whatsapp,
-                    linkedin,
-                    nivel_influencia,
-                    decisor,
-                    data_ultimo_contato,
-                    canal_preferido
+                    contato_id, empresa_id, nome, funcao, email, celular,
+                    observacoes, prioridade, whatsapp, linkedin,
+                    nivel_influencia, decisor, data_ultimo_contato, canal_preferido
                 )
                 VALUES (
-                    :id,
-                    :empresa_id,
-                    :nome,
-                    :funcao,
-                    :email,
-                    :celular,
-                    :observacoes,
-                    :prioridade,
-                    :whatsapp,
-                    :linkedin,
-                    :nivel_influencia,
-                    :decisor,
-                    :data_ultimo_contato,
-                    :canal_preferido
+                    :id, :empresa_id, :nome, :funcao, :email, :celular,
+                    :observacoes, :prioridade, :whatsapp, :linkedin,
+                    :nivel_influencia, :decisor, :data_ultimo_contato, :canal_preferido
                 )
             """),
             {
@@ -446,16 +424,11 @@ def ativar_conta(dados: AtivarConta):
         result = conn.execute(
             text("""
                 UPDATE usuarios
-                SET senha_hash = :senha,
-                    ativo = TRUE,
-                    token_ativacao = NULL
+                SET senha_hash = :senha, ativo = TRUE, token_ativacao = NULL
                 WHERE token_ativacao = :token
                 RETURNING usuario_id
             """),
-            {
-                "senha": senha_hash,
-                "token": dados.token
-            }
+            {"senha": senha_hash, "token": dados.token}
         ).fetchone()
 
         if not result:
@@ -489,7 +462,4 @@ def login(dados: Login):
 
     token = criar_token_acesso({"sub": usuario["email"]})
 
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    return {"access_token": token, "token_type": "bearer"}
