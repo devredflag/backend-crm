@@ -1,8 +1,9 @@
 # =========================
 # IMPORTAÇÕES
 # =========================
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -29,6 +30,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 resend.api_key = os.getenv("RESEND_API_KEY")
 
 engine = create_engine(DATABASE_URL)
+security = HTTPBearer()
 
 app = FastAPI()
 
@@ -60,12 +62,24 @@ def criar_token_acesso(data: dict):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(401, "Token inválido")
+        return email
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expirado")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Token inválido")
+
 # =========================
 # EMAIL
 # =========================
 async def enviar_email(destino: str, token: str):
     link = f"https://frontend-crm-xi-plum.vercel.app/ativar?token={token}"
-
     resend.Emails.send({
         "from": "onboarding@resend.dev",
         "to": destino,
@@ -84,6 +98,14 @@ class UsuarioCreate(BaseModel):
     nome: str
     email: EmailStr
     telefone: str | None = None
+
+
+class UsuarioUpdate(BaseModel):
+    nome: str | None = None
+    telefone: str | None = None
+    cargo: str | None = None
+    empresa_nome: str | None = None
+    bio: str | None = None
 
 
 class EmpresaCreate(BaseModel):
@@ -130,15 +152,6 @@ class EmpresaUpdate(BaseModel):
     temperatura: str | None = None
 
 
-class ContatoCreate(BaseModel):
-    empresa_id: str
-    nome: str
-    funcao: str | None = None
-    email: str | None = None
-    celular: str | None = None
-    observacoes: str | None = None
-
-
 class AtivarConta(BaseModel):
     token: str
     senha: str
@@ -161,6 +174,46 @@ class Token(BaseModel):
 @app.get("/")
 def home():
     return {"msg": "API rodando 🚀"}
+
+
+# =========================
+# MEU PERFIL
+# =========================
+@app.get("/me")
+def get_me(email: str = Depends(get_current_user)):
+    with engine.connect() as conn:
+        usuario = conn.execute(
+            text("SELECT usuario_id, nome, email, telefone, cargo, empresa_nome, bio, data_criacao FROM usuarios WHERE email = :email"),
+            {"email": email}
+        ).fetchone()
+    if not usuario:
+        raise HTTPException(404, "Usuário não encontrado")
+    return dict(usuario._mapping)
+
+
+@app.put("/me")
+def update_me(dados: UsuarioUpdate, email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE usuarios SET
+                    nome = COALESCE(:nome, nome),
+                    telefone = COALESCE(:telefone, telefone),
+                    cargo = COALESCE(:cargo, cargo),
+                    empresa_nome = COALESCE(:empresa_nome, empresa_nome),
+                    bio = COALESCE(:bio, bio)
+                WHERE email = :email
+            """),
+            {
+                "nome": dados.nome,
+                "telefone": dados.telefone,
+                "cargo": dados.cargo,
+                "empresa_nome": dados.empresa_nome,
+                "bio": dados.bio,
+                "email": email,
+            }
+        )
+    return {"msg": "Perfil atualizado com sucesso 🚀"}
 
 
 # =========================
@@ -201,7 +254,6 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
         ).fetchone()
         if not result:
             raise HTTPException(404, "Empresa não encontrada")
-
         conn.execute(
             text("""
                 UPDATE empresas SET
@@ -272,9 +324,7 @@ def deletar_empresa(empresa_id: str):
 # =========================
 @app.post("/usuarios", status_code=201)
 async def criar_usuario(usuario: UsuarioCreate):
-
     token_ativacao = str(uuid.uuid4())
-
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -296,10 +346,8 @@ async def criar_usuario(usuario: UsuarioCreate):
                     "token": token_ativacao
                 }
             )
-
         await enviar_email(usuario.email, token_ativacao)
         return {"msg": "Usuário criado. Verifique seu email 📩"}
-
     except IntegrityError:
         raise HTTPException(400, "Email já cadastrado")
 
@@ -309,9 +357,7 @@ async def criar_usuario(usuario: UsuarioCreate):
 # =========================
 @app.post("/empresas")
 def criar_empresa(empresa: EmpresaCreate):
-
     empresa_id = str(uuid.uuid4())
-
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -353,7 +399,6 @@ def criar_empresa(empresa: EmpresaCreate):
                 "temperatura": empresa.temperatura
             }
         )
-
     return {"msg": "Empresa criada com sucesso 🚀", "id": empresa_id}
 
 
@@ -376,7 +421,6 @@ def listar_contatos_empresa(empresa_id: str):
 # =========================
 @app.post("/contatos")
 def criar_contato(contato: dict):
-
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -408,7 +452,6 @@ def criar_contato(contato: dict):
                 "canal_preferido": contato.get("canal_preferido"),
             }
         )
-
     return {"msg": "Contato criado com sucesso 🚀"}
 
 
@@ -417,9 +460,7 @@ def criar_contato(contato: dict):
 # =========================
 @app.post("/ativar-conta")
 def ativar_conta(dados: AtivarConta):
-
     senha_hash = hash_senha(dados.senha)
-
     with engine.begin() as conn:
         result = conn.execute(
             text("""
@@ -430,10 +471,8 @@ def ativar_conta(dados: AtivarConta):
             """),
             {"senha": senha_hash, "token": dados.token}
         ).fetchone()
-
         if not result:
             raise HTTPException(400, "Token inválido")
-
     return {"msg": "Conta ativada com sucesso 🚀"}
 
 
@@ -442,7 +481,6 @@ def ativar_conta(dados: AtivarConta):
 # =========================
 @app.post("/login", response_model=Token)
 def login(dados: Login):
-
     with engine.connect() as conn:
         usuario = conn.execute(
             text("SELECT * FROM usuarios WHERE email = :email"),
