@@ -142,6 +142,17 @@ def home():
 
 
 # =========================
+# LISTAR EMPRESAS
+# =========================
+@app.get("/empresas")
+def listar_empresas():
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM empresas"))
+        empresas = [dict(row._mapping) for row in result]
+    return empresas
+
+
+# =========================
 # CRIAR USUÁRIO
 # =========================
 @app.post("/usuarios", status_code=201)
