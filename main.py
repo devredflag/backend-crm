@@ -108,6 +108,28 @@ class EmpresaCreate(BaseModel):
     temperatura: str | None = None
 
 
+class EmpresaUpdate(BaseModel):
+    nome: str | None = None
+    segmento: str | None = None
+    porte: str | None = None
+    cidade: str | None = None
+    endereco: str | None = None
+    cep: str | None = None
+    bairro: str | None = None
+    regiao: str | None = None
+    observacoes: str | None = None
+    cnpj: str | None = None
+    site: str | None = None
+    linkedin_empresa: str | None = None
+    responsavel_principal: str | None = None
+    ticket_medio_estimado: float | None = None
+    status: str | None = None
+    origem_lead: str | None = None
+    ultima_interacao: datetime | None = None
+    proxima_acao: str | None = None
+    temperatura: str | None = None
+
+
 class ContatoCreate(BaseModel):
     empresa_id: str
     nome: str
@@ -150,6 +172,99 @@ def listar_empresas():
         result = conn.execute(text("SELECT * FROM empresas"))
         empresas = [dict(row._mapping) for row in result]
     return empresas
+
+
+# =========================
+# BUSCAR EMPRESA POR ID
+# =========================
+@app.get("/empresas/{empresa_id}")
+def buscar_empresa(empresa_id: str):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM empresas WHERE empresa_id = :id"),
+            {"id": empresa_id}
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Empresa não encontrada")
+    return dict(result._mapping)
+
+
+# =========================
+# ATUALIZAR EMPRESA
+# =========================
+@app.put("/empresas/{empresa_id}")
+def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("SELECT empresa_id FROM empresas WHERE empresa_id = :id"),
+            {"id": empresa_id}
+        ).fetchone()
+        if not result:
+            raise HTTPException(404, "Empresa não encontrada")
+
+        conn.execute(
+            text("""
+                UPDATE empresas SET
+                    nome = COALESCE(:nome, nome),
+                    segmento = COALESCE(:segmento, segmento),
+                    porte = COALESCE(:porte, porte),
+                    cidade = COALESCE(:cidade, cidade),
+                    endereco = COALESCE(:endereco, endereco),
+                    cep = COALESCE(:cep, cep),
+                    bairro = COALESCE(:bairro, bairro),
+                    regiao = COALESCE(:regiao, regiao),
+                    observacoes = COALESCE(:observacoes, observacoes),
+                    cnpj = COALESCE(:cnpj, cnpj),
+                    site = COALESCE(:site, site),
+                    linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
+                    responsavel_principal = COALESCE(:responsavel_principal, responsavel_principal),
+                    ticket_medio_estimado = COALESCE(:ticket_medio_estimado, ticket_medio_estimado),
+                    status = COALESCE(:status, status),
+                    origem_lead = COALESCE(:origem_lead, origem_lead),
+                    ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
+                    proxima_acao = COALESCE(:proxima_acao, proxima_acao),
+                    temperatura = COALESCE(:temperatura, temperatura)
+                WHERE empresa_id = :id
+            """),
+            {
+                "id": empresa_id,
+                "nome": empresa.nome,
+                "segmento": empresa.segmento,
+                "porte": empresa.porte,
+                "cidade": empresa.cidade,
+                "endereco": empresa.endereco,
+                "cep": empresa.cep,
+                "bairro": empresa.bairro,
+                "regiao": empresa.regiao,
+                "observacoes": empresa.observacoes,
+                "cnpj": empresa.cnpj,
+                "site": empresa.site,
+                "linkedin_empresa": empresa.linkedin_empresa,
+                "responsavel_principal": empresa.responsavel_principal,
+                "ticket_medio_estimado": empresa.ticket_medio_estimado,
+                "status": empresa.status,
+                "origem_lead": empresa.origem_lead,
+                "ultima_interacao": empresa.ultima_interacao,
+                "proxima_acao": empresa.proxima_acao,
+                "temperatura": empresa.temperatura,
+            }
+        )
+    return {"msg": "Empresa atualizada com sucesso 🚀"}
+
+
+# =========================
+# DELETAR EMPRESA
+# =========================
+@app.delete("/empresas/{empresa_id}")
+def deletar_empresa(empresa_id: str):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"),
+            {"id": empresa_id}
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Empresa não encontrada")
+    return {"msg": "Empresa deletada com sucesso"}
 
 
 # =========================
