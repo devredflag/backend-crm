@@ -232,6 +232,8 @@ class EmpresaCreate(BaseModel):
     origem_lead: str | None = None
     ultima_interacao: datetime | None = None
     proxima_acao: str | None = None
+    data_proxima_acao: date | None = None
+    motivo_perdido: str | None = None
     temperatura: str | None = None
 
 class EmpresaUpdate(BaseModel):
@@ -253,6 +255,8 @@ class EmpresaUpdate(BaseModel):
     origem_lead: str | None = None
     ultima_interacao: datetime | None = None
     proxima_acao: str | None = None
+    data_proxima_acao: date | None = None
+    motivo_perdido: str | None = None
     temperatura: str | None = None
 
 class SegmentoCreate(BaseModel):
@@ -353,6 +357,21 @@ def salvar_segmento(conn, nome: str) -> str:
         {"id": str(uuid.uuid4()), "nome": nome_limpo, "nome_normalizado": normalizar_texto(nome_limpo)}
     )
     return nome_limpo
+
+def garantir_campos_pipeline(conn):
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS data_proxima_acao date"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS status_atualizado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS motivo_perdido text"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS empresa_status_historico (
+            historico_id uuid PRIMARY KEY,
+            empresa_id uuid NOT NULL,
+            status_anterior character varying(50),
+            status_novo character varying(50) NOT NULL,
+            observacao text,
+            alterado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
 
 # =========================
 # ROTAS BÁSICAS
@@ -499,19 +518,58 @@ def criar_segmento(segmento: SegmentoCreate):
 # =========================
 @app.get("/empresas")
 def listar_empresas():
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT * FROM empresas"))
+    with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
+        result = conn.execute(text("""
+            SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
+            FROM empresas e
+            LEFT JOIN LATERAL (
+                SELECT email, celular, whatsapp
+                FROM contatos
+                WHERE empresa_id = e.empresa_id
+                ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST
+                LIMIT 1
+            ) c ON TRUE
+            ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
+        """))
         return [dict(row._mapping) for row in result]
 
 @app.get("/empresas/{empresa_id}")
 def buscar_empresa(empresa_id: str):
-    with engine.connect() as conn:
+    with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
         result = conn.execute(
-            text("SELECT * FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}
+            text("""
+                SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
+                FROM empresas e
+                LEFT JOIN LATERAL (
+                    SELECT email, celular, whatsapp
+                    FROM contatos
+                    WHERE empresa_id = e.empresa_id
+                    ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST
+                    LIMIT 1
+                ) c ON TRUE
+                WHERE e.empresa_id = :id
+            """), {"id": empresa_id}
         ).fetchone()
     if not result:
         raise HTTPException(404, "Empresa não encontrada")
     return dict(result._mapping)
+
+@app.get("/empresas/{empresa_id}/historico-status")
+def historico_status_empresa(empresa_id: str):
+    with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
+        result = conn.execute(
+            text("""
+                SELECT *
+                FROM empresa_status_historico
+                WHERE empresa_id = :id
+                ORDER BY alterado_em DESC
+            """),
+            {"id": empresa_id}
+        )
+        return [dict(row._mapping) for row in result]
 
 @app.post("/empresas")
 def criar_empresa(empresa: EmpresaCreate):
@@ -526,6 +584,7 @@ def criar_empresa(empresa: EmpresaCreate):
             )
 
     with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
         if segmento:
             segmento = salvar_segmento(conn, segmento)
 
@@ -534,11 +593,13 @@ def criar_empresa(empresa: EmpresaCreate):
                 INSERT INTO empresas (
                     empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
                     observacoes, cnpj, site, linkedin_empresa, responsavel_principal,
-                    ticket_medio_estimado, status, origem_lead, ultima_interacao, proxima_acao, temperatura
+                    ticket_medio_estimado, status, origem_lead, ultima_interacao, proxima_acao,
+                    data_proxima_acao, status_atualizado_em, motivo_perdido, temperatura
                 ) VALUES (
                     :id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
                     :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal,
-                    :ticket_medio_estimado, :status, :origem_lead, :ultima_interacao, :proxima_acao, :temperatura
+                    :ticket_medio_estimado, :status, :origem_lead, :ultima_interacao, :proxima_acao,
+                    :data_proxima_acao, NOW(), :motivo_perdido, :temperatura
                 )
             """),
             {
@@ -549,19 +610,31 @@ def criar_empresa(empresa: EmpresaCreate):
                 "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
                 "ticket_medio_estimado": None, "status": "Lead",
                 "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
-                "proxima_acao": empresa.proxima_acao, "temperatura": empresa.temperatura
+                "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
+                "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
             }
+        )
+        conn.execute(
+            text("""
+                INSERT INTO empresa_status_historico (
+                    historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em
+                ) VALUES (:id, :empresa_id, NULL, 'Lead', 'Cadastro inicial', NOW())
+            """),
+            {"id": str(uuid.uuid4()), "empresa_id": empresa_id}
         )
     return {"msg": "Empresa criada com sucesso 🚀", "id": empresa_id}
 
 @app.put("/empresas/{empresa_id}")
 def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
     with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
         result = conn.execute(
-            text("SELECT empresa_id FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}
+            text("SELECT empresa_id, status FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}
         ).fetchone()
         if not result:
             raise HTTPException(404, "Empresa não encontrada")
+        status_anterior = result._mapping.get("status")
+        status_mudou = empresa.status is not None and empresa.status != status_anterior
         conn.execute(
             text("""
                 UPDATE empresas SET
@@ -576,6 +649,15 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                     status = COALESCE(:status, status), origem_lead = COALESCE(:origem_lead, origem_lead),
                     ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
                     proxima_acao = COALESCE(:proxima_acao, proxima_acao),
+                    data_proxima_acao = COALESCE(:data_proxima_acao, data_proxima_acao),
+                    status_atualizado_em = CASE
+                        WHEN :status IS NOT NULL AND :status <> status THEN NOW()
+                        ELSE status_atualizado_em
+                    END,
+                    motivo_perdido = CASE
+                        WHEN :status IS NOT NULL AND :status <> 'Perdido' THEN NULL
+                        ELSE COALESCE(:motivo_perdido, motivo_perdido)
+                    END,
                     temperatura = COALESCE(:temperatura, temperatura)
                 WHERE empresa_id = :id
             """),
@@ -587,9 +669,25 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                 "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
                 "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status,
                 "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao,
-                "proxima_acao": empresa.proxima_acao, "temperatura": empresa.temperatura
+                "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
+                "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
             }
         )
+        if status_mudou:
+            conn.execute(
+                text("""
+                    INSERT INTO empresa_status_historico (
+                        historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em
+                    ) VALUES (:id, :empresa_id, :status_anterior, :status_novo, :observacao, NOW())
+                """),
+                {
+                    "id": str(uuid.uuid4()),
+                    "empresa_id": empresa_id,
+                    "status_anterior": status_anterior,
+                    "status_novo": empresa.status,
+                    "observacao": empresa.motivo_perdido if empresa.status == "Perdido" else None,
+                }
+            )
     return {"msg": "Empresa atualizada com sucesso 🚀"}
 
 @app.delete("/empresas/{empresa_id}")
