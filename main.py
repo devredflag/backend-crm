@@ -13,6 +13,8 @@ from typing import Optional
 import uuid
 import jwt
 import os
+import re
+import unicodedata
 import resend
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
@@ -45,6 +47,114 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+SEGMENTOS_PADRAO = [
+    "Academias e Fitness",
+    "Administracao de Condominios",
+    "Advocacia",
+    "Agencia de Marketing",
+    "Agencia de Publicidade",
+    "Agronegocio",
+    "Alimentos e Bebidas",
+    "Arquitetura e Urbanismo",
+    "Assistencia Tecnica",
+    "Atacado e Distribuicao",
+    "Automacao Industrial",
+    "Autopecas",
+    "Bares e Restaurantes",
+    "Beleza e Estetica",
+    "Biotecnologia",
+    "Clinicas Medicas",
+    "Comercio Exterior",
+    "Comercio Varejista",
+    "Concessionarias",
+    "Construcao Civil",
+    "Consultoria Empresarial",
+    "Contabilidade",
+    "Coworking",
+    "Cursos e Treinamentos",
+    "Decoracao",
+    "Distribuidora",
+    "E-commerce",
+    "Educacao",
+    "Energia",
+    "Energia Solar",
+    "Engenharia",
+    "Entretenimento",
+    "Escritorio de Projetos",
+    "Eventos",
+    "Farmacias e Drogarias",
+    "Financeiro",
+    "Franquias",
+    "Gestao de Pessoas",
+    "Hotelaria",
+    "Imobiliarias",
+    "Industria Alimenticia",
+    "Industria Automotiva",
+    "Industria Farmaceutica",
+    "Industria Metalurgica",
+    "Industria Textil",
+    "Logistica e Transporte",
+    "Manutencao Predial",
+    "Maquinas e Equipamentos",
+    "Materiais de Construcao",
+    "Moda e Vestuario",
+    "Moveis Planejados",
+    "Odontologia",
+    "Pet Shop",
+    "Produtos Agropecuarios",
+    "Recursos Humanos",
+    "Saude",
+    "Seguranca Eletronica",
+    "Seguros",
+    "Servicos de Limpeza",
+    "Servicos Financeiros",
+    "Software e SaaS",
+    "Supermercados",
+    "Tecnologia da Informacao",
+    "Telecomunicacoes",
+    "Turismo",
+    "Venda de Gado",
+    "Vendas B2B",
+    "Veterinaria",
+    "Agropecuaria",
+    "Clinicas Odontologicas",
+    "Confeitaria",
+    "Delivery",
+    "Grafica",
+    "Hospitais",
+    "Jardinagem e Paisagismo",
+    "Laboratorios",
+    "Laticinios",
+    "Lavanderias",
+    "Marcenaria",
+    "Padarias",
+    "Papelarias",
+    "Postos de Combustivel",
+    "Serralheria",
+    "Transportadoras",
+]
+
+PALAVRAS_CHAVE_SEGMENTO = {
+    "academia", "administracao", "advocacia", "agencia", "agro", "agronegocio",
+    "alimento", "arquitetura", "assistencia", "atacado", "automacao", "autopecas",
+    "bar", "beleza", "biotecnologia", "clinica", "comercio", "condominio",
+    "concessionaria", "construcao", "consultoria", "contabilidade", "coworking",
+    "curso", "decoracao", "distribuicao", "distribuidora", "ecommerce", "educacao",
+    "energia", "engenharia", "entretenimento", "escola", "evento", "farmacia",
+    "financeiro", "fitness", "franquia", "gado", "gestao", "hotel", "imobiliaria",
+    "industria", "limpeza", "logistica", "manutencao", "maquinas", "marketing",
+    "materiais", "medica", "metalurgica", "moda", "moveis", "odontologia",
+    "oficina", "papelaria", "pet", "projetos", "publicidade", "recursos",
+    "restaurante", "rh", "saas", "saude", "seguranca", "seguros", "servicos",
+    "software", "solar", "supermercado", "tecnologia", "telecomunicacoes",
+    "textil", "transporte", "turismo", "varejo", "vendas", "veterinaria",
+    "agropecuaria", "combustivel", "confeitaria", "contabil", "delivery",
+    "frigorifico", "grafica", "hospital", "jardinagem", "juridico",
+    "laboratorio", "laticinios", "lavanderia", "marcenaria", "padaria",
+    "paisagismo", "panificadora", "pecuaria", "posto", "rural",
+    "serralheria", "transportadora",
+}
 
 # =========================
 # SEGURANÇA
@@ -145,6 +255,9 @@ class EmpresaUpdate(BaseModel):
     proxima_acao: str | None = None
     temperatura: str | None = None
 
+class SegmentoCreate(BaseModel):
+    nome: str
+
 class EventoCreate(BaseModel):
     titulo: str
     tipo: str
@@ -176,6 +289,70 @@ class Login(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+# =========================
+# SEGMENTOS
+# =========================
+def normalizar_texto(valor: str) -> str:
+    sem_acentos = unicodedata.normalize("NFD", valor.lower())
+    sem_acentos = "".join(ch for ch in sem_acentos if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", sem_acentos).strip()
+
+def limpar_segmento(nome: str) -> str:
+    return re.sub(r"\s+", " ", nome.strip())[:120]
+
+def segmento_valido(nome: str) -> bool:
+    nome_limpo = limpar_segmento(nome)
+    normalizado = normalizar_texto(nome_limpo)
+    if len(normalizado) < 3 or not re.search(r"[a-z]", normalizado):
+        return False
+
+    segmentos_base = {normalizar_texto(segmento) for segmento in SEGMENTOS_PADRAO}
+    if normalizado in segmentos_base:
+        return True
+
+    palavras = set(re.findall(r"[a-z0-9]+", normalizado))
+    return bool(palavras & PALAVRAS_CHAVE_SEGMENTO)
+
+def garantir_tabela_segmentos(conn):
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS segmentos (
+            segmento_id uuid PRIMARY KEY,
+            nome character varying(120) NOT NULL,
+            nome_normalizado character varying(120) UNIQUE NOT NULL,
+            criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+
+    for segmento in SEGMENTOS_PADRAO:
+        nome = limpar_segmento(segmento)
+        conn.execute(
+            text("""
+                INSERT INTO segmentos (segmento_id, nome, nome_normalizado)
+                VALUES (:id, :nome, :nome_normalizado)
+                ON CONFLICT (nome_normalizado) DO NOTHING
+            """),
+            {"id": str(uuid.uuid4()), "nome": nome, "nome_normalizado": normalizar_texto(nome)}
+        )
+
+def salvar_segmento(conn, nome: str) -> str:
+    nome_limpo = limpar_segmento(nome)
+    if not segmento_valido(nome_limpo):
+        raise HTTPException(
+            400,
+            "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
+        )
+
+    garantir_tabela_segmentos(conn)
+    conn.execute(
+        text("""
+            INSERT INTO segmentos (segmento_id, nome, nome_normalizado)
+            VALUES (:id, :nome, :nome_normalizado)
+            ON CONFLICT (nome_normalizado) DO UPDATE SET nome = EXCLUDED.nome
+        """),
+        {"id": str(uuid.uuid4()), "nome": nome_limpo, "nome_normalizado": normalizar_texto(nome_limpo)}
+    )
+    return nome_limpo
 
 # =========================
 # ROTAS BÁSICAS
@@ -302,6 +479,22 @@ def deletar_evento(evento_id: str, email: str = Depends(get_current_user)):
     return {"msg": "Evento deletado com sucesso"}
 
 # =========================
+# SEGMENTOS
+# =========================
+@app.get("/segmentos")
+def listar_segmentos():
+    with engine.begin() as conn:
+        garantir_tabela_segmentos(conn)
+        result = conn.execute(text("SELECT nome FROM segmentos ORDER BY nome"))
+        return {"segmentos": [row._mapping["nome"] for row in result]}
+
+@app.post("/segmentos", status_code=201)
+def criar_segmento(segmento: SegmentoCreate):
+    with engine.begin() as conn:
+        nome = salvar_segmento(conn, segmento.nome)
+    return {"nome": nome, "validado": True}
+
+# =========================
 # EMPRESAS
 # =========================
 @app.get("/empresas")
@@ -323,7 +516,19 @@ def buscar_empresa(empresa_id: str):
 @app.post("/empresas")
 def criar_empresa(empresa: EmpresaCreate):
     empresa_id = str(uuid.uuid4())
+    segmento = None
+    if empresa.segmento:
+        segmento = limpar_segmento(empresa.segmento)
+        if not segmento_valido(segmento):
+            raise HTTPException(
+                400,
+                "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
+            )
+
     with engine.begin() as conn:
+        if segmento:
+            segmento = salvar_segmento(conn, segmento)
+
         conn.execute(
             text("""
                 INSERT INTO empresas (
@@ -337,13 +542,13 @@ def criar_empresa(empresa: EmpresaCreate):
                 )
             """),
             {
-                "id": empresa_id, "nome": empresa.nome, "segmento": empresa.segmento,
+                "id": empresa_id, "nome": empresa.nome, "segmento": segmento,
                 "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
                 "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
                 "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
                 "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status,
-                "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao,
+                "ticket_medio_estimado": None, "status": "Lead",
+                "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
                 "proxima_acao": empresa.proxima_acao, "temperatura": empresa.temperatura
             }
         )
