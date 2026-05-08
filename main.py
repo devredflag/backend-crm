@@ -38,12 +38,14 @@ security = HTTPBearer()
 app = FastAPI()
 
 # =========================
-# CORS
+# ✅ FIX 1: CORS CORRIGIDO
+# allow_credentials=True + allow_origins=["*"] é inválido pelo spec CORS.
+# Com Bearer token não precisamos de credentials=True.
 # =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,   # ← MUDANÇA: era True, causava bloqueio de todas as requisições
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -294,8 +296,23 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
+# ✅ NOVO: Modelo para atualizar contato
+class ContatoUpdate(BaseModel):
+    nome: str | None = None
+    funcao: str | None = None
+    email: str | None = None
+    celular: str | None = None
+    whatsapp: str | None = None
+    linkedin: str | None = None
+    observacoes: str | None = None
+    prioridade: str | None = None
+    nivel_influencia: str | None = None
+    decisor: bool | None = None
+    canal_preferido: str | None = None
+    data_ultimo_contato: date | None = None
+
 # =========================
-# SEGMENTOS
+# SEGMENTOS (helpers)
 # =========================
 def normalizar_texto(valor: str) -> str:
     sem_acentos = unicodedata.normalize("NFD", valor.lower())
@@ -310,11 +327,9 @@ def segmento_valido(nome: str) -> bool:
     normalizado = normalizar_texto(nome_limpo)
     if len(normalizado) < 3 or not re.search(r"[a-z]", normalizado):
         return False
-
     segmentos_base = {normalizar_texto(segmento) for segmento in SEGMENTOS_PADRAO}
     if normalizado in segmentos_base:
         return True
-
     palavras = set(re.findall(r"[a-z0-9]+", normalizado))
     return bool(palavras & PALAVRAS_CHAVE_SEGMENTO)
 
@@ -327,7 +342,6 @@ def garantir_tabela_segmentos(conn):
             criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
         )
     """))
-
     for segmento in SEGMENTOS_PADRAO:
         nome = limpar_segmento(segmento)
         conn.execute(
@@ -346,7 +360,6 @@ def salvar_segmento(conn, nome: str) -> str:
             400,
             "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
         )
-
     garantir_tabela_segmentos(conn)
     conn.execute(
         text("""
@@ -376,7 +389,6 @@ def garantir_campos_pipeline(conn):
 # =========================
 # ROTAS BÁSICAS
 # =========================
-
 @app.get("/")
 def home():
     return {"msg": "API rodando 🚀"}
@@ -423,8 +435,7 @@ def listar_eventos(email: str = Depends(get_current_user)):
             text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"),
             {"email": email}
         )
-        eventos = [dict(row._mapping) for row in result]
-    return eventos
+        return [dict(row._mapping) for row in result]
 
 @app.post("/eventos", status_code=201)
 def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
@@ -441,16 +452,10 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
                 )
             """),
             {
-                "id": evento_id,
-                "titulo": evento.titulo,
-                "tipo": evento.tipo,
-                "data": evento.data,
-                "hora_inicio": evento.hora_inicio,
-                "hora_fim": evento.hora_fim,
-                "empresa_id": evento.empresa_id,
-                "empresa_nome": evento.empresa_nome,
-                "descricao": evento.descricao,
-                "email": email,
+                "id": evento_id, "titulo": evento.titulo, "tipo": evento.tipo,
+                "data": evento.data, "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
+                "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
+                "descricao": evento.descricao, "email": email,
             }
         )
     return {"msg": "Evento criado com sucesso 🚀", "id": evento_id}
@@ -467,14 +472,10 @@ def atualizar_evento(evento_id: str, evento: EventoUpdate, email: str = Depends(
         conn.execute(
             text("""
                 UPDATE eventos SET
-                    titulo = COALESCE(:titulo, titulo),
-                    tipo = COALESCE(:tipo, tipo),
-                    data = COALESCE(:data, data),
-                    hora_inicio = COALESCE(:hora_inicio, hora_inicio),
-                    hora_fim = COALESCE(:hora_fim, hora_fim),
-                    empresa_id = COALESCE(:empresa_id, empresa_id),
-                    empresa_nome = COALESCE(:empresa_nome, empresa_nome),
-                    descricao = COALESCE(:descricao, descricao)
+                    titulo = COALESCE(:titulo, titulo), tipo = COALESCE(:tipo, tipo),
+                    data = COALESCE(:data, data), hora_inicio = COALESCE(:hora_inicio, hora_inicio),
+                    hora_fim = COALESCE(:hora_fim, hora_fim), empresa_id = COALESCE(:empresa_id, empresa_id),
+                    empresa_nome = COALESCE(:empresa_nome, empresa_nome), descricao = COALESCE(:descricao, descricao)
                 WHERE evento_id = :id AND usuario_email = :email
             """),
             {
@@ -561,12 +562,17 @@ def historico_status_empresa(empresa_id: str):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
         result = conn.execute(
-            text("""
-                SELECT *
-                FROM empresa_status_historico
-                WHERE empresa_id = :id
-                ORDER BY alterado_em DESC
-            """),
+            text("SELECT * FROM empresa_status_historico WHERE empresa_id = :id ORDER BY alterado_em DESC"),
+            {"id": empresa_id}
+        )
+        return [dict(row._mapping) for row in result]
+
+# ✅ FIX 2: Rota de contatos pelo empresa_id — frontend chama /empresas/:id/contatos
+@app.get("/empresas/{empresa_id}/contatos")
+def listar_contatos_por_empresa(empresa_id: str):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
             {"id": empresa_id}
         )
         return [dict(row._mapping) for row in result]
@@ -607,11 +613,17 @@ def criar_empresa(empresa: EmpresaCreate):
                 "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
                 "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
                 "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-                "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": None, "status": "Lead",
-                "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
-                "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
-                "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
+                "linkedin_empresa": empresa.linkedin_empresa,
+                "responsavel_principal": empresa.responsavel_principal,
+                # ✅ FIX 3: era hardcoded None, agora usa o valor enviado
+                "ticket_medio_estimado": empresa.ticket_medio_estimado,
+                "status": empresa.status or "Lead",
+                "origem_lead": empresa.origem_lead,
+                "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
+                "proxima_acao": empresa.proxima_acao,
+                "data_proxima_acao": empresa.data_proxima_acao,
+                "motivo_perdido": empresa.motivo_perdido,
+                "temperatura": empresa.temperatura
             }
         )
         conn.execute(
@@ -622,7 +634,7 @@ def criar_empresa(empresa: EmpresaCreate):
             """),
             {"id": str(uuid.uuid4()), "empresa_id": empresa_id}
         )
-    return {"msg": "Empresa criada com sucesso 🚀", "id": empresa_id}
+    return {"msg": "Empresa criada com sucesso 🚀", "empresa_id": empresa_id, "id": empresa_id}
 
 @app.put("/empresas/{empresa_id}")
 def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
@@ -633,23 +645,33 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
         ).fetchone()
         if not result:
             raise HTTPException(404, "Empresa não encontrada")
+
         status_anterior = result._mapping.get("status")
         status_mudou = empresa.status is not None and empresa.status != status_anterior
+
         conn.execute(
             text("""
                 UPDATE empresas SET
-                    nome = COALESCE(:nome, nome), segmento = COALESCE(:segmento, segmento),
-                    porte = COALESCE(:porte, porte), cidade = COALESCE(:cidade, cidade),
-                    endereco = COALESCE(:endereco, endereco), cep = COALESCE(:cep, cep),
-                    bairro = COALESCE(:bairro, bairro), regiao = COALESCE(:regiao, regiao),
-                    observacoes = COALESCE(:observacoes, observacoes), cnpj = COALESCE(:cnpj, cnpj),
-                    site = COALESCE(:site, site), linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
+                    nome = COALESCE(:nome, nome),
+                    segmento = COALESCE(:segmento, segmento),
+                    porte = COALESCE(:porte, porte),
+                    cidade = COALESCE(:cidade, cidade),
+                    endereco = COALESCE(:endereco, endereco),
+                    cep = COALESCE(:cep, cep),
+                    bairro = COALESCE(:bairro, bairro),
+                    regiao = COALESCE(:regiao, regiao),
+                    observacoes = COALESCE(:observacoes, observacoes),
+                    cnpj = COALESCE(:cnpj, cnpj),
+                    site = COALESCE(:site, site),
+                    linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
                     responsavel_principal = COALESCE(:responsavel_principal, responsavel_principal),
                     ticket_medio_estimado = COALESCE(:ticket_medio_estimado, ticket_medio_estimado),
-                    status = COALESCE(:status, status), origem_lead = COALESCE(:origem_lead, origem_lead),
+                    status = COALESCE(:status, status),
+                    origem_lead = COALESCE(:origem_lead, origem_lead),
                     ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
                     proxima_acao = COALESCE(:proxima_acao, proxima_acao),
-                    data_proxima_acao = COALESCE(:data_proxima_acao, data_proxima_acao),
+                    -- ✅ data_proxima_acao pode ser limpa (set to NULL explicitamente)
+                    data_proxima_acao = :data_proxima_acao,
                     status_atualizado_em = CASE
                         WHEN :status IS NOT NULL AND :status <> status THEN NOW()
                         ELSE status_atualizado_em
@@ -666,13 +688,18 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                 "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
                 "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
                 "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-                "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status,
-                "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao,
-                "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
-                "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
+                "linkedin_empresa": empresa.linkedin_empresa,
+                "responsavel_principal": empresa.responsavel_principal,
+                "ticket_medio_estimado": empresa.ticket_medio_estimado,
+                "status": empresa.status, "origem_lead": empresa.origem_lead,
+                "ultima_interacao": empresa.ultima_interacao,
+                "proxima_acao": empresa.proxima_acao,
+                "data_proxima_acao": empresa.data_proxima_acao,  # permite NULL
+                "motivo_perdido": empresa.motivo_perdido,
+                "temperatura": empresa.temperatura
             }
         )
+
         if status_mudou:
             conn.execute(
                 text("""
@@ -693,8 +720,18 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
 @app.delete("/empresas/{empresa_id}")
 def deletar_empresa(empresa_id: str):
     with engine.begin() as conn:
+        # ✅ Deleta contatos vinculados primeiro (evita violação de FK)
+        conn.execute(
+            text("DELETE FROM contatos WHERE empresa_id = :id"),
+            {"id": empresa_id}
+        )
+        conn.execute(
+            text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"),
+            {"id": empresa_id}
+        )
         result = conn.execute(
-            text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"), {"id": empresa_id}
+            text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"),
+            {"id": empresa_id}
         ).fetchone()
     if not result:
         raise HTTPException(404, "Empresa não encontrada")
@@ -703,11 +740,14 @@ def deletar_empresa(empresa_id: str):
 # =========================
 # CONTATOS
 # =========================
+
+# Rota legada — mantida para compatibilidade
 @app.get("/contatos/{empresa_id}")
 def listar_contatos_empresa(empresa_id: str):
     with engine.connect() as conn:
         result = conn.execute(
-            text("SELECT * FROM contatos WHERE empresa_id = :id"), {"id": empresa_id}
+            text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
+            {"id": empresa_id}
         )
         return [dict(row._mapping) for row in result]
 
@@ -728,16 +768,72 @@ def criar_contato(contato: dict):
             """),
             {
                 "id": str(uuid.uuid4()),
-                "empresa_id": contato.get("empresa_id"), "nome": contato.get("nome"),
-                "funcao": contato.get("funcao"), "email": contato.get("email"),
-                "celular": contato.get("celular"), "observacoes": contato.get("observacoes"),
-                "prioridade": contato.get("prioridade"), "whatsapp": contato.get("whatsapp"),
-                "linkedin": contato.get("linkedin"), "nivel_influencia": contato.get("nivel_influencia"),
-                "decisor": contato.get("decisor"), "data_ultimo_contato": contato.get("data_ultimo_contato"),
+                "empresa_id": contato.get("empresa_id"),
+                "nome": contato.get("nome"),
+                "funcao": contato.get("funcao"),
+                "email": contato.get("email"),
+                "celular": contato.get("celular"),
+                "observacoes": contato.get("observacoes"),
+                "prioridade": contato.get("prioridade"),
+                "whatsapp": contato.get("whatsapp"),
+                "linkedin": contato.get("linkedin"),
+                "nivel_influencia": contato.get("nivel_influencia"),
+                "decisor": contato.get("decisor"),
+                "data_ultimo_contato": contato.get("data_ultimo_contato"),
                 "canal_preferido": contato.get("canal_preferido"),
             }
         )
     return {"msg": "Contato criado com sucesso 🚀"}
+
+# ✅ NOVO: Atualizar contato
+@app.put("/contatos/{contato_id}")
+def atualizar_contato(contato_id: str, contato: ContatoUpdate):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("SELECT contato_id FROM contatos WHERE contato_id = :id"),
+            {"id": contato_id}
+        ).fetchone()
+        if not result:
+            raise HTTPException(404, "Contato não encontrado")
+        conn.execute(
+            text("""
+                UPDATE contatos SET
+                    nome = COALESCE(:nome, nome),
+                    funcao = COALESCE(:funcao, funcao),
+                    email = COALESCE(:email, email),
+                    celular = COALESCE(:celular, celular),
+                    whatsapp = COALESCE(:whatsapp, whatsapp),
+                    linkedin = COALESCE(:linkedin, linkedin),
+                    observacoes = COALESCE(:observacoes, observacoes),
+                    prioridade = COALESCE(:prioridade, prioridade),
+                    nivel_influencia = COALESCE(:nivel_influencia, nivel_influencia),
+                    decisor = COALESCE(:decisor, decisor),
+                    canal_preferido = COALESCE(:canal_preferido, canal_preferido),
+                    data_ultimo_contato = COALESCE(:data_ultimo_contato, data_ultimo_contato)
+                WHERE contato_id = :id
+            """),
+            {
+                "id": contato_id,
+                "nome": contato.nome, "funcao": contato.funcao, "email": contato.email,
+                "celular": contato.celular, "whatsapp": contato.whatsapp, "linkedin": contato.linkedin,
+                "observacoes": contato.observacoes, "prioridade": contato.prioridade,
+                "nivel_influencia": contato.nivel_influencia, "decisor": contato.decisor,
+                "canal_preferido": contato.canal_preferido, "data_ultimo_contato": contato.data_ultimo_contato,
+            }
+        )
+    return {"msg": "Contato atualizado com sucesso 🚀"}
+
+# ✅ NOVO: Deletar contato individual
+@app.delete("/contatos/{contato_id}")
+def deletar_contato(contato_id: str):
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM contatos WHERE contato_id = :id RETURNING contato_id"),
+            {"id": contato_id}
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Contato não encontrado")
+    return {"msg": "Contato deletado com sucesso"}
 
 # =========================
 # USUÁRIOS
