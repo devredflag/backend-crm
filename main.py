@@ -28,7 +28,7 @@ if not DATABASE_URL:
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 horas
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
