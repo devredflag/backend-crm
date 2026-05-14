@@ -581,13 +581,18 @@ def listar_contatos_por_empresa(empresa_id: str):
 def criar_empresa(empresa: EmpresaCreate):
     empresa_id = str(uuid.uuid4())
     segmento = None
-    if empresa.segmento:
+    is_rascunho = (empresa.status or "").lower() == "rascunho"
+
+    if empresa.segmento and not is_rascunho:
         segmento = limpar_segmento(empresa.segmento)
         if not segmento_valido(segmento):
             raise HTTPException(
                 400,
                 "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
             )
+    elif empresa.segmento and is_rascunho:
+        # Rascunho: aceita o segmento sem validar, ou deixa null se vazio
+        segmento = limpar_segmento(empresa.segmento) if empresa.segmento.strip() else None
 
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
@@ -626,13 +631,19 @@ def criar_empresa(empresa: EmpresaCreate):
                 "temperatura": empresa.temperatura
             }
         )
+        status_inicial = empresa.status or "Lead"
         conn.execute(
             text("""
                 INSERT INTO empresa_status_historico (
                     historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em
-                ) VALUES (:id, :empresa_id, NULL, 'Lead', 'Cadastro inicial', NOW())
+                ) VALUES (:id, :empresa_id, NULL, :status_novo, :observacao, NOW())
             """),
-            {"id": str(uuid.uuid4()), "empresa_id": empresa_id}
+            {
+                "id": str(uuid.uuid4()),
+                "empresa_id": empresa_id,
+                "status_novo": status_inicial,
+                "observacao": "Rascunho salvo" if is_rascunho else "Cadastro inicial"
+            }
         )
     return {"msg": "Empresa criada com sucesso 🚀", "empresa_id": empresa_id, "id": empresa_id}
 
