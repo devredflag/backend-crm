@@ -15,6 +15,7 @@ import jwt
 import os
 import re
 import unicodedata
+import httpx
 import resend
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
@@ -32,109 +33,49 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 horas
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
+# Microsoft OAuth
+MICROSOFT_CLIENT_ID     = os.getenv("MICROSOFT_CLIENT_ID")
+MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
+MICROSOFT_TENANT_ID     = os.getenv("MICROSOFT_TENANT_ID")
+MICROSOFT_REDIRECT_URI  = os.getenv("MICROSOFT_REDIRECT_URI")
+
 engine = create_engine(DATABASE_URL)
 security = HTTPBearer()
 
 app = FastAPI()
 
-# =========================
-# ✅ FIX 1: CORS CORRIGIDO
-# allow_credentials=True + allow_origins=["*"] é inválido pelo spec CORS.
-# Com Bearer token não precisamos de credentials=True.
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,   # ← MUDANÇA: era True, causava bloqueio de todas as requisições
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 SEGMENTOS_PADRAO = [
-    "Academias e Fitness",
-    "Administracao de Condominios",
-    "Advocacia",
-    "Agencia de Marketing",
-    "Agencia de Publicidade",
-    "Agronegocio",
-    "Alimentos e Bebidas",
-    "Arquitetura e Urbanismo",
-    "Assistencia Tecnica",
-    "Atacado e Distribuicao",
-    "Automacao Industrial",
-    "Autopecas",
-    "Bares e Restaurantes",
-    "Beleza e Estetica",
-    "Biotecnologia",
-    "Clinicas Medicas",
-    "Comercio Exterior",
-    "Comercio Varejista",
-    "Concessionarias",
-    "Construcao Civil",
-    "Consultoria Empresarial",
-    "Contabilidade",
-    "Coworking",
-    "Cursos e Treinamentos",
-    "Decoracao",
-    "Distribuidora",
-    "E-commerce",
-    "Educacao",
-    "Energia",
-    "Energia Solar",
-    "Engenharia",
-    "Entretenimento",
-    "Escritorio de Projetos",
-    "Eventos",
-    "Farmacias e Drogarias",
-    "Financeiro",
-    "Franquias",
-    "Gestao de Pessoas",
-    "Hotelaria",
-    "Imobiliarias",
-    "Industria Alimenticia",
-    "Industria Automotiva",
-    "Industria Farmaceutica",
-    "Industria Metalurgica",
-    "Industria Textil",
-    "Logistica e Transporte",
-    "Manutencao Predial",
-    "Maquinas e Equipamentos",
-    "Materiais de Construcao",
-    "Moda e Vestuario",
-    "Moveis Planejados",
-    "Odontologia",
-    "Pet Shop",
-    "Produtos Agropecuarios",
-    "Recursos Humanos",
-    "Saude",
-    "Seguranca Eletronica",
-    "Seguros",
-    "Servicos de Limpeza",
-    "Servicos Financeiros",
-    "Software e SaaS",
-    "Supermercados",
-    "Tecnologia da Informacao",
-    "Telecomunicacoes",
-    "Turismo",
-    "Venda de Gado",
-    "Vendas B2B",
-    "Veterinaria",
-    "Agropecuaria",
-    "Clinicas Odontologicas",
-    "Confeitaria",
-    "Delivery",
-    "Grafica",
-    "Hospitais",
-    "Jardinagem e Paisagismo",
-    "Laboratorios",
-    "Laticinios",
-    "Lavanderias",
-    "Marcenaria",
-    "Padarias",
-    "Papelarias",
-    "Postos de Combustivel",
-    "Serralheria",
-    "Transportadoras",
+    "Academias e Fitness", "Administracao de Condominios", "Advocacia",
+    "Agencia de Marketing", "Agencia de Publicidade", "Agronegocio",
+    "Alimentos e Bebidas", "Arquitetura e Urbanismo", "Assistencia Tecnica",
+    "Atacado e Distribuicao", "Automacao Industrial", "Autopecas",
+    "Bares e Restaurantes", "Beleza e Estetica", "Biotecnologia",
+    "Clinicas Medicas", "Comercio Exterior", "Comercio Varejista",
+    "Concessionarias", "Construcao Civil", "Consultoria Empresarial",
+    "Contabilidade", "Coworking", "Cursos e Treinamentos", "Decoracao",
+    "Distribuidora", "E-commerce", "Educacao", "Energia", "Energia Solar",
+    "Engenharia", "Entretenimento", "Escritorio de Projetos", "Eventos",
+    "Farmacias e Drogarias", "Financeiro", "Franquias", "Gestao de Pessoas",
+    "Hotelaria", "Imobiliarias", "Industria Alimenticia", "Industria Automotiva",
+    "Industria Farmaceutica", "Industria Metalurgica", "Industria Textil",
+    "Logistica e Transporte", "Manutencao Predial", "Maquinas e Equipamentos",
+    "Materiais de Construcao", "Moda e Vestuario", "Moveis Planejados",
+    "Odontologia", "Pet Shop", "Produtos Agropecuarios", "Recursos Humanos",
+    "Saude", "Seguranca Eletronica", "Seguros", "Servicos de Limpeza",
+    "Servicos Financeiros", "Software e SaaS", "Supermercados",
+    "Tecnologia da Informacao", "Telecomunicacoes", "Turismo", "Venda de Gado",
+    "Vendas B2B", "Veterinaria", "Agropecuaria", "Clinicas Odontologicas",
+    "Confeitaria", "Delivery", "Grafica", "Hospitais", "Jardinagem e Paisagismo",
+    "Laboratorios", "Laticinios", "Lavanderias", "Marcenaria", "Padarias",
+    "Papelarias", "Postos de Combustivel", "Serralheria", "Transportadoras",
 ]
 
 PALAVRAS_CHAVE_SEGMENTO = {
@@ -189,7 +130,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(401, "Token inválido")
 
 # =========================
-# EMAIL
+# EMAIL (Resend)
 # =========================
 async def enviar_email(destino: str, token: str):
     link = f"https://frontend-crm-xi-plum.vercel.app/ativar?token={token}"
@@ -296,7 +237,6 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-# ✅ NOVO: Modelo para atualizar contato
 class ContatoUpdate(BaseModel):
     nome: str | None = None
     funcao: str | None = None
@@ -310,6 +250,14 @@ class ContatoUpdate(BaseModel):
     decisor: bool | None = None
     canal_preferido: str | None = None
     data_ultimo_contato: date | None = None
+
+class ReuniaoOutlook(BaseModel):
+    titulo: str
+    descricao: Optional[str] = None
+    data: date
+    hora_inicio: str  # formato "HH:MM"
+    hora_fim: str     # formato "HH:MM"
+    email_convidado: Optional[str] = None  # email do cliente
 
 # =========================
 # SEGMENTOS (helpers)
@@ -386,6 +334,10 @@ def garantir_campos_pipeline(conn):
         )
     """))
 
+def garantir_colunas_outlook(conn):
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_access_token text"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_refresh_token text"))
+
 # =========================
 # ROTAS BÁSICAS
 # =========================
@@ -424,6 +376,158 @@ def update_me(dados: UsuarioUpdate, email: str = Depends(get_current_user)):
              "empresa_nome": dados.empresa_nome, "bio": dados.bio, "email": email}
         )
     return {"msg": "Perfil atualizado com sucesso 🚀"}
+
+# =========================
+# MICROSOFT OAUTH
+# =========================
+@app.get("/auth/outlook/login")
+def outlook_login():
+    """Retorna a URL para o frontend redirecionar o usuário para autenticação Microsoft."""
+    url = (
+        f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
+        f"?client_id={MICROSOFT_CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={MICROSOFT_REDIRECT_URI}"
+        f"&scope=Calendars.ReadWrite%20Mail.Send%20offline_access"
+        f"&response_mode=query"
+    )
+    return {"auth_url": url}
+
+@app.get("/auth/outlook/callback")
+async def outlook_callback(code: str, email: str = Depends(get_current_user)):
+    """Recebe o code do Microsoft, troca por tokens e salva no banco."""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
+            data={
+                "client_id": MICROSOFT_CLIENT_ID,
+                "client_secret": MICROSOFT_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": MICROSOFT_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            }
+        )
+    tokens = response.json()
+    if "access_token" not in tokens:
+        raise HTTPException(400, f"Erro ao obter tokens: {tokens.get('error_description', 'Erro desconhecido')}")
+
+    with engine.begin() as conn:
+        garantir_colunas_outlook(conn)
+        conn.execute(text("""
+            UPDATE usuarios SET
+                outlook_access_token = :access,
+                outlook_refresh_token = :refresh
+            WHERE email = :email
+        """), {
+            "access": tokens.get("access_token"),
+            "refresh": tokens.get("refresh_token"),
+            "email": email
+        })
+    return {"msg": "Outlook conectado com sucesso 🚀"}
+
+@app.get("/auth/outlook/status")
+def outlook_status(email: str = Depends(get_current_user)):
+    """Verifica se o usuário já tem Outlook conectado."""
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT outlook_access_token FROM usuarios WHERE email = :email"),
+            {"email": email}
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Usuário não encontrado")
+    conectado = result._mapping.get("outlook_access_token") is not None
+    return {"conectado": conectado}
+
+@app.delete("/auth/outlook/disconnect")
+def outlook_disconnect(email: str = Depends(get_current_user)):
+    """Desconecta o Outlook removendo os tokens."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE usuarios SET
+                outlook_access_token = NULL,
+                outlook_refresh_token = NULL
+            WHERE email = :email
+        """), {"email": email})
+    return {"msg": "Outlook desconectado com sucesso"}
+
+# =========================
+# REUNIÃO OUTLOOK CALENDAR
+# =========================
+async def _refresh_outlook_token(refresh_token: str) -> str:
+    """Renova o access_token usando o refresh_token."""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
+            data={
+                "client_id": MICROSOFT_CLIENT_ID,
+                "client_secret": MICROSOFT_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }
+        )
+    return response.json().get("access_token")
+
+@app.post("/eventos/{evento_id}/agendar-outlook")
+async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
+    """Cria uma reunião no Outlook Calendar do usuário e envia convite ao cliente."""
+    with engine.connect() as conn:
+        usuario = conn.execute(
+            text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
+            {"email": email}
+        ).fetchone()
+
+    if not usuario or not usuario._mapping.get("outlook_access_token"):
+        raise HTTPException(400, "Outlook não conectado. Acesse /auth/outlook/login primeiro.")
+
+    access_token = usuario._mapping["outlook_access_token"]
+    refresh_token = usuario._mapping.get("outlook_refresh_token")
+
+    # Monta o evento para a API do Microsoft Graph
+    data_str = reuniao.data.isoformat()
+    evento_graph = {
+        "subject": reuniao.titulo,
+        "body": {"contentType": "HTML", "content": reuniao.descricao or ""},
+        "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
+        "end":   {"dateTime": f"{data_str}T{reuniao.hora_fim}:00",   "timeZone": "America/Sao_Paulo"},
+    }
+    if reuniao.email_convidado:
+        evento_graph["attendees"] = [{
+            "emailAddress": {"address": reuniao.email_convidado},
+            "type": "required"
+        }]
+
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://graph.microsoft.com/v1.0/me/events",
+            json=evento_graph,
+            headers=headers
+        )
+
+    # Se token expirou, renova e tenta de novo
+    if response.status_code == 401 and refresh_token:
+        access_token = await _refresh_outlook_token(refresh_token)
+        headers["Authorization"] = f"Bearer {access_token}"
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE usuarios SET outlook_access_token = :t WHERE email = :e"),
+                         {"t": access_token, "e": email})
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://graph.microsoft.com/v1.0/me/events",
+                json=evento_graph,
+                headers=headers
+            )
+
+    if response.status_code not in (200, 201):
+        raise HTTPException(500, f"Erro ao criar evento no Outlook: {response.text}")
+
+    outlook_event = response.json()
+    return {
+        "msg": "Reunião criada no Outlook Calendar 🚀",
+        "outlook_event_id": outlook_event.get("id"),
+        "link": outlook_event.get("webLink")
+    }
 
 # =========================
 # EVENTOS
@@ -567,7 +671,6 @@ def historico_status_empresa(empresa_id: str):
         )
         return [dict(row._mapping) for row in result]
 
-# ✅ FIX 2: Rota de contatos pelo empresa_id — frontend chama /empresas/:id/contatos
 @app.get("/empresas/{empresa_id}/contatos")
 def listar_contatos_por_empresa(empresa_id: str):
     with engine.connect() as conn:
@@ -591,7 +694,6 @@ def criar_empresa(empresa: EmpresaCreate):
                 "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
             )
     elif empresa.segmento and is_rascunho:
-        # Rascunho: aceita o segmento sem validar, ou deixa null se vazio
         segmento = limpar_segmento(empresa.segmento) if empresa.segmento.strip() else None
 
     with engine.begin() as conn:
@@ -620,7 +722,6 @@ def criar_empresa(empresa: EmpresaCreate):
                 "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
                 "linkedin_empresa": empresa.linkedin_empresa,
                 "responsavel_principal": empresa.responsavel_principal,
-                # ✅ FIX 3: era hardcoded None, agora usa o valor enviado
                 "ticket_medio_estimado": empresa.ticket_medio_estimado,
                 "status": empresa.status or "Lead",
                 "origem_lead": empresa.origem_lead,
@@ -681,7 +782,6 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                     origem_lead = COALESCE(:origem_lead, origem_lead),
                     ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
                     proxima_acao = COALESCE(:proxima_acao, proxima_acao),
-                    -- ✅ data_proxima_acao pode ser limpa (set to NULL explicitamente)
                     data_proxima_acao = :data_proxima_acao,
                     status_atualizado_em = CASE
                         WHEN :status IS NOT NULL AND :status <> status THEN NOW()
@@ -705,7 +805,7 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                 "status": empresa.status, "origem_lead": empresa.origem_lead,
                 "ultima_interacao": empresa.ultima_interacao,
                 "proxima_acao": empresa.proxima_acao,
-                "data_proxima_acao": empresa.data_proxima_acao,  # permite NULL
+                "data_proxima_acao": empresa.data_proxima_acao,
                 "motivo_perdido": empresa.motivo_perdido,
                 "temperatura": empresa.temperatura
             }
@@ -731,15 +831,8 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
 @app.delete("/empresas/{empresa_id}")
 def deletar_empresa(empresa_id: str):
     with engine.begin() as conn:
-        # ✅ Deleta contatos vinculados primeiro (evita violação de FK)
-        conn.execute(
-            text("DELETE FROM contatos WHERE empresa_id = :id"),
-            {"id": empresa_id}
-        )
-        conn.execute(
-            text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"),
-            {"id": empresa_id}
-        )
+        conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": empresa_id})
+        conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": empresa_id})
         result = conn.execute(
             text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"),
             {"id": empresa_id}
@@ -751,8 +844,6 @@ def deletar_empresa(empresa_id: str):
 # =========================
 # CONTATOS
 # =========================
-
-# Rota legada — mantida para compatibilidade
 @app.get("/contatos/{empresa_id}")
 def listar_contatos_empresa(empresa_id: str):
     with engine.connect() as conn:
@@ -796,7 +887,6 @@ def criar_contato(contato: dict):
         )
     return {"msg": "Contato criado com sucesso 🚀"}
 
-# ✅ NOVO: Atualizar contato
 @app.put("/contatos/{contato_id}")
 def atualizar_contato(contato_id: str, contato: ContatoUpdate):
     with engine.begin() as conn:
@@ -834,7 +924,6 @@ def atualizar_contato(contato_id: str, contato: ContatoUpdate):
         )
     return {"msg": "Contato atualizado com sucesso 🚀"}
 
-# ✅ NOVO: Deletar contato individual
 @app.delete("/contatos/{contato_id}")
 def deletar_contato(contato_id: str):
     with engine.begin() as conn:
