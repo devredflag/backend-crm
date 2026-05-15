@@ -8,3 +8,4 @@ pydantic[email]
 PyJWT
 resend
 email-validator
+httpx
