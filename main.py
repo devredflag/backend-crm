@@ -470,48 +470,34 @@ async def _refresh_outlook_token(refresh_token: str) -> str:
 @app.post("/eventos/{evento_id}/agendar-outlook")
 async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
     """Cria uma reunião no Outlook Calendar do usuário e envia convite ao cliente."""
-    with engine.connect() as conn:
-        usuario = conn.execute(
-            text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
-            {"email": email}
-        ).fetchone()
+    try:
+        with engine.connect() as conn:
+            usuario = conn.execute(
+                text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
+                {"email": email}
+            ).fetchone()
 
-    if not usuario or not usuario._mapping.get("outlook_access_token"):
-        raise HTTPException(400, "Outlook não conectado. Acesse /auth/outlook/login primeiro.")
+        if not usuario or not usuario._mapping.get("outlook_access_token"):
+            raise HTTPException(400, "Outlook não conectado. Acesse /auth/outlook/login primeiro.")
 
-    access_token = usuario._mapping["outlook_access_token"]
-    refresh_token = usuario._mapping.get("outlook_refresh_token")
+        access_token = usuario._mapping["outlook_access_token"]
+        refresh_token = usuario._mapping.get("outlook_refresh_token")
 
-    # Monta o evento para a API do Microsoft Graph
-    data_str = reuniao.data.isoformat()
-    evento_graph = {
-        "subject": reuniao.titulo,
-        "body": {"contentType": "HTML", "content": reuniao.descricao or ""},
-        "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
-        "end":   {"dateTime": f"{data_str}T{reuniao.hora_fim}:00",   "timeZone": "America/Sao_Paulo"},
-    }
-    if reuniao.email_convidado:
-        evento_graph["attendees"] = [{
-            "emailAddress": {"address": reuniao.email_convidado},
-            "type": "required"
-        }]
+        data_str = reuniao.data.isoformat()
+        evento_graph = {
+            "subject": reuniao.titulo,
+            "body": {"contentType": "HTML", "content": reuniao.descricao or ""},
+            "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
+            "end":   {"dateTime": f"{data_str}T{reuniao.hora_fim}:00",   "timeZone": "America/Sao_Paulo"},
+        }
+        if reuniao.email_convidado:
+            evento_graph["attendees"] = [{
+                "emailAddress": {"address": reuniao.email_convidado},
+                "type": "required"
+            }]
 
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://graph.microsoft.com/v1.0/me/events",
-            json=evento_graph,
-            headers=headers
-        )
-
-    # Se token expirou, renova e tenta de novo
-    if response.status_code == 401 and refresh_token:
-        access_token = await _refresh_outlook_token(refresh_token)
-        headers["Authorization"] = f"Bearer {access_token}"
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE usuarios SET outlook_access_token = :t WHERE email = :e"),
-                         {"t": access_token, "e": email})
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://graph.microsoft.com/v1.0/me/events",
@@ -519,15 +505,36 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
                 headers=headers
             )
 
-    if response.status_code not in (200, 201):
-        raise HTTPException(500, f"Erro ao criar evento no Outlook: {response.text}")
+        if response.status_code == 401 and refresh_token:
+            access_token = await _refresh_outlook_token(refresh_token)
+            headers["Authorization"] = f"Bearer {access_token}"
+            with engine.begin() as conn:
+                conn.execute(text("UPDATE usuarios SET outlook_access_token = :t WHERE email = :e"),
+                             {"t": access_token, "e": email})
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://graph.microsoft.com/v1.0/me/events",
+                    json=evento_graph,
+                    headers=headers
+                )
 
-    outlook_event = response.json()
-    return {
-        "msg": "Reunião criada no Outlook Calendar 🚀",
-        "outlook_event_id": outlook_event.get("id"),
-        "link": outlook_event.get("webLink")
-    }
+        print(f"📬 OUTLOOK RESPONSE: {response.status_code} - {response.text}")
+
+        if response.status_code not in (200, 201):
+            raise HTTPException(500, f"Erro ao criar evento no Outlook: {response.text}")
+
+        outlook_event = response.json()
+        return {
+            "msg": "Reunião criada no Outlook Calendar 🚀",
+            "outlook_event_id": outlook_event.get("id"),
+            "link": outlook_event.get("webLink")
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🔴 EXCEPTION agendar-outlook: {str(e)}")
+        raise HTTPException(500, str(e))
 
 # =========================
 # EVENTOS
