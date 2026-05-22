@@ -549,6 +549,8 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
 
         outlook_event = response.json()
         print(f"✅ Evento criado no Outlook: {outlook_event.get('id')}")
+        print(f"📧 Convidado enviado para: {reuniao.email_convidado}")
+        print(f"📧 Attendees no evento: {evento_graph.get('attendees')}")
         return {
             "msg": "Reunião criada no Outlook Calendar 🚀",
             "outlook_event_id": outlook_event.get("id"),
