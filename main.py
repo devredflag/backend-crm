@@ -255,9 +255,9 @@ class ReuniaoOutlook(BaseModel):
     titulo: str
     descricao: Optional[str] = None
     data: date
-    hora_inicio: str  # formato "HH:MM"
-    hora_fim: str     # formato "HH:MM"
-    email_convidado: Optional[str] = None  # email do cliente
+    hora_inicio: str
+    hora_fim: str
+    email_convidado: Optional[str] = None
 
 # =========================
 # SEGMENTOS (helpers)
@@ -382,7 +382,6 @@ def update_me(dados: UsuarioUpdate, email: str = Depends(get_current_user)):
 # =========================
 @app.get("/auth/outlook/login")
 def outlook_login():
-    """Retorna a URL para o frontend redirecionar o usuário para autenticação Microsoft."""
     url = (
         f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
         f"?client_id={MICROSOFT_CLIENT_ID}"
@@ -395,7 +394,7 @@ def outlook_login():
 
 @app.get("/auth/outlook/callback")
 async def outlook_callback(code: str, email: str = Depends(get_current_user)):
-    """Recebe o code do Microsoft, troca por tokens e salva no banco."""
+    print(f"📩 OUTLOOK CALLBACK recebido para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
@@ -408,6 +407,7 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
             }
         )
     tokens = response.json()
+    print(f"📩 OUTLOOK TOKEN RESPONSE status: {response.status_code}")
     if "access_token" not in tokens:
         raise HTTPException(400, f"Erro ao obter tokens: {tokens.get('error_description', 'Erro desconhecido')}")
 
@@ -423,11 +423,11 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
             "refresh": tokens.get("refresh_token"),
             "email": email
         })
+    print(f"✅ OUTLOOK tokens salvos para: {email}")
     return {"msg": "Outlook conectado com sucesso 🚀"}
 
 @app.get("/auth/outlook/status")
 def outlook_status(email: str = Depends(get_current_user)):
-    """Verifica se o usuário já tem Outlook conectado."""
     with engine.connect() as conn:
         result = conn.execute(
             text("SELECT outlook_access_token FROM usuarios WHERE email = :email"),
@@ -440,7 +440,6 @@ def outlook_status(email: str = Depends(get_current_user)):
 
 @app.delete("/auth/outlook/disconnect")
 def outlook_disconnect(email: str = Depends(get_current_user)):
-    """Desconecta o Outlook removendo os tokens."""
     with engine.begin() as conn:
         conn.execute(text("""
             UPDATE usuarios SET
@@ -453,8 +452,9 @@ def outlook_disconnect(email: str = Depends(get_current_user)):
 # =========================
 # REUNIÃO OUTLOOK CALENDAR
 # =========================
-async def _refresh_outlook_token(refresh_token: str) -> str:
-    """Renova o access_token usando o refresh_token."""
+async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
+    """Renova o access_token usando o refresh_token e salva no banco."""
+    print(f"🔄 Tentando refresh do token para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
@@ -463,14 +463,34 @@ async def _refresh_outlook_token(refresh_token: str) -> str:
                 "client_secret": MICROSOFT_CLIENT_SECRET,
                 "refresh_token": refresh_token,
                 "grant_type": "refresh_token",
+                "scope": "Calendars.ReadWrite Mail.Send offline_access",
             }
         )
-    return response.json().get("access_token")
+    tokens = response.json()
+    new_access = tokens.get("access_token")
+    new_refresh = tokens.get("refresh_token", refresh_token)
+    print(f"🔄 Refresh response status: {response.status_code} | novo token obtido: {bool(new_access)}")
+
+    if new_access:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE usuarios SET
+                    outlook_access_token = :access,
+                    outlook_refresh_token = :refresh
+                WHERE email = :email
+            """), {"access": new_access, "refresh": new_refresh, "email": email})
+        print(f"✅ Novo token salvo para: {email}")
+    else:
+        print(f"🔴 Falha no refresh: {tokens}")
+
+    return new_access
 
 @app.post("/eventos/{evento_id}/agendar-outlook")
 async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
     """Cria uma reunião no Outlook Calendar do usuário e envia convite ao cliente."""
     try:
+        print(f"📅 Iniciando agendamento Outlook para evento {evento_id} | usuário: {email}")
+
         with engine.connect() as conn:
             usuario = conn.execute(
                 text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
@@ -482,6 +502,7 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
 
         access_token = usuario._mapping["outlook_access_token"]
         refresh_token = usuario._mapping.get("outlook_refresh_token")
+        print(f"📅 Token encontrado. Refresh disponível: {bool(refresh_token)}")
 
         data_str = reuniao.data.isoformat()
         evento_graph = {
@@ -505,25 +526,29 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
                 headers=headers
             )
 
+        print(f"📬 OUTLOOK RESPONSE: {response.status_code} - {response.text[:300]}")
+
+        # Se token expirou, renova e tenta de novo
         if response.status_code == 401 and refresh_token:
-            access_token = await _refresh_outlook_token(refresh_token)
+            print(f"🔄 Token expirado, tentando renovar...")
+            access_token = await _refresh_outlook_token(refresh_token, email)
+            if not access_token:
+                raise HTTPException(401, "Token expirado e não foi possível renovar. Reconecte o Outlook.")
             headers["Authorization"] = f"Bearer {access_token}"
-            with engine.begin() as conn:
-                conn.execute(text("UPDATE usuarios SET outlook_access_token = :t WHERE email = :e"),
-                             {"t": access_token, "e": email})
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     "https://graph.microsoft.com/v1.0/me/events",
                     json=evento_graph,
                     headers=headers
                 )
-
-        print(f"📬 OUTLOOK RESPONSE: {response.status_code} - {response.text}")
+            print(f"📬 OUTLOOK RESPONSE (após refresh): {response.status_code} - {response.text[:300]}")
 
         if response.status_code not in (200, 201):
+            print(f"🔴 OUTLOOK ERROR FINAL: {response.status_code} - {response.text}")
             raise HTTPException(500, f"Erro ao criar evento no Outlook: {response.text}")
 
         outlook_event = response.json()
+        print(f"✅ Evento criado no Outlook: {outlook_event.get('id')}")
         return {
             "msg": "Reunião criada no Outlook Calendar 🚀",
             "outlook_event_id": outlook_event.get("id"),
@@ -696,10 +721,7 @@ def criar_empresa(empresa: EmpresaCreate):
     if empresa.segmento and not is_rascunho:
         segmento = limpar_segmento(empresa.segmento)
         if not segmento_valido(segmento):
-            raise HTTPException(
-                400,
-                "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
-            )
+            raise HTTPException(400, "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido.")
     elif empresa.segmento and is_rascunho:
         segmento = limpar_segmento(empresa.segmento) if empresa.segmento.strip() else None
 
@@ -707,7 +729,6 @@ def criar_empresa(empresa: EmpresaCreate):
         garantir_campos_pipeline(conn)
         if segmento:
             segmento = salvar_segmento(conn, segmento)
-
         conn.execute(
             text("""
                 INSERT INTO empresas (
@@ -747,8 +768,7 @@ def criar_empresa(empresa: EmpresaCreate):
                 ) VALUES (:id, :empresa_id, NULL, :status_novo, :observacao, NOW())
             """),
             {
-                "id": str(uuid.uuid4()),
-                "empresa_id": empresa_id,
+                "id": str(uuid.uuid4()), "empresa_id": empresa_id,
                 "status_novo": status_inicial,
                 "observacao": "Rascunho salvo" if is_rascunho else "Cadastro inicial"
             }
@@ -826,10 +846,8 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                     ) VALUES (:id, :empresa_id, :status_anterior, :status_novo, :observacao, NOW())
                 """),
                 {
-                    "id": str(uuid.uuid4()),
-                    "empresa_id": empresa_id,
-                    "status_anterior": status_anterior,
-                    "status_novo": empresa.status,
+                    "id": str(uuid.uuid4()), "empresa_id": empresa_id,
+                    "status_anterior": status_anterior, "status_novo": empresa.status,
                     "observacao": empresa.motivo_perdido if empresa.status == "Perdido" else None,
                 }
             )
