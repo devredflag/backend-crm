@@ -8,7 +8,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from typing import Optional
 import uuid
 import jwt
@@ -29,7 +29,7 @@ if not DATABASE_URL:
 
 SECRET_KEY = "super_secret_key"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 horas
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
@@ -38,6 +38,11 @@ MICROSOFT_CLIENT_ID     = os.getenv("MICROSOFT_CLIENT_ID")
 MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
 MICROSOFT_TENANT_ID     = os.getenv("MICROSOFT_TENANT_ID")
 MICROSOFT_REDIRECT_URI  = os.getenv("MICROSOFT_REDIRECT_URI")
+
+# Google OAuth
+GOOGLE_CLIENT_ID        = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET    = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI     = os.getenv("GOOGLE_REDIRECT_URI")
 
 engine = create_engine(DATABASE_URL)
 security = HTTPBearer()
@@ -259,6 +264,14 @@ class ReuniaoOutlook(BaseModel):
     hora_fim: str
     email_convidado: Optional[str] = None
 
+class ReuniaoGoogle(BaseModel):
+    titulo: str
+    descricao: Optional[str] = None
+    data: date
+    hora_inicio: str
+    hora_fim: str
+    email_convidado: Optional[str] = None
+
 # =========================
 # SEGMENTOS (helpers)
 # =========================
@@ -304,10 +317,7 @@ def garantir_tabela_segmentos(conn):
 def salvar_segmento(conn, nome: str) -> str:
     nome_limpo = limpar_segmento(nome)
     if not segmento_valido(nome_limpo):
-        raise HTTPException(
-            400,
-            "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido."
-        )
+        raise HTTPException(400, "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido.")
     garantir_tabela_segmentos(conn)
     conn.execute(
         text("""
@@ -334,9 +344,11 @@ def garantir_campos_pipeline(conn):
         )
     """))
 
-def garantir_colunas_outlook(conn):
+def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_access_token text"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_refresh_token text"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_access_token text"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_refresh_token text"))
 
 # =========================
 # ROTAS BÁSICAS
@@ -410,19 +422,12 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
     print(f"📩 OUTLOOK TOKEN RESPONSE status: {response.status_code}")
     if "access_token" not in tokens:
         raise HTTPException(400, f"Erro ao obter tokens: {tokens.get('error_description', 'Erro desconhecido')}")
-
     with engine.begin() as conn:
-        garantir_colunas_outlook(conn)
+        garantir_colunas_oauth(conn)
         conn.execute(text("""
-            UPDATE usuarios SET
-                outlook_access_token = :access,
-                outlook_refresh_token = :refresh
+            UPDATE usuarios SET outlook_access_token = :access, outlook_refresh_token = :refresh
             WHERE email = :email
-        """), {
-            "access": tokens.get("access_token"),
-            "refresh": tokens.get("refresh_token"),
-            "email": email
-        })
+        """), {"access": tokens.get("access_token"), "refresh": tokens.get("refresh_token"), "email": email})
     print(f"✅ OUTLOOK tokens salvos para: {email}")
     return {"msg": "Outlook conectado com sucesso 🚀"}
 
@@ -430,31 +435,82 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
 def outlook_status(email: str = Depends(get_current_user)):
     with engine.connect() as conn:
         result = conn.execute(
-            text("SELECT outlook_access_token FROM usuarios WHERE email = :email"),
-            {"email": email}
+            text("SELECT outlook_access_token FROM usuarios WHERE email = :email"), {"email": email}
         ).fetchone()
     if not result:
         raise HTTPException(404, "Usuário não encontrado")
-    conectado = result._mapping.get("outlook_access_token") is not None
-    return {"conectado": conectado}
+    return {"conectado": result._mapping.get("outlook_access_token") is not None}
 
 @app.delete("/auth/outlook/disconnect")
 def outlook_disconnect(email: str = Depends(get_current_user)):
     with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE usuarios SET
-                outlook_access_token = NULL,
-                outlook_refresh_token = NULL
-            WHERE email = :email
-        """), {"email": email})
+        conn.execute(text("UPDATE usuarios SET outlook_access_token = NULL, outlook_refresh_token = NULL WHERE email = :email"), {"email": email})
     return {"msg": "Outlook desconectado com sucesso"}
+
+# =========================
+# GOOGLE OAUTH
+# =========================
+@app.get("/auth/google/login")
+def google_login():
+    url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&scope=https://www.googleapis.com/auth/gmail.send%20https://www.googleapis.com/auth/calendar.events%20https://www.googleapis.com/auth/calendar"
+        f"&access_type=offline"
+        f"&prompt=consent"
+    )
+    return {"auth_url": url}
+
+@app.get("/auth/google/callback")
+async def google_callback(code: str, email: str = Depends(get_current_user)):
+    print(f"📩 GOOGLE CALLBACK recebido para: {email}")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            }
+        )
+    tokens = response.json()
+    print(f"📩 GOOGLE TOKEN RESPONSE status: {response.status_code} | keys: {list(tokens.keys())}")
+    if "access_token" not in tokens:
+        raise HTTPException(400, f"Erro ao obter tokens Google: {tokens.get('error_description', tokens)}")
+    with engine.begin() as conn:
+        garantir_colunas_oauth(conn)
+        conn.execute(text("""
+            UPDATE usuarios SET google_access_token = :access, google_refresh_token = :refresh
+            WHERE email = :email
+        """), {"access": tokens.get("access_token"), "refresh": tokens.get("refresh_token"), "email": email})
+    print(f"✅ GOOGLE tokens salvos para: {email}")
+    return {"msg": "Google conectado com sucesso 🚀"}
+
+@app.get("/auth/google/status")
+def google_status(email: str = Depends(get_current_user)):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT google_access_token FROM usuarios WHERE email = :email"), {"email": email}
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Usuário não encontrado")
+    return {"conectado": result._mapping.get("google_access_token") is not None}
+
+@app.delete("/auth/google/disconnect")
+def google_disconnect(email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE usuarios SET google_access_token = NULL, google_refresh_token = NULL WHERE email = :email"), {"email": email})
+    return {"msg": "Google desconectado com sucesso"}
 
 # =========================
 # REUNIÃO OUTLOOK CALENDAR
 # =========================
 async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
-    """Renova o access_token usando o refresh_token e salva no banco."""
-    print(f"🔄 Tentando refresh do token para: {email}")
+    print(f"🔄 Tentando refresh do token Outlook para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
@@ -469,41 +525,48 @@ async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
     tokens = response.json()
     new_access = tokens.get("access_token")
     new_refresh = tokens.get("refresh_token", refresh_token)
-    print(f"🔄 Refresh response status: {response.status_code} | novo token obtido: {bool(new_access)}")
-
+    print(f"🔄 Refresh Outlook status: {response.status_code} | token obtido: {bool(new_access)}")
     if new_access:
         with engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE usuarios SET
-                    outlook_access_token = :access,
-                    outlook_refresh_token = :refresh
-                WHERE email = :email
-            """), {"access": new_access, "refresh": new_refresh, "email": email})
-        print(f"✅ Novo token salvo para: {email}")
-    else:
-        print(f"🔴 Falha no refresh: {tokens}")
+            conn.execute(text("UPDATE usuarios SET outlook_access_token = :a, outlook_refresh_token = :r WHERE email = :e"),
+                         {"a": new_access, "r": new_refresh, "e": email})
+    return new_access
 
+async def _refresh_google_token(refresh_token: str, email: str) -> str:
+    print(f"🔄 Tentando refresh do token Google para: {email}")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            }
+        )
+    tokens = response.json()
+    new_access = tokens.get("access_token")
+    print(f"🔄 Refresh Google status: {response.status_code} | token obtido: {bool(new_access)}")
+    if new_access:
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE usuarios SET google_access_token = :a WHERE email = :e"),
+                         {"a": new_access, "e": email})
     return new_access
 
 @app.post("/eventos/{evento_id}/agendar-outlook")
 async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
-    """Cria uma reunião no Outlook Calendar do usuário e envia convite ao cliente."""
     try:
         print(f"📅 Iniciando agendamento Outlook para evento {evento_id} | usuário: {email}")
-
         with engine.connect() as conn:
             usuario = conn.execute(
                 text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
                 {"email": email}
             ).fetchone()
-
         if not usuario or not usuario._mapping.get("outlook_access_token"):
-            raise HTTPException(400, "Outlook não conectado. Acesse /auth/outlook/login primeiro.")
-
+            raise HTTPException(400, "Outlook não conectado.")
         access_token = usuario._mapping["outlook_access_token"]
         refresh_token = usuario._mapping.get("outlook_refresh_token")
         print(f"📅 Token encontrado. Refresh disponível: {bool(refresh_token)}")
-
         data_str = reuniao.data.isoformat()
         evento_graph = {
             "subject": reuniao.titulo,
@@ -512,55 +575,83 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
             "end":   {"dateTime": f"{data_str}T{reuniao.hora_fim}:00",   "timeZone": "America/Sao_Paulo"},
         }
         if reuniao.email_convidado:
-            evento_graph["attendees"] = [{
-                "emailAddress": {"address": reuniao.email_convidado},
-                "type": "required"
-            }]
-
+            evento_graph["attendees"] = [{"emailAddress": {"address": reuniao.email_convidado}, "type": "required"}]
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://graph.microsoft.com/v1.0/me/events",
-                json=evento_graph,
-                headers=headers
-            )
-
+            response = await client.post("https://graph.microsoft.com/v1.0/me/events", json=evento_graph, headers=headers)
         print(f"📬 OUTLOOK RESPONSE: {response.status_code} - {response.text[:300]}")
-
-        # Se token expirou, renova e tenta de novo
         if response.status_code == 401 and refresh_token:
-            print(f"🔄 Token expirado, tentando renovar...")
             access_token = await _refresh_outlook_token(refresh_token, email)
             if not access_token:
-                raise HTTPException(401, "Token expirado e não foi possível renovar. Reconecte o Outlook.")
+                raise HTTPException(401, "Token expirado. Reconecte o Outlook.")
             headers["Authorization"] = f"Bearer {access_token}"
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://graph.microsoft.com/v1.0/me/events",
-                    json=evento_graph,
-                    headers=headers
-                )
+                response = await client.post("https://graph.microsoft.com/v1.0/me/events", json=evento_graph, headers=headers)
             print(f"📬 OUTLOOK RESPONSE (após refresh): {response.status_code} - {response.text[:300]}")
-
         if response.status_code not in (200, 201):
-            print(f"🔴 OUTLOOK ERROR FINAL: {response.status_code} - {response.text}")
-            raise HTTPException(500, f"Erro ao criar evento no Outlook: {response.text}")
-
+            raise HTTPException(500, f"Erro Outlook: {response.text}")
         outlook_event = response.json()
         print(f"✅ Evento criado no Outlook: {outlook_event.get('id')}")
-        print(f"📧 Convidado enviado para: {reuniao.email_convidado}")
-        print(f"📧 Attendees no evento: {evento_graph.get('attendees')}")
-        return {
-            "msg": "Reunião criada no Outlook Calendar 🚀",
-            "outlook_event_id": outlook_event.get("id"),
-            "link": outlook_event.get("webLink")
-        }
-
+        return {"msg": "Reunião criada no Outlook Calendar 🚀", "outlook_event_id": outlook_event.get("id"), "link": outlook_event.get("webLink")}
     except HTTPException:
         raise
     except Exception as e:
         print(f"🔴 EXCEPTION agendar-outlook: {str(e)}")
+        raise HTTPException(500, str(e))
+
+# =========================
+# REUNIÃO GOOGLE CALENDAR
+# =========================
+@app.post("/eventos/{evento_id}/agendar-google")
+async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: str = Depends(get_current_user)):
+    try:
+        print(f"📅 Iniciando agendamento Google para evento {evento_id} | usuário: {email}")
+        with engine.connect() as conn:
+            usuario = conn.execute(
+                text("SELECT google_access_token, google_refresh_token FROM usuarios WHERE email = :email"),
+                {"email": email}
+            ).fetchone()
+        if not usuario or not usuario._mapping.get("google_access_token"):
+            raise HTTPException(400, "Google Calendar não conectado.")
+        access_token = usuario._mapping["google_access_token"]
+        refresh_token = usuario._mapping.get("google_refresh_token")
+        print(f"📅 Token Google encontrado. Refresh disponível: {bool(refresh_token)}")
+        data_str = reuniao.data.isoformat()
+        evento_google = {
+            "summary": reuniao.titulo,
+            "description": reuniao.descricao or "",
+            "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
+            "end":   {"dateTime": f"{data_str}T{reuniao.hora_fim}:00",   "timeZone": "America/Sao_Paulo"},
+        }
+        if reuniao.email_convidado:
+            evento_google["attendees"] = [{"email": reuniao.email_convidado}]
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
+                json=evento_google, headers=headers
+            )
+        print(f"📬 GOOGLE RESPONSE: {response.status_code} - {response.text[:300]}")
+        if response.status_code == 401 and refresh_token:
+            access_token = await _refresh_google_token(refresh_token, email)
+            if not access_token:
+                raise HTTPException(401, "Token expirado. Reconecte o Google.")
+            headers["Authorization"] = f"Bearer {access_token}"
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
+                    json=evento_google, headers=headers
+                )
+            print(f"📬 GOOGLE RESPONSE (após refresh): {response.status_code} - {response.text[:300]}")
+        if response.status_code not in (200, 201):
+            raise HTTPException(500, f"Erro Google Calendar: {response.text}")
+        google_event = response.json()
+        print(f"✅ Evento criado no Google Calendar: {google_event.get('id')}")
+        return {"msg": "Reunião criada no Google Calendar 🚀", "google_event_id": google_event.get("id"), "link": google_event.get("htmlLink")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🔴 EXCEPTION agendar-google: {str(e)}")
         raise HTTPException(500, str(e))
 
 # =========================
@@ -581,20 +672,15 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
     with engine.begin() as conn:
         conn.execute(
             text("""
-                INSERT INTO eventos (
-                    evento_id, titulo, tipo, data, hora_inicio, hora_fim,
-                    empresa_id, empresa_nome, descricao, usuario_email, criado_em
-                ) VALUES (
-                    :id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
-                    :empresa_id, :empresa_nome, :descricao, :email, NOW()
-                )
+                INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
+                    empresa_id, empresa_nome, descricao, usuario_email, criado_em)
+                VALUES (:id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
+                    :empresa_id, :empresa_nome, :descricao, :email, NOW())
             """),
-            {
-                "id": evento_id, "titulo": evento.titulo, "tipo": evento.tipo,
-                "data": evento.data, "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
-                "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
-                "descricao": evento.descricao, "email": email,
-            }
+            {"id": evento_id, "titulo": evento.titulo, "tipo": evento.tipo,
+             "data": evento.data, "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
+             "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
+             "descricao": evento.descricao, "email": email}
         )
     return {"msg": "Evento criado com sucesso 🚀", "id": evento_id}
 
@@ -616,12 +702,10 @@ def atualizar_evento(evento_id: str, evento: EventoUpdate, email: str = Depends(
                     empresa_nome = COALESCE(:empresa_nome, empresa_nome), descricao = COALESCE(:descricao, descricao)
                 WHERE evento_id = :id AND usuario_email = :email
             """),
-            {
-                "titulo": evento.titulo, "tipo": evento.tipo, "data": evento.data,
-                "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
-                "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
-                "descricao": evento.descricao, "id": evento_id, "email": email
-            }
+            {"titulo": evento.titulo, "tipo": evento.tipo, "data": evento.data,
+             "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
+             "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
+             "descricao": evento.descricao, "id": evento_id, "email": email}
         )
     return {"msg": "Evento atualizado com sucesso 🚀"}
 
@@ -663,11 +747,9 @@ def listar_empresas():
             SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
             FROM empresas e
             LEFT JOIN LATERAL (
-                SELECT email, celular, whatsapp
-                FROM contatos
+                SELECT email, celular, whatsapp FROM contatos
                 WHERE empresa_id = e.empresa_id
-                ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST
-                LIMIT 1
+                ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
             ) c ON TRUE
             ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
         """))
@@ -677,20 +759,16 @@ def listar_empresas():
 def buscar_empresa(empresa_id: str):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
-        result = conn.execute(
-            text("""
-                SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
-                FROM empresas e
-                LEFT JOIN LATERAL (
-                    SELECT email, celular, whatsapp
-                    FROM contatos
-                    WHERE empresa_id = e.empresa_id
-                    ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST
-                    LIMIT 1
-                ) c ON TRUE
-                WHERE e.empresa_id = :id
-            """), {"id": empresa_id}
-        ).fetchone()
+        result = conn.execute(text("""
+            SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
+            FROM empresas e
+            LEFT JOIN LATERAL (
+                SELECT email, celular, whatsapp FROM contatos
+                WHERE empresa_id = e.empresa_id
+                ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
+            ) c ON TRUE
+            WHERE e.empresa_id = :id
+        """), {"id": empresa_id}).fetchone()
     if not result:
         raise HTTPException(404, "Empresa não encontrada")
     return dict(result._mapping)
@@ -719,140 +797,90 @@ def criar_empresa(empresa: EmpresaCreate):
     empresa_id = str(uuid.uuid4())
     segmento = None
     is_rascunho = (empresa.status or "").lower() == "rascunho"
-
     if empresa.segmento and not is_rascunho:
         segmento = limpar_segmento(empresa.segmento)
         if not segmento_valido(segmento):
-            raise HTTPException(400, "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido.")
+            raise HTTPException(400, "Segmento nao reconhecido.")
     elif empresa.segmento and is_rascunho:
         segmento = limpar_segmento(empresa.segmento) if empresa.segmento.strip() else None
-
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
         if segmento:
             segmento = salvar_segmento(conn, segmento)
-        conn.execute(
-            text("""
-                INSERT INTO empresas (
-                    empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
-                    observacoes, cnpj, site, linkedin_empresa, responsavel_principal,
-                    ticket_medio_estimado, status, origem_lead, ultima_interacao, proxima_acao,
-                    data_proxima_acao, status_atualizado_em, motivo_perdido, temperatura
-                ) VALUES (
-                    :id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
-                    :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal,
-                    :ticket_medio_estimado, :status, :origem_lead, :ultima_interacao, :proxima_acao,
-                    :data_proxima_acao, NOW(), :motivo_perdido, :temperatura
-                )
-            """),
-            {
-                "id": empresa_id, "nome": empresa.nome, "segmento": segmento,
-                "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
-                "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
-                "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-                "linkedin_empresa": empresa.linkedin_empresa,
-                "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": empresa.ticket_medio_estimado,
-                "status": empresa.status or "Lead",
-                "origem_lead": empresa.origem_lead,
-                "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
-                "proxima_acao": empresa.proxima_acao,
-                "data_proxima_acao": empresa.data_proxima_acao,
-                "motivo_perdido": empresa.motivo_perdido,
-                "temperatura": empresa.temperatura
-            }
-        )
-        status_inicial = empresa.status or "Lead"
-        conn.execute(
-            text("""
-                INSERT INTO empresa_status_historico (
-                    historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em
-                ) VALUES (:id, :empresa_id, NULL, :status_novo, :observacao, NOW())
-            """),
-            {
-                "id": str(uuid.uuid4()), "empresa_id": empresa_id,
-                "status_novo": status_inicial,
-                "observacao": "Rascunho salvo" if is_rascunho else "Cadastro inicial"
-            }
-        )
+        conn.execute(text("""
+            INSERT INTO empresas (
+                empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
+                observacoes, cnpj, site, linkedin_empresa, responsavel_principal,
+                ticket_medio_estimado, status, origem_lead, ultima_interacao, proxima_acao,
+                data_proxima_acao, status_atualizado_em, motivo_perdido, temperatura
+            ) VALUES (
+                :id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
+                :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal,
+                :ticket_medio_estimado, :status, :origem_lead, :ultima_interacao, :proxima_acao,
+                :data_proxima_acao, NOW(), :motivo_perdido, :temperatura
+            )
+        """), {
+            "id": empresa_id, "nome": empresa.nome, "segmento": segmento,
+            "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
+            "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
+            "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
+            "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
+            "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status or "Lead",
+            "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
+            "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
+            "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
+        })
+        conn.execute(text("""
+            INSERT INTO empresa_status_historico (historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em)
+            VALUES (:id, :empresa_id, NULL, :status_novo, :observacao, NOW())
+        """), {"id": str(uuid.uuid4()), "empresa_id": empresa_id, "status_novo": empresa.status or "Lead",
+               "observacao": "Rascunho salvo" if is_rascunho else "Cadastro inicial"})
     return {"msg": "Empresa criada com sucesso 🚀", "empresa_id": empresa_id, "id": empresa_id}
 
 @app.put("/empresas/{empresa_id}")
 def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
-        result = conn.execute(
-            text("SELECT empresa_id, status FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}
-        ).fetchone()
+        result = conn.execute(text("SELECT empresa_id, status FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}).fetchone()
         if not result:
             raise HTTPException(404, "Empresa não encontrada")
-
         status_anterior = result._mapping.get("status")
         status_mudou = empresa.status is not None and empresa.status != status_anterior
-
-        conn.execute(
-            text("""
-                UPDATE empresas SET
-                    nome = COALESCE(:nome, nome),
-                    segmento = COALESCE(:segmento, segmento),
-                    porte = COALESCE(:porte, porte),
-                    cidade = COALESCE(:cidade, cidade),
-                    endereco = COALESCE(:endereco, endereco),
-                    cep = COALESCE(:cep, cep),
-                    bairro = COALESCE(:bairro, bairro),
-                    regiao = COALESCE(:regiao, regiao),
-                    observacoes = COALESCE(:observacoes, observacoes),
-                    cnpj = COALESCE(:cnpj, cnpj),
-                    site = COALESCE(:site, site),
-                    linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
-                    responsavel_principal = COALESCE(:responsavel_principal, responsavel_principal),
-                    ticket_medio_estimado = COALESCE(:ticket_medio_estimado, ticket_medio_estimado),
-                    status = COALESCE(:status, status),
-                    origem_lead = COALESCE(:origem_lead, origem_lead),
-                    ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
-                    proxima_acao = COALESCE(:proxima_acao, proxima_acao),
-                    data_proxima_acao = :data_proxima_acao,
-                    status_atualizado_em = CASE
-                        WHEN :status IS NOT NULL AND :status <> status THEN NOW()
-                        ELSE status_atualizado_em
-                    END,
-                    motivo_perdido = CASE
-                        WHEN :status IS NOT NULL AND :status <> 'Perdido' THEN NULL
-                        ELSE COALESCE(:motivo_perdido, motivo_perdido)
-                    END,
-                    temperatura = COALESCE(:temperatura, temperatura)
-                WHERE empresa_id = :id
-            """),
-            {
-                "id": empresa_id, "nome": empresa.nome, "segmento": empresa.segmento,
-                "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
-                "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
-                "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-                "linkedin_empresa": empresa.linkedin_empresa,
-                "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": empresa.ticket_medio_estimado,
-                "status": empresa.status, "origem_lead": empresa.origem_lead,
-                "ultima_interacao": empresa.ultima_interacao,
-                "proxima_acao": empresa.proxima_acao,
-                "data_proxima_acao": empresa.data_proxima_acao,
-                "motivo_perdido": empresa.motivo_perdido,
-                "temperatura": empresa.temperatura
-            }
-        )
-
+        conn.execute(text("""
+            UPDATE empresas SET
+                nome = COALESCE(:nome, nome), segmento = COALESCE(:segmento, segmento),
+                porte = COALESCE(:porte, porte), cidade = COALESCE(:cidade, cidade),
+                endereco = COALESCE(:endereco, endereco), cep = COALESCE(:cep, cep),
+                bairro = COALESCE(:bairro, bairro), regiao = COALESCE(:regiao, regiao),
+                observacoes = COALESCE(:observacoes, observacoes), cnpj = COALESCE(:cnpj, cnpj),
+                site = COALESCE(:site, site), linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
+                responsavel_principal = COALESCE(:responsavel_principal, responsavel_principal),
+                ticket_medio_estimado = COALESCE(:ticket_medio_estimado, ticket_medio_estimado),
+                status = COALESCE(:status, status), origem_lead = COALESCE(:origem_lead, origem_lead),
+                ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
+                proxima_acao = COALESCE(:proxima_acao, proxima_acao),
+                data_proxima_acao = :data_proxima_acao,
+                status_atualizado_em = CASE WHEN :status IS NOT NULL AND :status <> status THEN NOW() ELSE status_atualizado_em END,
+                motivo_perdido = CASE WHEN :status IS NOT NULL AND :status <> 'Perdido' THEN NULL ELSE COALESCE(:motivo_perdido, motivo_perdido) END,
+                temperatura = COALESCE(:temperatura, temperatura)
+            WHERE empresa_id = :id
+        """), {
+            "id": empresa_id, "nome": empresa.nome, "segmento": empresa.segmento,
+            "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
+            "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
+            "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
+            "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
+            "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status,
+            "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao,
+            "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
+            "motivo_perdido": empresa.motivo_perdido, "temperatura": empresa.temperatura
+        })
         if status_mudou:
-            conn.execute(
-                text("""
-                    INSERT INTO empresa_status_historico (
-                        historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em
-                    ) VALUES (:id, :empresa_id, :status_anterior, :status_novo, :observacao, NOW())
-                """),
-                {
-                    "id": str(uuid.uuid4()), "empresa_id": empresa_id,
-                    "status_anterior": status_anterior, "status_novo": empresa.status,
-                    "observacao": empresa.motivo_perdido if empresa.status == "Perdido" else None,
-                }
-            )
+            conn.execute(text("""
+                INSERT INTO empresa_status_historico (historico_id, empresa_id, status_anterior, status_novo, observacao, alterado_em)
+                VALUES (:id, :empresa_id, :status_anterior, :status_novo, :observacao, NOW())
+            """), {"id": str(uuid.uuid4()), "empresa_id": empresa_id, "status_anterior": status_anterior,
+                   "status_novo": empresa.status, "observacao": empresa.motivo_perdido if empresa.status == "Perdido" else None})
     return {"msg": "Empresa atualizada com sucesso 🚀"}
 
 @app.delete("/empresas/{empresa_id}")
@@ -860,10 +888,7 @@ def deletar_empresa(empresa_id: str):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": empresa_id})
         conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": empresa_id})
-        result = conn.execute(
-            text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"),
-            {"id": empresa_id}
-        ).fetchone()
+        result = conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"), {"id": empresa_id}).fetchone()
     if not result:
         raise HTTPException(404, "Empresa não encontrada")
     return {"msg": "Empresa deletada com sucesso"}
@@ -874,90 +899,56 @@ def deletar_empresa(empresa_id: str):
 @app.get("/contatos/{empresa_id}")
 def listar_contatos_empresa(empresa_id: str):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
-            {"id": empresa_id}
-        )
+        result = conn.execute(text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"), {"id": empresa_id})
         return [dict(row._mapping) for row in result]
 
 @app.post("/contatos")
 def criar_contato(contato: dict):
     with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO contatos (
-                    contato_id, empresa_id, nome, funcao, email, celular, observacoes,
-                    prioridade, whatsapp, linkedin, nivel_influencia, decisor,
-                    data_ultimo_contato, canal_preferido
-                ) VALUES (
-                    :id, :empresa_id, :nome, :funcao, :email, :celular, :observacoes,
-                    :prioridade, :whatsapp, :linkedin, :nivel_influencia, :decisor,
-                    :data_ultimo_contato, :canal_preferido
-                )
-            """),
-            {
-                "id": str(uuid.uuid4()),
-                "empresa_id": contato.get("empresa_id"),
-                "nome": contato.get("nome"),
-                "funcao": contato.get("funcao"),
-                "email": contato.get("email"),
-                "celular": contato.get("celular"),
-                "observacoes": contato.get("observacoes"),
-                "prioridade": contato.get("prioridade"),
-                "whatsapp": contato.get("whatsapp"),
-                "linkedin": contato.get("linkedin"),
-                "nivel_influencia": contato.get("nivel_influencia"),
-                "decisor": contato.get("decisor"),
-                "data_ultimo_contato": contato.get("data_ultimo_contato"),
-                "canal_preferido": contato.get("canal_preferido"),
-            }
-        )
+        conn.execute(text("""
+            INSERT INTO contatos (contato_id, empresa_id, nome, funcao, email, celular, observacoes,
+                prioridade, whatsapp, linkedin, nivel_influencia, decisor, data_ultimo_contato, canal_preferido)
+            VALUES (:id, :empresa_id, :nome, :funcao, :email, :celular, :observacoes,
+                :prioridade, :whatsapp, :linkedin, :nivel_influencia, :decisor, :data_ultimo_contato, :canal_preferido)
+        """), {
+            "id": str(uuid.uuid4()), "empresa_id": contato.get("empresa_id"), "nome": contato.get("nome"),
+            "funcao": contato.get("funcao"), "email": contato.get("email"), "celular": contato.get("celular"),
+            "observacoes": contato.get("observacoes"), "prioridade": contato.get("prioridade"),
+            "whatsapp": contato.get("whatsapp"), "linkedin": contato.get("linkedin"),
+            "nivel_influencia": contato.get("nivel_influencia"), "decisor": contato.get("decisor"),
+            "data_ultimo_contato": contato.get("data_ultimo_contato"), "canal_preferido": contato.get("canal_preferido"),
+        })
     return {"msg": "Contato criado com sucesso 🚀"}
 
 @app.put("/contatos/{contato_id}")
 def atualizar_contato(contato_id: str, contato: ContatoUpdate):
     with engine.begin() as conn:
-        result = conn.execute(
-            text("SELECT contato_id FROM contatos WHERE contato_id = :id"),
-            {"id": contato_id}
-        ).fetchone()
+        result = conn.execute(text("SELECT contato_id FROM contatos WHERE contato_id = :id"), {"id": contato_id}).fetchone()
         if not result:
             raise HTTPException(404, "Contato não encontrado")
-        conn.execute(
-            text("""
-                UPDATE contatos SET
-                    nome = COALESCE(:nome, nome),
-                    funcao = COALESCE(:funcao, funcao),
-                    email = COALESCE(:email, email),
-                    celular = COALESCE(:celular, celular),
-                    whatsapp = COALESCE(:whatsapp, whatsapp),
-                    linkedin = COALESCE(:linkedin, linkedin),
-                    observacoes = COALESCE(:observacoes, observacoes),
-                    prioridade = COALESCE(:prioridade, prioridade),
-                    nivel_influencia = COALESCE(:nivel_influencia, nivel_influencia),
-                    decisor = COALESCE(:decisor, decisor),
-                    canal_preferido = COALESCE(:canal_preferido, canal_preferido),
-                    data_ultimo_contato = COALESCE(:data_ultimo_contato, data_ultimo_contato)
-                WHERE contato_id = :id
-            """),
-            {
-                "id": contato_id,
-                "nome": contato.nome, "funcao": contato.funcao, "email": contato.email,
-                "celular": contato.celular, "whatsapp": contato.whatsapp, "linkedin": contato.linkedin,
-                "observacoes": contato.observacoes, "prioridade": contato.prioridade,
-                "nivel_influencia": contato.nivel_influencia, "decisor": contato.decisor,
-                "canal_preferido": contato.canal_preferido, "data_ultimo_contato": contato.data_ultimo_contato,
-            }
-        )
+        conn.execute(text("""
+            UPDATE contatos SET
+                nome = COALESCE(:nome, nome), funcao = COALESCE(:funcao, funcao),
+                email = COALESCE(:email, email), celular = COALESCE(:celular, celular),
+                whatsapp = COALESCE(:whatsapp, whatsapp), linkedin = COALESCE(:linkedin, linkedin),
+                observacoes = COALESCE(:observacoes, observacoes), prioridade = COALESCE(:prioridade, prioridade),
+                nivel_influencia = COALESCE(:nivel_influencia, nivel_influencia), decisor = COALESCE(:decisor, decisor),
+                canal_preferido = COALESCE(:canal_preferido, canal_preferido),
+                data_ultimo_contato = COALESCE(:data_ultimo_contato, data_ultimo_contato)
+            WHERE contato_id = :id
+        """), {
+            "id": contato_id, "nome": contato.nome, "funcao": contato.funcao, "email": contato.email,
+            "celular": contato.celular, "whatsapp": contato.whatsapp, "linkedin": contato.linkedin,
+            "observacoes": contato.observacoes, "prioridade": contato.prioridade,
+            "nivel_influencia": contato.nivel_influencia, "decisor": contato.decisor,
+            "canal_preferido": contato.canal_preferido, "data_ultimo_contato": contato.data_ultimo_contato,
+        })
     return {"msg": "Contato atualizado com sucesso 🚀"}
 
 @app.delete("/contatos/{contato_id}")
 def deletar_contato(contato_id: str):
     with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM contatos WHERE contato_id = :id RETURNING contato_id"),
-            {"id": contato_id}
-        ).fetchone()
+        result = conn.execute(text("DELETE FROM contatos WHERE contato_id = :id RETURNING contato_id"), {"id": contato_id}).fetchone()
     if not result:
         raise HTTPException(404, "Contato não encontrado")
     return {"msg": "Contato deletado com sucesso"}
@@ -970,14 +961,11 @@ async def criar_usuario(usuario: UsuarioCreate):
     token_ativacao = str(uuid.uuid4())
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao, data_criacao)
-                    VALUES (:usuario_id, :nome, :email, :telefone, FALSE, :token, NOW())
-                """),
-                {"usuario_id": str(uuid.uuid4()), "nome": usuario.nome, "email": usuario.email,
-                 "telefone": usuario.telefone, "token": token_ativacao}
-            )
+            conn.execute(text("""
+                INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao, data_criacao)
+                VALUES (:usuario_id, :nome, :email, :telefone, FALSE, :token, NOW())
+            """), {"usuario_id": str(uuid.uuid4()), "nome": usuario.nome, "email": usuario.email,
+                   "telefone": usuario.telefone, "token": token_ativacao})
         await enviar_email(usuario.email, token_ativacao)
         return {"msg": "Usuário criado. Verifique seu email 📩"}
     except IntegrityError:
@@ -987,13 +975,10 @@ async def criar_usuario(usuario: UsuarioCreate):
 def ativar_conta(dados: AtivarConta):
     senha_hash = hash_senha(dados.senha)
     with engine.begin() as conn:
-        result = conn.execute(
-            text("""
-                UPDATE usuarios SET senha_hash = :senha, ativo = TRUE, token_ativacao = NULL
-                WHERE token_ativacao = :token RETURNING usuario_id
-            """),
-            {"senha": senha_hash, "token": dados.token}
-        ).fetchone()
+        result = conn.execute(text("""
+            UPDATE usuarios SET senha_hash = :senha, ativo = TRUE, token_ativacao = NULL
+            WHERE token_ativacao = :token RETURNING usuario_id
+        """), {"senha": senha_hash, "token": dados.token}).fetchone()
         if not result:
             raise HTTPException(400, "Token inválido")
     return {"msg": "Conta ativada com sucesso 🚀"}
@@ -1001,9 +986,7 @@ def ativar_conta(dados: AtivarConta):
 @app.post("/login", response_model=Token)
 def login(dados: Login):
     with engine.connect() as conn:
-        usuario = conn.execute(
-            text("SELECT * FROM usuarios WHERE email = :email"), {"email": dados.email}
-        ).fetchone()
+        usuario = conn.execute(text("SELECT * FROM usuarios WHERE email = :email"), {"email": dados.email}).fetchone()
     if not usuario:
         raise HTTPException(401, "Usuário não encontrado")
     usuario = dict(usuario._mapping)
