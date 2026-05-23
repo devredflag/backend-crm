@@ -18,6 +18,9 @@ import re
 import unicodedata
 import httpx
 import resend
+import base64
+import json
+import requests as http_requests
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
 
@@ -363,6 +366,24 @@ def garantir_tabela_notificacoes(conn):
             criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
         )
     """))
+    # ── ADICIONAR ABAIXO ──────────────────────────────
+    conn.execute(text("ALTER TABLE notificacoes ADD COLUMN IF NOT EXISTS platform VARCHAR(30)"))
+    conn.execute(text("ALTER TABLE notificacoes ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS email_subscriptions (
+            sub_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            usuario_email TEXT NOT NULL,
+            provider VARCHAR(20) NOT NULL,
+            subscription_id TEXT,
+            email_address TEXT,
+            history_id BIGINT,
+            expires_at TIMESTAMP,
+            access_token TEXT,
+            refresh_token TEXT,
+            criado_em TIMESTAMP DEFAULT NOW(),
+            atualizado_em TIMESTAMP DEFAULT NOW()
+        )
+    """))
 
 # =========================
 # JOB: RASCUNHOS EXPIRÁVEIS
@@ -446,9 +467,338 @@ def verificar_rascunhos_expirados():
     except Exception as e:
         print(f"🔴 JOB ERRO: {str(e)}")
 
+# =========================
+# WEBHOOK HELPERS
+# =========================
+
+def find_company_by_sender(conn, sender_email: str):
+    result = conn.execute(text("""
+        SELECT c.empresa_id, c.contato_id, e.nome as empresa_nome
+        FROM contatos c
+        JOIN empresas e ON e.empresa_id = c.empresa_id
+        WHERE LOWER(c.email) = LOWER(:email)
+        LIMIT 1
+    """), {"email": sender_email.strip()}).fetchone()
+    if result:
+        return result._mapping["empresa_id"], result._mapping["contato_id"], result._mapping["empresa_nome"]
+    return None, None, None
+
+
+def create_interaction_notification(conn, usuario_email: str, empresa_id, empresa_nome: str,
+                                     platform: str, sender_name: str, sender_email: str, subject: str):
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(minutes=10)
+    existe = conn.execute(text("""
+        SELECT 1 FROM notificacoes
+        WHERE empresa_id = :eid AND platform = :platform
+          AND criado_em >= :cutoff
+    """), {"eid": str(empresa_id), "platform": platform, "cutoff": cutoff}).fetchone()
+    if existe:
+        return
+
+    label = "Gmail" if platform == "gmail" else "Outlook"
+    conn.execute(text("""
+        INSERT INTO notificacoes
+            (notificacao_id, usuario_email, tipo, titulo, mensagem,
+             empresa_id, empresa_nome, platform, meta, lida, criado_em)
+        VALUES
+            (:id, :email, 'email_interaction', :titulo, :mensagem,
+             :eid, :enome, :platform, :meta::jsonb, FALSE, NOW())
+    """), {
+        "id": str(uuid.uuid4()),
+        "email": usuario_email,
+        "titulo": f"Cliente respondeu no {label}",
+        "mensagem": f"{sender_name or sender_email} ({empresa_nome}) enviou uma mensagem via {label}.",
+        "eid": str(empresa_id),
+        "enome": empresa_nome,
+        "platform": platform,
+        "meta": json.dumps({"sender_email": sender_email, "sender_name": sender_name, "subject": subject}),
+    })
+
+
+def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str, gmail_address: str):
+    try:
+        res = http_requests.post(
+            f"https://gmail.googleapis.com/gmail/v1/users/{gmail_address}/watch",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"topicName": GMAIL_PUBSUB_TOPIC, "labelIds": ["INBOX"]},
+            timeout=15,
+        )
+        if not res.ok:
+            print(f"[Gmail Watch] Erro: {res.text}")
+            return
+        data = res.json()
+        history_id = int(data.get("historyId", 0))
+        expires_ms  = int(data.get("expiration", 0))
+        expires_at  = datetime.utcfromtimestamp(expires_ms / 1000) if expires_ms else None
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            existing = conn.execute(text("""
+                SELECT sub_id FROM email_subscriptions
+                WHERE usuario_email = :email AND provider = 'gmail'
+            """), {"email": usuario_email}).fetchone()
+            if existing:
+                conn.execute(text("""
+                    UPDATE email_subscriptions
+                    SET history_id=:hid, expires_at=:exp, access_token=:at,
+                        refresh_token=:rt, email_address=:addr, atualizado_em=NOW()
+                    WHERE usuario_email=:email AND provider='gmail'
+                """), {"hid": history_id, "exp": expires_at, "at": access_token,
+                       "rt": refresh_token, "addr": gmail_address, "email": usuario_email})
+            else:
+                conn.execute(text("""
+                    INSERT INTO email_subscriptions
+                        (sub_id, usuario_email, provider, email_address, history_id,
+                         expires_at, access_token, refresh_token)
+                    VALUES (:id, :email, 'gmail', :addr, :hid, :exp, :at, :rt)
+                """), {"id": str(uuid.uuid4()), "email": usuario_email, "addr": gmail_address,
+                       "hid": history_id, "exp": expires_at, "at": access_token, "rt": refresh_token})
+        print(f"[Gmail Watch] OK para {gmail_address}, historyId={history_id}")
+    except Exception as e:
+        print(f"[Gmail Watch] Exceção: {e}")
+
+
+def setup_outlook_subscription(usuario_email: str, access_token: str, refresh_token: str):
+    try:
+        from datetime import timedelta
+        expires_at = datetime.utcnow() + timedelta(minutes=4000)
+        res = http_requests.post(
+            "https://graph.microsoft.com/v1.0/subscriptions",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "changeType": "created",
+                "notificationUrl": f"{BACKEND_URL}/webhooks/outlook",
+                "resource": "me/mailFolders('Inbox')/messages",
+                "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
+                "clientState": OUTLOOK_WEBHOOK_SECRET,
+            },
+            timeout=15,
+        )
+        if not res.ok:
+            print(f"[Outlook Sub] Erro: {res.text}")
+            return
+        sub_id = res.json().get("id")
+        me_res = http_requests.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+        )
+        email_address = me_res.json().get("mail") or me_res.json().get("userPrincipalName", "")
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            existing = conn.execute(text("""
+                SELECT sub_id FROM email_subscriptions
+                WHERE usuario_email = :email AND provider = 'outlook'
+            """), {"email": usuario_email}).fetchone()
+            if existing:
+                conn.execute(text("""
+                    UPDATE email_subscriptions
+                    SET subscription_id=:sid, expires_at=:exp, access_token=:at,
+                        refresh_token=:rt, email_address=:addr, atualizado_em=NOW()
+                    WHERE usuario_email=:email AND provider='outlook'
+                """), {"sid": sub_id, "exp": expires_at, "at": access_token,
+                       "rt": refresh_token, "addr": email_address, "email": usuario_email})
+            else:
+                conn.execute(text("""
+                    INSERT INTO email_subscriptions
+                        (sub_id, usuario_email, provider, subscription_id,
+                         email_address, expires_at, access_token, refresh_token)
+                    VALUES (:id, :email, 'outlook', :sid, :addr, :exp, :at, :rt)
+                """), {"id": str(uuid.uuid4()), "email": usuario_email, "sid": sub_id,
+                       "addr": email_address, "exp": expires_at, "at": access_token, "rt": refresh_token})
+        print(f"[Outlook Sub] OK para {email_address}, id={sub_id}")
+    except Exception as e:
+        print(f"[Outlook Sub] Exceção: {e}")
+
+
+# =========================
+# WEBHOOKS
+# =========================
+
+@app.post("/webhooks/gmail", include_in_schema=False)
+async def gmail_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    msg_data = body.get("message", {}).get("data", "")
+    if not msg_data:
+        return {"ok": True}
+
+    try:
+        decoded    = json.loads(base64.b64decode(msg_data).decode("utf-8"))
+        gmail_addr = decoded.get("emailAddress", "")
+        new_hist   = int(decoded.get("historyId", 0))
+    except Exception as e:
+        print(f"[Gmail Webhook] Decode erro: {e}")
+        return {"ok": True}
+
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        sub = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider='gmail' AND email_address=:addr
+        """), {"addr": gmail_addr}).fetchone()
+        if not sub:
+            return {"ok": True}
+
+        sub = dict(sub._mapping)
+        old_hist     = sub.get("history_id") or new_hist
+        access_token = sub.get("access_token", "")
+        refresh_token = sub.get("refresh_token", "")
+        usuario_email = sub.get("usuario_email", "")
+
+        if new_hist <= old_hist:
+            return {"ok": True}
+
+        # Atualiza historyId
+        conn.execute(text("""
+            UPDATE email_subscriptions SET history_id=:hid, atualizado_em=NOW()
+            WHERE provider='gmail' AND email_address=:addr
+        """), {"hid": new_hist, "addr": gmail_addr})
+
+    # Busca mensagens novas
+    hist_res = http_requests.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
+        f"?startHistoryId={old_hist}&historyTypes=messageAdded&labelId=INBOX",
+        headers={"Authorization": f"Bearer {access_token}"}, timeout=15,
+    )
+    if not hist_res.ok:
+        return {"ok": True}
+
+    for record in hist_res.json().get("history", []):
+        for entry in record.get("messagesAdded", []):
+            msg_id = entry.get("message", {}).get("id")
+            if not msg_id:
+                continue
+            msg_res = http_requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
+                "?format=metadata&metadataHeaders=From&metadataHeaders=Subject",
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+            )
+            if not msg_res.ok:
+                continue
+            headers_map = {h["name"].lower(): h["value"]
+                           for h in msg_res.json().get("payload", {}).get("headers", [])}
+            from_raw = headers_map.get("from", "")
+            subject  = headers_map.get("subject", "")
+            match = re.match(r'^(.*?)\s*<(.+?)>$', from_raw.strip())
+            sender_name  = match.group(1).strip().strip('"') if match else ""
+            sender_email = match.group(2).strip() if match else from_raw.strip()
+            if sender_email.lower() == gmail_addr.lower():
+                continue
+            with engine.begin() as conn:
+                empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+                if empresa_id:
+                    create_interaction_notification(
+                        conn, usuario_email, empresa_id, empresa_nome,
+                        "gmail", sender_name, sender_email, subject
+                    )
+    return {"ok": True}
+
+
+@app.api_route("/webhooks/outlook", methods=["GET", "POST"], include_in_schema=False)
+async def outlook_webhook(request: Request):
+    validation_token = request.query_params.get("validationToken")
+    if validation_token:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=validation_token, status_code=200)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    for notif in body.get("value", []):
+        if notif.get("clientState") != OUTLOOK_WEBHOOK_SECRET:
+            continue
+        sub_id  = notif.get("subscriptionId")
+        msg_id  = notif.get("resourceData", {}).get("id")
+        if not msg_id:
+            continue
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            sub = conn.execute(text("""
+                SELECT * FROM email_subscriptions
+                WHERE provider='outlook' AND subscription_id=:sid
+            """), {"sid": sub_id}).fetchone()
+            if not sub:
+                continue
+            sub = dict(sub._mapping)
+
+        access_token  = sub.get("access_token", "")
+        usuario_email = sub.get("usuario_email", "")
+        own_email     = sub.get("email_address", "")
+
+        msg_res = http_requests.get(
+            f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
+            "?$select=from,subject",
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+        )
+        if not msg_res.ok:
+            continue
+        from_obj     = msg_res.json().get("from", {}).get("emailAddress", {})
+        sender_email = from_obj.get("address", "")
+        sender_name  = from_obj.get("name", "")
+        subject      = msg_res.json().get("subject", "")
+        if not sender_email or sender_email.lower() == own_email.lower():
+            continue
+        with engine.begin() as conn:
+            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+            if empresa_id:
+                create_interaction_notification(
+                    conn, usuario_email, empresa_id, empresa_nome,
+                    "outlook", sender_name, sender_email, subject
+                )
+    return {"ok": True}
+
+def renovar_gmail_watches():
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        subs = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider='gmail'
+              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '36 hours')
+        """)).fetchall()
+    for sub in subs:
+        s = dict(sub._mapping)
+        setup_gmail_watch(
+            s["usuario_email"], s.get("access_token",""),
+            s.get("refresh_token",""), s.get("email_address","")
+        )
+
+def renovar_outlook_subscriptions():
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        subs = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider='outlook'
+              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '12 hours')
+        """)).fetchall()
+    for sub in subs:
+        s = dict(sub._mapping)
+        if not s.get("subscription_id"):
+            continue
+        from datetime import timedelta
+        new_exp = datetime.utcnow() + timedelta(minutes=4000)
+        http_requests.patch(
+            f"https://graph.microsoft.com/v1.0/subscriptions/{s['subscription_id']}",
+            headers={"Authorization": f"Bearer {s.get('access_token','')}",
+                     "Content-Type": "application/json"},
+            json={"expirationDateTime": new_exp.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")},
+            timeout=10,
+        )
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE email_subscriptions SET expires_at=:exp, atualizado_em=NOW()
+                WHERE subscription_id=:sid
+            """), {"exp": new_exp, "sid": s["subscription_id"]})
+
 # Inicia o scheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)  # Roda todo dia às 8h UTC
+scheduler.add_job(renovar_gmail_watches,          "interval", hours=6, id="renew_gmail")
+scheduler.add_job(renovar_outlook_subscriptions,  "interval", hours=6, id="renew_outlook")
 scheduler.start()
 print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
 
@@ -577,6 +927,14 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
         garantir_colunas_oauth(conn)
         conn.execute(text("UPDATE usuarios SET outlook_access_token = :a, outlook_refresh_token = :r WHERE email = :e"),
                      {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
+    # Configura a subscription do Outlook em background
+    import threading
+    threading.Thread(
+        target=setup_outlook_subscription,
+        args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
+        daemon=True
+    ).start()
+
     return {"msg": "Outlook conectado com sucesso 🚀"}
 
 @app.get("/auth/outlook/status")
@@ -621,6 +979,22 @@ async def google_callback(code: str, email: str = Depends(get_current_user)):
         garantir_colunas_oauth(conn)
         conn.execute(text("UPDATE usuarios SET google_access_token = :a, google_refresh_token = :r WHERE email = :e"),
                      {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
+    # Busca o e-mail do usuário no Google
+    async with httpx.AsyncClient() as client:
+        userinfo_res = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {tokens.get('access_token')}"}
+        )
+    gmail_address = userinfo_res.json().get("email", email)
+
+    # Configura o watch do Gmail em background
+    import threading
+    threading.Thread(
+        target=setup_gmail_watch,
+        args=(email, tokens.get("access_token"), tokens.get("refresh_token", ""), gmail_address),
+        daemon=True
+    ).start()
+
     return {"msg": "Google conectado com sucesso 🚀"}
 
 @app.get("/auth/google/status")
