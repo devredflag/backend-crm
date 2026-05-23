@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, date
 from typing import Optional
+from apscheduler.schedulers.background import BackgroundScheduler
 import uuid
 import jwt
 import os
@@ -33,13 +34,11 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
-# Microsoft OAuth
 MICROSOFT_CLIENT_ID     = os.getenv("MICROSOFT_CLIENT_ID")
 MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
 MICROSOFT_TENANT_ID     = os.getenv("MICROSOFT_TENANT_ID")
 MICROSOFT_REDIRECT_URI  = os.getenv("MICROSOFT_REDIRECT_URI")
 
-# Google OAuth
 GOOGLE_CLIENT_ID        = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET    = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI     = os.getenv("GOOGLE_REDIRECT_URI")
@@ -317,7 +316,7 @@ def garantir_tabela_segmentos(conn):
 def salvar_segmento(conn, nome: str) -> str:
     nome_limpo = limpar_segmento(nome)
     if not segmento_valido(nome_limpo):
-        raise HTTPException(400, "Segmento nao reconhecido. Escolha um segmento da lista ou informe um segmento de mercado valido.")
+        raise HTTPException(400, "Segmento nao reconhecido.")
     garantir_tabela_segmentos(conn)
     conn.execute(
         text("""
@@ -350,12 +349,173 @@ def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_access_token text"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_refresh_token text"))
 
+def garantir_tabela_notificacoes(conn):
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS notificacoes (
+            notificacao_id uuid PRIMARY KEY,
+            usuario_email text NOT NULL,
+            tipo text NOT NULL,
+            titulo text NOT NULL,
+            mensagem text NOT NULL,
+            empresa_id uuid,
+            empresa_nome text,
+            lida boolean DEFAULT FALSE,
+            criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+
+# =========================
+# JOB: RASCUNHOS EXPIRÁVEIS
+# =========================
+def verificar_rascunhos_expirados():
+    """
+    Roda diariamente:
+    - 25 dias: notificação de aviso (5 dias restantes)
+    - 30 dias: notificação de exclusão + exclui o rascunho
+    """
+    print("⏰ JOB: verificando rascunhos expirados...")
+    try:
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+
+            agora = datetime.utcnow()
+            limite_aviso   = agora - timedelta(days=25)
+            limite_exclusao = agora - timedelta(days=30)
+
+            # Busca rascunhos com 25-29 dias (aviso de 5 dias)
+            avisos = conn.execute(text("""
+                SELECT e.empresa_id, e.nome, e.status_atualizado_em, u.email
+                FROM empresas e
+                JOIN usuarios u ON u.ativo = TRUE
+                WHERE e.status = 'Rascunho'
+                  AND e.status_atualizado_em <= :limite_aviso
+                  AND e.status_atualizado_em > :limite_exclusao
+            """), {"limite_aviso": limite_aviso, "limite_exclusao": limite_exclusao}).fetchall()
+
+            for r in avisos:
+                dias_restantes = 30 - int((agora - r.status_atualizado_em).days)
+                # Evita duplicar notificação no mesmo dia
+                existe = conn.execute(text("""
+                    SELECT 1 FROM notificacoes
+                    WHERE empresa_id = :eid AND tipo = 'rascunho_aviso'
+                      AND criado_em >= NOW() - INTERVAL '23 hours'
+                """), {"eid": r.empresa_id}).fetchone()
+                if not existe:
+                    conn.execute(text("""
+                        INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
+                        VALUES (:id, :email, 'rascunho_aviso', :titulo, :mensagem, :eid, :enome)
+                    """), {
+                        "id": str(uuid.uuid4()),
+                        "email": r.email,
+                        "titulo": f"Rascunho expira em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}",
+                        "mensagem": f"O rascunho '{r.nome}' será excluído automaticamente em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}. Complete o cadastro para não perder.",
+                        "eid": r.empresa_id,
+                        "enome": r.nome,
+                    })
+                    print(f"📢 Aviso gerado para rascunho: {r.nome}")
+
+            # Busca rascunhos com 30+ dias (exclusão)
+            expirados = conn.execute(text("""
+                SELECT e.empresa_id, e.nome, u.email
+                FROM empresas e
+                JOIN usuarios u ON u.ativo = TRUE
+                WHERE e.status = 'Rascunho'
+                  AND e.status_atualizado_em <= :limite_exclusao
+            """), {"limite_exclusao": limite_exclusao}).fetchall()
+
+            for r in expirados:
+                # Notificação de exclusão
+                conn.execute(text("""
+                    INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
+                    VALUES (:id, :email, 'rascunho_excluido', :titulo, :mensagem, :eid, :enome)
+                """), {
+                    "id": str(uuid.uuid4()),
+                    "email": r.email,
+                    "titulo": "Rascunho excluído automaticamente",
+                    "mensagem": f"O rascunho '{r.nome}' foi excluído por inatividade após 30 dias. Cadastre novamente se necessário.",
+                    "eid": r.empresa_id,
+                    "enome": r.nome,
+                })
+                # Exclui contatos e o rascunho
+                conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": r.empresa_id})
+                conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": r.empresa_id})
+                conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id"), {"id": r.empresa_id})
+                print(f"🗑️ Rascunho excluído: {r.nome}")
+
+        print("✅ JOB: verificação de rascunhos concluída")
+    except Exception as e:
+        print(f"🔴 JOB ERRO: {str(e)}")
+
+# Inicia o scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)  # Roda todo dia às 8h UTC
+scheduler.start()
+print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
+
 # =========================
 # ROTAS BÁSICAS
 # =========================
 @app.get("/")
 def home():
     return {"msg": "API rodando 🚀"}
+
+# Rota manual para disparar o job (útil para testar)
+@app.post("/admin/verificar-rascunhos")
+def trigger_verificar_rascunhos():
+    verificar_rascunhos_expirados()
+    return {"msg": "Verificação executada"}
+
+# =========================
+# NOTIFICAÇÕES
+# =========================
+@app.get("/notificacoes")
+def listar_notificacoes(email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        result = conn.execute(text("""
+            SELECT * FROM notificacoes
+            WHERE usuario_email = :email
+            ORDER BY criado_em DESC
+            LIMIT 50
+        """), {"email": email})
+        return [dict(row._mapping) for row in result]
+
+@app.get("/notificacoes/nao-lidas")
+def contar_nao_lidas(email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        result = conn.execute(text("""
+            SELECT COUNT(*) as total FROM notificacoes
+            WHERE usuario_email = :email AND lida = FALSE
+        """), {"email": email}).fetchone()
+        return {"total": result._mapping["total"]}
+
+@app.put("/notificacoes/{notificacao_id}/ler")
+def marcar_lida(notificacao_id: str, email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE notificacoes SET lida = TRUE
+            WHERE notificacao_id = :id AND usuario_email = :email
+        """), {"id": notificacao_id, "email": email})
+    return {"msg": "Notificação marcada como lida"}
+
+@app.put("/notificacoes/ler-todas")
+def marcar_todas_lidas(email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE notificacoes SET lida = TRUE
+            WHERE usuario_email = :email AND lida = FALSE
+        """), {"email": email})
+    return {"msg": "Todas as notificações marcadas como lidas"}
+
+@app.delete("/notificacoes/{notificacao_id}")
+def deletar_notificacao(notificacao_id: str, email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        conn.execute(text("""
+            DELETE FROM notificacoes
+            WHERE notificacao_id = :id AND usuario_email = :email
+        """), {"id": notificacao_id, "email": email})
+    return {"msg": "Notificação removida"}
 
 # =========================
 # MEU PERFIL
@@ -396,47 +556,33 @@ def update_me(dados: UsuarioUpdate, email: str = Depends(get_current_user)):
 def outlook_login():
     url = (
         f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
-        f"?client_id={MICROSOFT_CLIENT_ID}"
-        f"&response_type=code"
+        f"?client_id={MICROSOFT_CLIENT_ID}&response_type=code"
         f"&redirect_uri={MICROSOFT_REDIRECT_URI}"
-        f"&scope=Calendars.ReadWrite%20Mail.Send%20offline_access"
-        f"&response_mode=query"
+        f"&scope=Calendars.ReadWrite%20Mail.Send%20offline_access&response_mode=query"
     )
     return {"auth_url": url}
 
 @app.get("/auth/outlook/callback")
 async def outlook_callback(code: str, email: str = Depends(get_current_user)):
-    print(f"📩 OUTLOOK CALLBACK recebido para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
-            data={
-                "client_id": MICROSOFT_CLIENT_ID,
-                "client_secret": MICROSOFT_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": MICROSOFT_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            }
+            data={"client_id": MICROSOFT_CLIENT_ID, "client_secret": MICROSOFT_CLIENT_SECRET,
+                  "code": code, "redirect_uri": MICROSOFT_REDIRECT_URI, "grant_type": "authorization_code"}
         )
     tokens = response.json()
-    print(f"📩 OUTLOOK TOKEN RESPONSE status: {response.status_code}")
     if "access_token" not in tokens:
-        raise HTTPException(400, f"Erro ao obter tokens: {tokens.get('error_description', 'Erro desconhecido')}")
+        raise HTTPException(400, f"Erro: {tokens.get('error_description', 'Erro desconhecido')}")
     with engine.begin() as conn:
         garantir_colunas_oauth(conn)
-        conn.execute(text("""
-            UPDATE usuarios SET outlook_access_token = :access, outlook_refresh_token = :refresh
-            WHERE email = :email
-        """), {"access": tokens.get("access_token"), "refresh": tokens.get("refresh_token"), "email": email})
-    print(f"✅ OUTLOOK tokens salvos para: {email}")
+        conn.execute(text("UPDATE usuarios SET outlook_access_token = :a, outlook_refresh_token = :r WHERE email = :e"),
+                     {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
     return {"msg": "Outlook conectado com sucesso 🚀"}
 
 @app.get("/auth/outlook/status")
 def outlook_status(email: str = Depends(get_current_user)):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT outlook_access_token FROM usuarios WHERE email = :email"), {"email": email}
-        ).fetchone()
+        result = conn.execute(text("SELECT outlook_access_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
     if not result:
         raise HTTPException(404, "Usuário não encontrado")
     return {"conectado": result._mapping.get("outlook_access_token") is not None}
@@ -453,49 +599,34 @@ def outlook_disconnect(email: str = Depends(get_current_user)):
 @app.get("/auth/google/login")
 def google_login():
     url = (
-        f"https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={GOOGLE_CLIENT_ID}"
-        f"&response_type=code"
-        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"https://accounts.google.com/o/oauth2/v2/auth?client_id={GOOGLE_CLIENT_ID}"
+        f"&response_type=code&redirect_uri={GOOGLE_REDIRECT_URI}"
         f"&scope=https://www.googleapis.com/auth/gmail.send%20https://www.googleapis.com/auth/calendar.events%20https://www.googleapis.com/auth/calendar"
-        f"&access_type=offline"
-        f"&prompt=consent"
+        f"&access_type=offline&prompt=consent"
     )
     return {"auth_url": url}
 
 @app.get("/auth/google/callback")
 async def google_callback(code: str, email: str = Depends(get_current_user)):
-    print(f"📩 GOOGLE CALLBACK recebido para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": GOOGLE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            }
+            data={"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
+                  "code": code, "redirect_uri": GOOGLE_REDIRECT_URI, "grant_type": "authorization_code"}
         )
     tokens = response.json()
-    print(f"📩 GOOGLE TOKEN RESPONSE status: {response.status_code} | keys: {list(tokens.keys())}")
     if "access_token" not in tokens:
-        raise HTTPException(400, f"Erro ao obter tokens Google: {tokens.get('error_description', tokens)}")
+        raise HTTPException(400, f"Erro Google: {tokens.get('error_description', tokens)}")
     with engine.begin() as conn:
         garantir_colunas_oauth(conn)
-        conn.execute(text("""
-            UPDATE usuarios SET google_access_token = :access, google_refresh_token = :refresh
-            WHERE email = :email
-        """), {"access": tokens.get("access_token"), "refresh": tokens.get("refresh_token"), "email": email})
-    print(f"✅ GOOGLE tokens salvos para: {email}")
+        conn.execute(text("UPDATE usuarios SET google_access_token = :a, google_refresh_token = :r WHERE email = :e"),
+                     {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
     return {"msg": "Google conectado com sucesso 🚀"}
 
 @app.get("/auth/google/status")
 def google_status(email: str = Depends(get_current_user)):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT google_access_token FROM usuarios WHERE email = :email"), {"email": email}
-        ).fetchone()
+        result = conn.execute(text("SELECT google_access_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
     if not result:
         raise HTTPException(404, "Usuário não encontrado")
     return {"conectado": result._mapping.get("google_access_token") is not None}
@@ -507,66 +638,47 @@ def google_disconnect(email: str = Depends(get_current_user)):
     return {"msg": "Google desconectado com sucesso"}
 
 # =========================
-# REUNIÃO OUTLOOK CALENDAR
+# REUNIÃO OUTLOOK
 # =========================
 async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
-    print(f"🔄 Tentando refresh do token Outlook para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
-            data={
-                "client_id": MICROSOFT_CLIENT_ID,
-                "client_secret": MICROSOFT_CLIENT_SECRET,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-                "scope": "Calendars.ReadWrite Mail.Send offline_access",
-            }
+            data={"client_id": MICROSOFT_CLIENT_ID, "client_secret": MICROSOFT_CLIENT_SECRET,
+                  "refresh_token": refresh_token, "grant_type": "refresh_token",
+                  "scope": "Calendars.ReadWrite Mail.Send offline_access"}
         )
     tokens = response.json()
     new_access = tokens.get("access_token")
-    new_refresh = tokens.get("refresh_token", refresh_token)
-    print(f"🔄 Refresh Outlook status: {response.status_code} | token obtido: {bool(new_access)}")
     if new_access:
         with engine.begin() as conn:
             conn.execute(text("UPDATE usuarios SET outlook_access_token = :a, outlook_refresh_token = :r WHERE email = :e"),
-                         {"a": new_access, "r": new_refresh, "e": email})
+                         {"a": new_access, "r": tokens.get("refresh_token", refresh_token), "e": email})
     return new_access
 
 async def _refresh_google_token(refresh_token: str, email: str) -> str:
-    print(f"🔄 Tentando refresh do token Google para: {email}")
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            }
+            data={"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
+                  "refresh_token": refresh_token, "grant_type": "refresh_token"}
         )
     tokens = response.json()
     new_access = tokens.get("access_token")
-    print(f"🔄 Refresh Google status: {response.status_code} | token obtido: {bool(new_access)}")
     if new_access:
         with engine.begin() as conn:
-            conn.execute(text("UPDATE usuarios SET google_access_token = :a WHERE email = :e"),
-                         {"a": new_access, "e": email})
+            conn.execute(text("UPDATE usuarios SET google_access_token = :a WHERE email = :e"), {"a": new_access, "e": email})
     return new_access
 
 @app.post("/eventos/{evento_id}/agendar-outlook")
 async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
     try:
-        print(f"📅 Iniciando agendamento Outlook para evento {evento_id} | usuário: {email}")
         with engine.connect() as conn:
-            usuario = conn.execute(
-                text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"),
-                {"email": email}
-            ).fetchone()
+            usuario = conn.execute(text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
         if not usuario or not usuario._mapping.get("outlook_access_token"):
             raise HTTPException(400, "Outlook não conectado.")
         access_token = usuario._mapping["outlook_access_token"]
         refresh_token = usuario._mapping.get("outlook_refresh_token")
-        print(f"📅 Token encontrado. Refresh disponível: {bool(refresh_token)}")
         data_str = reuniao.data.isoformat()
         evento_graph = {
             "subject": reuniao.titulo,
@@ -579,7 +691,6 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient() as client:
             response = await client.post("https://graph.microsoft.com/v1.0/me/events", json=evento_graph, headers=headers)
-        print(f"📬 OUTLOOK RESPONSE: {response.status_code} - {response.text[:300]}")
         if response.status_code == 401 and refresh_token:
             access_token = await _refresh_outlook_token(refresh_token, email)
             if not access_token:
@@ -587,35 +698,27 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
             headers["Authorization"] = f"Bearer {access_token}"
             async with httpx.AsyncClient() as client:
                 response = await client.post("https://graph.microsoft.com/v1.0/me/events", json=evento_graph, headers=headers)
-            print(f"📬 OUTLOOK RESPONSE (após refresh): {response.status_code} - {response.text[:300]}")
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Outlook: {response.text}")
         outlook_event = response.json()
-        print(f"✅ Evento criado no Outlook: {outlook_event.get('id')}")
         return {"msg": "Reunião criada no Outlook Calendar 🚀", "outlook_event_id": outlook_event.get("id"), "link": outlook_event.get("webLink")}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔴 EXCEPTION agendar-outlook: {str(e)}")
         raise HTTPException(500, str(e))
 
 # =========================
-# REUNIÃO GOOGLE CALENDAR
+# REUNIÃO GOOGLE
 # =========================
 @app.post("/eventos/{evento_id}/agendar-google")
 async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: str = Depends(get_current_user)):
     try:
-        print(f"📅 Iniciando agendamento Google para evento {evento_id} | usuário: {email}")
         with engine.connect() as conn:
-            usuario = conn.execute(
-                text("SELECT google_access_token, google_refresh_token FROM usuarios WHERE email = :email"),
-                {"email": email}
-            ).fetchone()
+            usuario = conn.execute(text("SELECT google_access_token, google_refresh_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
         if not usuario or not usuario._mapping.get("google_access_token"):
             raise HTTPException(400, "Google Calendar não conectado.")
         access_token = usuario._mapping["google_access_token"]
         refresh_token = usuario._mapping.get("google_refresh_token")
-        print(f"📅 Token Google encontrado. Refresh disponível: {bool(refresh_token)}")
         data_str = reuniao.data.isoformat()
         evento_google = {
             "summary": reuniao.titulo,
@@ -627,31 +730,21 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
             evento_google["attendees"] = [{"email": reuniao.email_convidado}]
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
-                json=evento_google, headers=headers
-            )
-        print(f"📬 GOOGLE RESPONSE: {response.status_code} - {response.text[:300]}")
+            response = await client.post("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", json=evento_google, headers=headers)
         if response.status_code == 401 and refresh_token:
             access_token = await _refresh_google_token(refresh_token, email)
             if not access_token:
                 raise HTTPException(401, "Token expirado. Reconecte o Google.")
             headers["Authorization"] = f"Bearer {access_token}"
             async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
-                    json=evento_google, headers=headers
-                )
-            print(f"📬 GOOGLE RESPONSE (após refresh): {response.status_code} - {response.text[:300]}")
+                response = await client.post("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", json=evento_google, headers=headers)
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Google Calendar: {response.text}")
         google_event = response.json()
-        print(f"✅ Evento criado no Google Calendar: {google_event.get('id')}")
         return {"msg": "Reunião criada no Google Calendar 🚀", "google_event_id": google_event.get("id"), "link": google_event.get("htmlLink")}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🔴 EXCEPTION agendar-google: {str(e)}")
         raise HTTPException(500, str(e))
 
 # =========================
@@ -660,62 +753,46 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
 @app.get("/eventos")
 def listar_eventos(email: str = Depends(get_current_user)):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"),
-            {"email": email}
-        )
+        result = conn.execute(text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"), {"email": email})
         return [dict(row._mapping) for row in result]
 
 @app.post("/eventos", status_code=201)
 def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
     evento_id = str(uuid.uuid4())
     with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
-                    empresa_id, empresa_nome, descricao, usuario_email, criado_em)
-                VALUES (:id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
-                    :empresa_id, :empresa_nome, :descricao, :email, NOW())
-            """),
-            {"id": evento_id, "titulo": evento.titulo, "tipo": evento.tipo,
-             "data": evento.data, "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
-             "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
-             "descricao": evento.descricao, "email": email}
-        )
+        conn.execute(text("""
+            INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
+                empresa_id, empresa_nome, descricao, usuario_email, criado_em)
+            VALUES (:id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
+                :empresa_id, :empresa_nome, :descricao, :email, NOW())
+        """), {"id": evento_id, "titulo": evento.titulo, "tipo": evento.tipo, "data": evento.data,
+               "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
+               "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
+               "descricao": evento.descricao, "email": email})
     return {"msg": "Evento criado com sucesso 🚀", "id": evento_id}
 
 @app.put("/eventos/{evento_id}")
 def atualizar_evento(evento_id: str, evento: EventoUpdate, email: str = Depends(get_current_user)):
     with engine.begin() as conn:
-        result = conn.execute(
-            text("SELECT evento_id FROM eventos WHERE evento_id = :id AND usuario_email = :email"),
-            {"id": evento_id, "email": email}
-        ).fetchone()
+        result = conn.execute(text("SELECT evento_id FROM eventos WHERE evento_id = :id AND usuario_email = :email"), {"id": evento_id, "email": email}).fetchone()
         if not result:
             raise HTTPException(404, "Evento não encontrado")
-        conn.execute(
-            text("""
-                UPDATE eventos SET
-                    titulo = COALESCE(:titulo, titulo), tipo = COALESCE(:tipo, tipo),
-                    data = COALESCE(:data, data), hora_inicio = COALESCE(:hora_inicio, hora_inicio),
-                    hora_fim = COALESCE(:hora_fim, hora_fim), empresa_id = COALESCE(:empresa_id, empresa_id),
-                    empresa_nome = COALESCE(:empresa_nome, empresa_nome), descricao = COALESCE(:descricao, descricao)
-                WHERE evento_id = :id AND usuario_email = :email
-            """),
-            {"titulo": evento.titulo, "tipo": evento.tipo, "data": evento.data,
-             "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
-             "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
-             "descricao": evento.descricao, "id": evento_id, "email": email}
-        )
+        conn.execute(text("""
+            UPDATE eventos SET titulo=COALESCE(:titulo,titulo), tipo=COALESCE(:tipo,tipo),
+                data=COALESCE(:data,data), hora_inicio=COALESCE(:hora_inicio,hora_inicio),
+                hora_fim=COALESCE(:hora_fim,hora_fim), empresa_id=COALESCE(:empresa_id,empresa_id),
+                empresa_nome=COALESCE(:empresa_nome,empresa_nome), descricao=COALESCE(:descricao,descricao)
+            WHERE evento_id=:id AND usuario_email=:email
+        """), {"titulo": evento.titulo, "tipo": evento.tipo, "data": evento.data,
+               "hora_inicio": evento.hora_inicio, "hora_fim": evento.hora_fim,
+               "empresa_id": evento.empresa_id, "empresa_nome": evento.empresa_nome,
+               "descricao": evento.descricao, "id": evento_id, "email": email})
     return {"msg": "Evento atualizado com sucesso 🚀"}
 
 @app.delete("/eventos/{evento_id}")
 def deletar_evento(evento_id: str, email: str = Depends(get_current_user)):
     with engine.begin() as conn:
-        result = conn.execute(
-            text("DELETE FROM eventos WHERE evento_id = :id AND usuario_email = :email RETURNING evento_id"),
-            {"id": evento_id, "email": email}
-        ).fetchone()
+        result = conn.execute(text("DELETE FROM eventos WHERE evento_id=:id AND usuario_email=:email RETURNING evento_id"), {"id": evento_id, "email": email}).fetchone()
     if not result:
         raise HTTPException(404, "Evento não encontrado")
     return {"msg": "Evento deletado com sucesso"}
@@ -747,8 +824,7 @@ def listar_empresas():
             SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
             FROM empresas e
             LEFT JOIN LATERAL (
-                SELECT email, celular, whatsapp FROM contatos
-                WHERE empresa_id = e.empresa_id
+                SELECT email, celular, whatsapp FROM contatos WHERE empresa_id = e.empresa_id
                 ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
             ) c ON TRUE
             ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
@@ -763,11 +839,9 @@ def buscar_empresa(empresa_id: str):
             SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
             FROM empresas e
             LEFT JOIN LATERAL (
-                SELECT email, celular, whatsapp FROM contatos
-                WHERE empresa_id = e.empresa_id
+                SELECT email, celular, whatsapp FROM contatos WHERE empresa_id = e.empresa_id
                 ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
-            ) c ON TRUE
-            WHERE e.empresa_id = :id
+            ) c ON TRUE WHERE e.empresa_id = :id
         """), {"id": empresa_id}).fetchone()
     if not result:
         raise HTTPException(404, "Empresa não encontrada")
@@ -777,19 +851,13 @@ def buscar_empresa(empresa_id: str):
 def historico_status_empresa(empresa_id: str):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
-        result = conn.execute(
-            text("SELECT * FROM empresa_status_historico WHERE empresa_id = :id ORDER BY alterado_em DESC"),
-            {"id": empresa_id}
-        )
+        result = conn.execute(text("SELECT * FROM empresa_status_historico WHERE empresa_id = :id ORDER BY alterado_em DESC"), {"id": empresa_id})
         return [dict(row._mapping) for row in result]
 
 @app.get("/empresas/{empresa_id}/contatos")
 def listar_contatos_por_empresa(empresa_id: str):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
-            {"id": empresa_id}
-        )
+        result = conn.execute(text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"), {"id": empresa_id})
         return [dict(row._mapping) for row in result]
 
 @app.post("/empresas")
@@ -808,23 +876,20 @@ def criar_empresa(empresa: EmpresaCreate):
         if segmento:
             segmento = salvar_segmento(conn, segmento)
         conn.execute(text("""
-            INSERT INTO empresas (
-                empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
-                observacoes, cnpj, site, linkedin_empresa, responsavel_principal,
-                ticket_medio_estimado, status, origem_lead, ultima_interacao, proxima_acao,
-                data_proxima_acao, status_atualizado_em, motivo_perdido, temperatura
-            ) VALUES (
-                :id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
-                :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal,
-                :ticket_medio_estimado, :status, :origem_lead, :ultima_interacao, :proxima_acao,
-                :data_proxima_acao, NOW(), :motivo_perdido, :temperatura
-            )
+            INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
+                observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
+                status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
+                motivo_perdido, temperatura)
+            VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
+                :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
+                :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
+                :motivo_perdido, :temperatura)
         """), {
-            "id": empresa_id, "nome": empresa.nome, "segmento": segmento,
-            "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
-            "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
-            "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-            "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
+            "id": empresa_id, "nome": empresa.nome, "segmento": segmento, "porte": empresa.porte,
+            "cidade": empresa.cidade, "endereco": empresa.endereco, "cep": empresa.cep,
+            "bairro": empresa.bairro, "regiao": empresa.regiao, "observacoes": empresa.observacoes,
+            "cnpj": empresa.cnpj, "site": empresa.site, "linkedin_empresa": empresa.linkedin_empresa,
+            "responsavel_principal": empresa.responsavel_principal,
             "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status or "Lead",
             "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
             "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
@@ -847,29 +912,26 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
         status_anterior = result._mapping.get("status")
         status_mudou = empresa.status is not None and empresa.status != status_anterior
         conn.execute(text("""
-            UPDATE empresas SET
-                nome = COALESCE(:nome, nome), segmento = COALESCE(:segmento, segmento),
-                porte = COALESCE(:porte, porte), cidade = COALESCE(:cidade, cidade),
-                endereco = COALESCE(:endereco, endereco), cep = COALESCE(:cep, cep),
-                bairro = COALESCE(:bairro, bairro), regiao = COALESCE(:regiao, regiao),
-                observacoes = COALESCE(:observacoes, observacoes), cnpj = COALESCE(:cnpj, cnpj),
-                site = COALESCE(:site, site), linkedin_empresa = COALESCE(:linkedin_empresa, linkedin_empresa),
-                responsavel_principal = COALESCE(:responsavel_principal, responsavel_principal),
-                ticket_medio_estimado = COALESCE(:ticket_medio_estimado, ticket_medio_estimado),
-                status = COALESCE(:status, status), origem_lead = COALESCE(:origem_lead, origem_lead),
-                ultima_interacao = COALESCE(:ultima_interacao, ultima_interacao),
-                proxima_acao = COALESCE(:proxima_acao, proxima_acao),
-                data_proxima_acao = :data_proxima_acao,
-                status_atualizado_em = CASE WHEN :status IS NOT NULL AND :status <> status THEN NOW() ELSE status_atualizado_em END,
-                motivo_perdido = CASE WHEN :status IS NOT NULL AND :status <> 'Perdido' THEN NULL ELSE COALESCE(:motivo_perdido, motivo_perdido) END,
-                temperatura = COALESCE(:temperatura, temperatura)
-            WHERE empresa_id = :id
+            UPDATE empresas SET nome=COALESCE(:nome,nome), segmento=COALESCE(:segmento,segmento),
+                porte=COALESCE(:porte,porte), cidade=COALESCE(:cidade,cidade), endereco=COALESCE(:endereco,endereco),
+                cep=COALESCE(:cep,cep), bairro=COALESCE(:bairro,bairro), regiao=COALESCE(:regiao,regiao),
+                observacoes=COALESCE(:observacoes,observacoes), cnpj=COALESCE(:cnpj,cnpj), site=COALESCE(:site,site),
+                linkedin_empresa=COALESCE(:linkedin_empresa,linkedin_empresa),
+                responsavel_principal=COALESCE(:responsavel_principal,responsavel_principal),
+                ticket_medio_estimado=COALESCE(:ticket_medio_estimado,ticket_medio_estimado),
+                status=COALESCE(:status,status), origem_lead=COALESCE(:origem_lead,origem_lead),
+                ultima_interacao=COALESCE(:ultima_interacao,ultima_interacao),
+                proxima_acao=COALESCE(:proxima_acao,proxima_acao), data_proxima_acao=:data_proxima_acao,
+                status_atualizado_em=CASE WHEN :status IS NOT NULL AND :status<>status THEN NOW() ELSE status_atualizado_em END,
+                motivo_perdido=CASE WHEN :status IS NOT NULL AND :status<>'Perdido' THEN NULL ELSE COALESCE(:motivo_perdido,motivo_perdido) END,
+                temperatura=COALESCE(:temperatura,temperatura)
+            WHERE empresa_id=:id
         """), {
-            "id": empresa_id, "nome": empresa.nome, "segmento": empresa.segmento,
-            "porte": empresa.porte, "cidade": empresa.cidade, "endereco": empresa.endereco,
-            "cep": empresa.cep, "bairro": empresa.bairro, "regiao": empresa.regiao,
-            "observacoes": empresa.observacoes, "cnpj": empresa.cnpj, "site": empresa.site,
-            "linkedin_empresa": empresa.linkedin_empresa, "responsavel_principal": empresa.responsavel_principal,
+            "id": empresa_id, "nome": empresa.nome, "segmento": empresa.segmento, "porte": empresa.porte,
+            "cidade": empresa.cidade, "endereco": empresa.endereco, "cep": empresa.cep,
+            "bairro": empresa.bairro, "regiao": empresa.regiao, "observacoes": empresa.observacoes,
+            "cnpj": empresa.cnpj, "site": empresa.site, "linkedin_empresa": empresa.linkedin_empresa,
+            "responsavel_principal": empresa.responsavel_principal,
             "ticket_medio_estimado": empresa.ticket_medio_estimado, "status": empresa.status,
             "origem_lead": empresa.origem_lead, "ultima_interacao": empresa.ultima_interacao,
             "proxima_acao": empresa.proxima_acao, "data_proxima_acao": empresa.data_proxima_acao,
@@ -927,15 +989,14 @@ def atualizar_contato(contato_id: str, contato: ContatoUpdate):
         if not result:
             raise HTTPException(404, "Contato não encontrado")
         conn.execute(text("""
-            UPDATE contatos SET
-                nome = COALESCE(:nome, nome), funcao = COALESCE(:funcao, funcao),
-                email = COALESCE(:email, email), celular = COALESCE(:celular, celular),
-                whatsapp = COALESCE(:whatsapp, whatsapp), linkedin = COALESCE(:linkedin, linkedin),
-                observacoes = COALESCE(:observacoes, observacoes), prioridade = COALESCE(:prioridade, prioridade),
-                nivel_influencia = COALESCE(:nivel_influencia, nivel_influencia), decisor = COALESCE(:decisor, decisor),
-                canal_preferido = COALESCE(:canal_preferido, canal_preferido),
-                data_ultimo_contato = COALESCE(:data_ultimo_contato, data_ultimo_contato)
-            WHERE contato_id = :id
+            UPDATE contatos SET nome=COALESCE(:nome,nome), funcao=COALESCE(:funcao,funcao),
+                email=COALESCE(:email,email), celular=COALESCE(:celular,celular),
+                whatsapp=COALESCE(:whatsapp,whatsapp), linkedin=COALESCE(:linkedin,linkedin),
+                observacoes=COALESCE(:observacoes,observacoes), prioridade=COALESCE(:prioridade,prioridade),
+                nivel_influencia=COALESCE(:nivel_influencia,nivel_influencia), decisor=COALESCE(:decisor,decisor),
+                canal_preferido=COALESCE(:canal_preferido,canal_preferido),
+                data_ultimo_contato=COALESCE(:data_ultimo_contato,data_ultimo_contato)
+            WHERE contato_id=:id
         """), {
             "id": contato_id, "nome": contato.nome, "funcao": contato.funcao, "email": contato.email,
             "celular": contato.celular, "whatsapp": contato.whatsapp, "linkedin": contato.linkedin,

@@ -9,3 +9,4 @@ PyJWT
 resend
 email-validator
 httpx
+apscheduler
