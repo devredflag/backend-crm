@@ -490,15 +490,33 @@ def is_automated_sender(email: str) -> bool:
     return any(pattern in email_lower for pattern in BLOCKED_SENDER_PATTERNS)
 
 def find_company_by_sender(conn, sender_email: str):
-    result = conn.execute(text("""
-        SELECT c.empresa_id, c.contato_id, e.nome as empresa_nome
+    results = conn.execute(text("""
+        SELECT
+            c.empresa_id,
+            c.contato_id,
+            e.nome as empresa_nome,
+            c.data_ultimo_contato,
+            e.ultima_interacao
         FROM contatos c
-        JOIN empresas e ON e.empresa_id = c.empresa_id
+        JOIN empresas e
+            ON e.empresa_id = c.empresa_id
         WHERE LOWER(c.email) = LOWER(:email)
+        ORDER BY
+            c.decisor DESC NULLS LAST,
+            c.data_ultimo_contato DESC NULLS LAST,
+            e.ultima_interacao DESC NULLS LAST
         LIMIT 1
-    """), {"email": sender_email.strip()}).fetchone()
-    if result:
-        return result._mapping["empresa_id"], result._mapping["contato_id"], result._mapping["empresa_nome"]
+    """), {
+        "email": sender_email.strip()
+    }).fetchone()
+
+    if results:
+        return (
+            results._mapping["empresa_id"],
+            results._mapping["contato_id"],
+            results._mapping["empresa_nome"]
+        )
+
     return None, None, None
 
 def create_interaction_notification(conn, usuario_email: str, empresa_id, empresa_nome: str,
@@ -830,8 +848,23 @@ async def outlook_webhook(request: Request):
             h.get("name", "").lower(): h.get("value", "")
             for h in msg_data.get("internetMessageHeaders", [])
         }
+
         in_reply_to = internet_headers.get("in-reply-to", "")
-        is_reply    = bool(in_reply_to) or subject.lower().startswith("re:")
+
+        subject_clean = (subject or "").strip().lower()
+
+        reply_prefixes = (
+            "re:",
+            "res:",
+            "aw:",
+            "fw:",
+            "fwd:"
+        )
+
+        is_reply = (
+            bool(in_reply_to)
+            or subject_clean.startswith(reply_prefixes)
+        )
 
         if not is_reply:
             print(f"[Outlook Webhook] Ignorado (não é reply): {subject}")
