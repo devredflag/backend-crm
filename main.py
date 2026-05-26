@@ -1065,14 +1065,18 @@ async def gmail_webhook(request: Request):
             if not msg_id:
                 continue
             msg_res = http_requests.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
-                "?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=In-Reply-To",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10,
-            )
+            f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
+            "?format=full",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
             if not msg_res.ok:
                 continue
             headers_map = {h["name"].lower(): h["value"] for h in msg_res.json().get("payload", {}).get("headers", [])}
+            msg_json = msg_res.json()
+
+            thread_id = msg_json.get("threadId", "")
+
             from_raw = headers_map.get("from", "")
             subject = headers_map.get("subject", "")
             in_reply = headers_map.get("in-reply-to", "")
@@ -1103,6 +1107,7 @@ async def gmail_webhook(request: Request):
                         sender_name,
                         sender_email,
                         subject,
+                        thread_id,
                     )
         return {"ok": True}
 
