@@ -542,8 +542,8 @@ def create_interaction_notification(conn, usuario_email: str, empresa_id, empres
     """), {
         "id":       str(uuid.uuid4()),
         "email":    usuario_email,
-        "titulo":   f"{empresa_nome} respondeu via {label}",
-        "mensagem": f"{sender_name or sender_email} enviou uma resposta via {label}.",
+        "titulo":   empresa_nome,
+        "mensagem": f"Nova interação via {label}",
         "eid":      str(empresa_id),
         "enome":    empresa_nome,
         "platform": platform,
