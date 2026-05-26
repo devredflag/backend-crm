@@ -442,16 +442,46 @@ def verificar_rascunhos_expirados():
                 """), {"eid": r.empresa_id}).fetchone()
                 if not existe:
                     conn.execute(text("""
-                        INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
-                        VALUES (:id, :email, 'rascunho_aviso', :titulo, :mensagem, :eid, :enome)
+                    INSERT INTO notificacoes (
+                        notificacao_id,
+                        usuario_email,
+                        tipo,
+                        titulo,
+                        mensagem,
+                        empresa_id,
+                        empresa_nome,
+                        platform,
+                        meta
+                    )
+                        VALUES (
+                            :id,
+                            :email,
+                            :tipo,
+                            :titulo,
+                            :mensagem,
+                            :empresa_id,
+                            :empresa_nome,
+                            :platform,
+                            CAST(:meta AS JSONB)
+                        )
                     """), {
+                            "id": str(uuid.uuid4()),
+                            "email": usuario_email,
+                            "tipo": tipo,
+                            "titulo": titulo,
+                            "mensagem": mensagem,
+                            "empresa_id": empresa_id,
+                            "empresa_nome": empresa_nome,
+                            "platform": "outlook",
+                            "meta": json.dumps(meta or {})
+                        }), {
                         "id": str(uuid.uuid4()),
                         "email": r.email,
                         "titulo": f"Rascunho expira em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}",
                         "mensagem": f"O rascunho '{r.nome}' será excluído automaticamente em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}. Complete o cadastro para não perder.",
                         "eid": r.empresa_id,
                         "enome": r.nome,
-                    })
+                    }
                     print(f"📢 Aviso gerado para rascunho: {r.nome}")
 
             # Busca rascunhos com 30+ dias (exclusão)
