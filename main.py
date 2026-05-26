@@ -520,8 +520,8 @@ def find_company_by_sender(conn, sender_email: str):
     return None, None, None
 
 def create_interaction_notification(conn, usuario_email: str, empresa_id, empresa_nome: str,
-                                     platform: str, sender_name: str, sender_email: str, subject: str):
-    cutoff = datetime.utcnow() - timedelta(minutes=10)
+                                     platform: str, sender_name: str, sender_email: str, subject: str, conversation_id: str = ""):
+    cutoff = datetime.utcnow() - timedelta(minutes=1)
     existe = conn.execute(text("""
         SELECT 1 FROM notificacoes
         WHERE empresa_id = :eid AND tipo = 'email_interaction' AND platform = :platform
@@ -551,6 +551,7 @@ def create_interaction_notification(conn, usuario_email: str, empresa_id, empres
             "sender_email": sender_email,
             "sender_name":  sender_name,
             "subject":      subject,
+            "conversation_id": conversation_id,
         }),
     })
 
@@ -828,65 +829,67 @@ async def outlook_webhook(request: Request):
         usuario_email = sub.get("usuario_email", "")
         own_email     = sub.get("email_address", "")
 
-        # Busca mensagem com cabeçalhos de resposta para detectar replies reais
-        msg_res = http_requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
-            "?$select=from,subject,conversationId,internetMessageHeaders",
-            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
-        )
-        if not msg_res.ok:
-            continue
+            # Busca mensagem com cabeçalhos de resposta para detectar replies reais
+            msg_res = http_requests.get(
+                f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
+                "?$select=from,subject,conversationId,internetMessageHeaders",
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+            )
+            if not msg_res.ok:
+                continue
 
-        msg_data = msg_res.json()
-        from_obj     = msg_data.get("from", {}).get("emailAddress", {})
-        sender_email = from_obj.get("address", "")
-        sender_name  = from_obj.get("name", "")
-        subject      = msg_data.get("subject", "")
+            msg_data = msg_res.json()
 
-        # Verifica se é uma resposta real via cabeçalhos Internet padrão
-        internet_headers = {
-            h.get("name", "").lower(): h.get("value", "")
-            for h in msg_data.get("internetMessageHeaders", [])
-        }
+            from_obj     = msg_data.get("from", {}).get("emailAddress", {})
+            sender_email = from_obj.get("address", "")
+            sender_name  = from_obj.get("name", "")
+            subject      = msg_data.get("subject", "")
+            conversation_id = msg_data.get("conversationId", "")
 
-        in_reply_to = internet_headers.get("in-reply-to", "")
+            # Verifica se é uma resposta real via cabeçalhos Internet padrão
+            internet_headers = {
+                h.get("name", "").lower(): h.get("value", "")
+                for h in msg_data.get("internetMessageHeaders", [])
+            }
 
-        subject_clean = (subject or "").strip().lower()
+            in_reply_to = internet_headers.get("in-reply-to", "")
 
-        reply_prefixes = (
-            "re:",
-            "res:",
-            "aw:",
-            "fw:",
-            "fwd:"
-        )
+            subject_clean = (subject or "").strip().lower()
 
-        is_reply = (
-            bool(in_reply_to)
-            or subject_clean.startswith(reply_prefixes)
-        )
+            reply_prefixes = (
+                "re:",
+                "res:",
+                "aw:",
+                "fw:",
+                "fwd:"
+            )
 
-        if not is_reply:
-            print(f"[Outlook Webhook] Ignorado (não é reply): {subject}")
-            continue
+            is_reply = (
+                bool(in_reply_to)
+                or subject_clean.startswith(reply_prefixes)
+            )
 
-        if not sender_email:
-            continue
-        if sender_email.lower() == own_email.lower():
-            continue
-        if is_automated_sender(sender_email):
-            print(f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}")
-            continue
+            if not is_reply:
+                print(f"[Outlook Webhook] Ignorado (não é reply): {subject}")
+                continue
 
-        with engine.begin() as conn:
-            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
-            if empresa_id:
-                create_interaction_notification(
-                    conn, usuario_email, empresa_id, empresa_nome,
-                    "outlook", sender_name, sender_email, subject
-                )
+            if not sender_email:
+                continue
+            if sender_email.lower() == own_email.lower():
+                continue
+            if is_automated_sender(sender_email):
+                print(f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}")
+                continue
 
-    return {"ok": True}
+            with engine.begin() as conn:
+                empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+                if empresa_id:
+                    create_interaction_notification(
+                        conn, usuario_email, empresa_id, empresa_nome,
+                        "outlook", sender_name, sender_email, subject, conversation_id
+                    )
+
+        return {"ok": True}
 
 
 @app.api_route("/webhooks/outlook-calendar", methods=["GET", "POST"], include_in_schema=False)
