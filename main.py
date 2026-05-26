@@ -552,7 +552,7 @@ def create_interaction_notification(conn, usuario_email: str, empresa_id, empres
              empresa_id, empresa_nome, platform, meta, lida, criado_em)
         VALUES
             (:id, :email, 'email_interaction', :titulo, :mensagem,
-             :eid, :enome, :platform, :meta::jsonb, FALSE, NOW())
+             :eid, :enome, :platform, CAST(:meta AS JSONB), FALSE, NOW())
     """), {
         "id": str(uuid.uuid4()),
         "email": usuario_email,
@@ -985,7 +985,7 @@ async def outlook_calendar_webhook(request: Request):
                          empresa_id, empresa_nome, platform, meta, lida, criado_em)
                     VALUES
                         (:id, :uemail, :tipo, :titulo, :mensagem,
-                         :eid, :enome, 'outlook', :meta::jsonb, FALSE, NOW())
+                         :eid, :enome, 'outlook', CAST(:meta AS JSONB), FALSE, NOW())
                 """), {
                     "id":      str(uuid.uuid4()),
                     "uemail":  usuario_email,
