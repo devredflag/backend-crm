@@ -41,6 +41,12 @@ MICROSOFT_CLIENT_ID     = os.getenv("MICROSOFT_CLIENT_ID")
 MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
 MICROSOFT_TENANT_ID     = os.getenv("MICROSOFT_TENANT_ID")
 MICROSOFT_REDIRECT_URI  = os.getenv("MICROSOFT_REDIRECT_URI")
+BACKEND_URL = os.getenv("BACKEND_URL")
+
+OUTLOOK_WEBHOOK_SECRET = os.getenv(
+    "OUTLOOK_WEBHOOK_SECRET",
+    "crm-webhook-secret"
+)
 
 GOOGLE_CLIENT_ID        = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET    = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -1080,9 +1086,17 @@ def update_me(dados: UsuarioUpdate, email: str = Depends(get_current_user)):
 def outlook_login():
     url = (
         f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/authorize"
-        f"?client_id={MICROSOFT_CLIENT_ID}&response_type=code"
+        f"?client_id={MICROSOFT_CLIENT_ID}"
+        f"&response_type=code"
         f"&redirect_uri={MICROSOFT_REDIRECT_URI}"
-        f"&scope=Calendars.ReadWrite%20Mail.Send%20offline_access&response_mode=query"
+        f"&response_mode=query"
+        f"&scope="
+        f"openid%20profile%20email%20"
+        f"User.Read%20"
+        f"Mail.Read%20"
+        f"Mail.Send%20"
+        f"Calendars.ReadWrite%20"
+        f"offline_access"
     )
     return {"auth_url": url}
 
@@ -1200,9 +1214,9 @@ async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
             data={"client_id": MICROSOFT_CLIENT_ID, "client_secret": MICROSOFT_CLIENT_SECRET,
                   "refresh_token": refresh_token, "grant_type": "refresh_token",
-                  "scope": "Calendars.ReadWrite Mail.Send offline_access"}
+                  "scope": ( "openid profile email " "User.Read " "Mail.Read " "Mail.Send " "Calendars.ReadWrite " "offline_access")}
         )
-    tokens = response.json()
+    tokens = response.json() 
     new_access = tokens.get("access_token")
     if new_access:
         with engine.begin() as conn:
