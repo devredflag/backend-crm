@@ -364,6 +364,8 @@ def garantir_tabela_notificacoes(conn):
             empresa_nome text,
             lida boolean DEFAULT FALSE,
             criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+            conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
+            conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
         )
     """))
     # ── ADICIONAR ABAIXO ──────────────────────────────
@@ -794,6 +796,167 @@ def renovar_outlook_subscriptions():
                 WHERE subscription_id=:sid
             """), {"exp": new_exp, "sid": s["subscription_id"]})
 
+
+def setup_outlook_calendar_subscription(usuario_email: str, access_token: str, refresh_token: str):
+    try:
+        expires_at = datetime.utcnow() + timedelta(minutes=4000)
+        res = http_requests.post(
+            "https://graph.microsoft.com/v1.0/subscriptions",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={
+                "changeType": "updated",
+                "notificationUrl": f"{BACKEND_URL}/webhooks/outlook-calendar",
+                "resource": "me/events",
+                "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
+                "clientState": OUTLOOK_WEBHOOK_SECRET,
+            },
+            timeout=15,
+        )
+        if not res.ok:
+            print(f"[Outlook Cal Sub] Erro: {res.text}")
+            return
+        sub_id = res.json().get("id")
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            existing = conn.execute(text("""
+                SELECT sub_id FROM email_subscriptions
+                WHERE usuario_email = :email AND provider = 'outlook_calendar'
+            """), {"email": usuario_email}).fetchone()
+            if existing:
+                conn.execute(text("""
+                    UPDATE email_subscriptions
+                    SET subscription_id=:sid, expires_at=:exp, access_token=:at,
+                        refresh_token=:rt, atualizado_em=NOW()
+                    WHERE usuario_email=:email AND provider='outlook_calendar'
+                """), {"sid": sub_id, "exp": expires_at, "at": access_token,
+                       "rt": refresh_token, "email": usuario_email})
+            else:
+                conn.execute(text("""
+                    INSERT INTO email_subscriptions
+                        (sub_id, usuario_email, provider, subscription_id,
+                         expires_at, access_token, refresh_token)
+                    VALUES (:id, :email, 'outlook_calendar', :sid, :exp, :at, :rt)
+                """), {"id": str(uuid.uuid4()), "email": usuario_email, "sid": sub_id,
+                       "exp": expires_at, "at": access_token, "rt": refresh_token})
+        print(f"[Outlook Cal Sub] OK para {usuario_email}, id={sub_id}")
+    except Exception as e:
+        print(f"[Outlook Cal Sub] Exceção: {e}")
+
+
+@app.api_route("/webhooks/outlook-calendar", methods=["GET", "POST"], include_in_schema=False)
+async def outlook_calendar_webhook(request: Request):
+    validation_token = request.query_params.get("validationToken")
+    if validation_token:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=validation_token, status_code=200)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    for notif in body.get("value", []):
+        if notif.get("clientState") != OUTLOOK_WEBHOOK_SECRET:
+            continue
+        sub_id   = notif.get("subscriptionId")
+        event_id = notif.get("resourceData", {}).get("id")
+        if not event_id:
+            continue
+
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            sub = conn.execute(text("""
+                SELECT * FROM email_subscriptions
+                WHERE provider='outlook_calendar' AND subscription_id=:sid
+            """), {"sid": sub_id}).fetchone()
+            if not sub:
+                continue
+            sub = dict(sub._mapping)
+
+        access_token  = sub.get("access_token", "")
+        usuario_email = sub.get("usuario_email", "")
+
+        event_res = http_requests.get(
+            f"https://graph.microsoft.com/v1.0/me/events/{event_id}?$select=subject,attendees",
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+        )
+        if not event_res.ok:
+            continue
+
+        event_data = event_res.json()
+        subject    = event_data.get("subject", "")
+        attendees  = event_data.get("attendees", [])
+
+        with engine.begin() as conn:
+            evento = conn.execute(text("""
+                SELECT evento_id, empresa_id, empresa_nome, titulo
+                FROM eventos
+                WHERE outlook_event_id = :eid AND usuario_email = :uemail
+            """), {"eid": event_id, "uemail": usuario_email}).fetchone()
+            if not evento:
+                continue
+            evento       = dict(evento._mapping)
+            empresa_id   = evento.get("empresa_id")
+            empresa_nome = evento.get("empresa_nome")
+            titulo_evento = evento.get("titulo", subject)
+            if not empresa_id or not empresa_nome:
+                continue
+
+            response_map = {
+                "accepted":            ("calendar_accepted",  "aceitou"),
+                "declined":            ("calendar_declined",  "recusou"),
+                "tentativelyAccepted": ("calendar_tentative", "disse talvez para"),
+            }
+
+            for attendee in attendees:
+                response   = attendee.get("status", {}).get("response", "")
+                email_addr = attendee.get("emailAddress", {}).get("address", "")
+                name       = attendee.get("emailAddress", {}).get("name", email_addr)
+                if response not in response_map:
+                    continue
+
+                notif_tipo, verbo = response_map[response]
+
+                existe = conn.execute(text("""
+                    SELECT 1 FROM notificacoes
+                    WHERE empresa_id = :eid
+                      AND tipo = :tipo
+                      AND meta->>'attendee_email' = :aemail
+                      AND meta->>'outlook_event_id' = :evid
+                """), {
+                    "eid":   str(empresa_id),
+                    "tipo":  notif_tipo,
+                    "aemail": email_addr,
+                    "evid":  event_id,
+                }).fetchone()
+                if existe:
+                    continue
+
+                conn.execute(text("""
+                    INSERT INTO notificacoes
+                        (notificacao_id, usuario_email, tipo, titulo, mensagem,
+                         empresa_id, empresa_nome, platform, meta, lida, criado_em)
+                    VALUES
+                        (:id, :uemail, :tipo, :titulo, :mensagem,
+                         :eid, :enome, 'outlook', :meta::jsonb, FALSE, NOW())
+                """), {
+                    "id":      str(uuid.uuid4()),
+                    "uemail":  usuario_email,
+                    "tipo":    notif_tipo,
+                    "titulo":  f"{empresa_nome} {verbo} a call",
+                    "mensagem": f"{name} {verbo} o convite para '{titulo_evento}'.",
+                    "eid":     str(empresa_id),
+                    "enome":   empresa_nome,
+                    "meta":    json.dumps({
+                        "attendee_email":   email_addr,
+                        "attendee_name":    name,
+                        "outlook_event_id": event_id,
+                        "event_subject":    subject,
+                    }),
+                })
+
+    return {"ok": True}            
+
 # Inicia o scheduler
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)  # Roda todo dia às 8h UTC
@@ -931,6 +1094,12 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
     import threading
     threading.Thread(
         target=setup_outlook_subscription,
+        args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=setup_outlook_calendar_subscription,
         args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
         daemon=True
     ).start()
@@ -1075,6 +1244,13 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Outlook: {response.text}")
         outlook_event = response.json()
+        # Salva o ID do evento Outlook na nossa tabela
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE eventos SET outlook_event_id = :oid
+                WHERE evento_id = :id AND usuario_email = :email
+            """), {"oid": outlook_event.get("id"), "id": evento_id, "email": email})
+
         return {"msg": "Reunião criada no Outlook Calendar 🚀", "outlook_event_id": outlook_event.get("id"), "link": outlook_event.get("webLink")}
     except HTTPException:
         raise
