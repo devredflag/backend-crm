@@ -355,18 +355,29 @@ def garantir_colunas_oauth(conn):
 def garantir_tabela_notificacoes(conn):
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS notificacoes (
-            notificacao_id uuid PRIMARY KEY,
-            usuario_email text NOT NULL,
-            tipo text NOT NULL,
-            titulo text NOT NULL,
-            mensagem text NOT NULL,
-            empresa_id uuid,
-            empresa_nome text,
-            lida boolean DEFAULT FALSE,
-            criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
-            conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
-            conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
+            notificacao_id UUID PRIMARY KEY,
+            usuario_email TEXT NOT NULL,
+            tipo TEXT NOT NULL,
+            titulo TEXT NOT NULL,
+            mensagem TEXT NOT NULL,
+            empresa_id UUID NULL,
+            empresa_nome TEXT NULL,
+            platform TEXT NULL,
+            meta JSONB DEFAULT '{}'::jsonb,
+            lida BOOLEAN DEFAULT FALSE,
+            criado_em TIMESTAMP DEFAULT NOW()
         )
+    """))
+
+    # NOVAS COLUNAS DO CALENDÁRIO
+    conn.execute(text("""
+        ALTER TABLE eventos
+        ADD COLUMN IF NOT EXISTS outlook_event_id TEXT
+    """))
+
+    conn.execute(text("""
+        ALTER TABLE eventos
+        ADD COLUMN IF NOT EXISTS google_event_id TEXT
     """))
     # ── ADICIONAR ABAIXO ──────────────────────────────
     conn.execute(text("ALTER TABLE notificacoes ADD COLUMN IF NOT EXISTS platform VARCHAR(30)"))
