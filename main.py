@@ -41,16 +41,14 @@ MICROSOFT_CLIENT_ID     = os.getenv("MICROSOFT_CLIENT_ID")
 MICROSOFT_CLIENT_SECRET = os.getenv("MICROSOFT_CLIENT_SECRET")
 MICROSOFT_TENANT_ID     = os.getenv("MICROSOFT_TENANT_ID")
 MICROSOFT_REDIRECT_URI  = os.getenv("MICROSOFT_REDIRECT_URI")
-BACKEND_URL = os.getenv("BACKEND_URL")
-
-OUTLOOK_WEBHOOK_SECRET = os.getenv(
-    "OUTLOOK_WEBHOOK_SECRET",
-    "crm-webhook-secret"
-)
 
 GOOGLE_CLIENT_ID        = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET    = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI     = os.getenv("GOOGLE_REDIRECT_URI")
+
+BACKEND_URL            = os.getenv("BACKEND_URL", "https://backend-crm-production-157b.up.railway.app")
+OUTLOOK_WEBHOOK_SECRET = os.getenv("OUTLOOK_WEBHOOK_SECRET", "crm-webhook-secret")
+GMAIL_PUBSUB_TOPIC     = os.getenv("GMAIL_PUBSUB_TOPIC", "projects/SEU_PROJECT_ID/topics/gmail-crm-push")
 
 engine = create_engine(DATABASE_URL)
 security = HTTPBearer()
@@ -374,18 +372,6 @@ def garantir_tabela_notificacoes(conn):
             criado_em TIMESTAMP DEFAULT NOW()
         )
     """))
-
-    # NOVAS COLUNAS DO CALENDÁRIO
-    conn.execute(text("""
-        ALTER TABLE eventos
-        ADD COLUMN IF NOT EXISTS outlook_event_id TEXT
-    """))
-
-    conn.execute(text("""
-        ALTER TABLE eventos
-        ADD COLUMN IF NOT EXISTS google_event_id TEXT
-    """))
-    # ── ADICIONAR ABAIXO ──────────────────────────────
     conn.execute(text("ALTER TABLE notificacoes ADD COLUMN IF NOT EXISTS platform VARCHAR(30)"))
     conn.execute(text("ALTER TABLE notificacoes ADD COLUMN IF NOT EXISTS meta JSONB DEFAULT '{}'"))
     conn.execute(text("""
@@ -403,26 +389,23 @@ def garantir_tabela_notificacoes(conn):
             atualizado_em TIMESTAMP DEFAULT NOW()
         )
     """))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
 
 # =========================
 # JOB: RASCUNHOS EXPIRÁVEIS
 # =========================
 def verificar_rascunhos_expirados():
-    """
-    Roda diariamente:
-    - 25 dias: notificação de aviso (5 dias restantes)
-    - 30 dias: notificação de exclusão + exclui o rascunho
-    """
     print("⏰ JOB: verificando rascunhos expirados...")
     try:
         with engine.begin() as conn:
             garantir_tabela_notificacoes(conn)
 
             agora = datetime.utcnow()
-            limite_aviso   = agora - timedelta(days=25)
+            limite_aviso    = agora - timedelta(days=25)
             limite_exclusao = agora - timedelta(days=30)
 
-            # Busca rascunhos com 25-29 dias (aviso de 5 dias)
+            # Rascunhos com 25-29 dias → aviso
             avisos = conn.execute(text("""
                 SELECT e.empresa_id, e.nome, e.status_atualizado_em, u.email
                 FROM empresas e
@@ -434,7 +417,6 @@ def verificar_rascunhos_expirados():
 
             for r in avisos:
                 dias_restantes = 30 - int((agora - r.status_atualizado_em).days)
-                # Evita duplicar notificação no mesmo dia
                 existe = conn.execute(text("""
                     SELECT 1 FROM notificacoes
                     WHERE empresa_id = :eid AND tipo = 'rascunho_aviso'
@@ -442,49 +424,20 @@ def verificar_rascunhos_expirados():
                 """), {"eid": r.empresa_id}).fetchone()
                 if not existe:
                     conn.execute(text("""
-                    INSERT INTO notificacoes (
-                        notificacao_id,
-                        usuario_email,
-                        tipo,
-                        titulo,
-                        mensagem,
-                        empresa_id,
-                        empresa_nome,
-                        platform,
-                        meta
-                    )
-                        VALUES (
-                            :id,
-                            :email,
-                            :tipo,
-                            :titulo,
-                            :mensagem,
-                            :empresa_id,
-                            :empresa_nome,
-                            :platform,
-                            CAST(:meta AS JSONB)
-                        )
+                        INSERT INTO notificacoes
+                            (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
+                        VALUES (:id, :email, 'rascunho_aviso', :titulo, :mensagem, :eid, :enome)
                     """), {
-                            "id": str(uuid.uuid4()),
-                            "email": usuario_email,
-                            "tipo": tipo,
-                            "titulo": titulo,
-                            "mensagem": mensagem,
-                            "empresa_id": empresa_id,
-                            "empresa_nome": empresa_nome,
-                            "platform": "outlook",
-                            "meta": json.dumps(meta or {})
-                        }), {
-                        "id": str(uuid.uuid4()),
-                        "email": r.email,
-                        "titulo": f"Rascunho expira em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}",
+                        "id":      str(uuid.uuid4()),
+                        "email":   r.email,
+                        "titulo":  f"Rascunho expira em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}",
                         "mensagem": f"O rascunho '{r.nome}' será excluído automaticamente em {dias_restantes} dia{'s' if dias_restantes != 1 else ''}. Complete o cadastro para não perder.",
-                        "eid": r.empresa_id,
+                        "eid":   r.empresa_id,
                         "enome": r.nome,
-                    }
+                    })
                     print(f"📢 Aviso gerado para rascunho: {r.nome}")
 
-            # Busca rascunhos com 30+ dias (exclusão)
+            # Rascunhos com 30+ dias → excluir
             expirados = conn.execute(text("""
                 SELECT e.empresa_id, e.nome, u.email
                 FROM empresas e
@@ -494,19 +447,18 @@ def verificar_rascunhos_expirados():
             """), {"limite_exclusao": limite_exclusao}).fetchall()
 
             for r in expirados:
-                # Notificação de exclusão
                 conn.execute(text("""
-                    INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
+                    INSERT INTO notificacoes
+                        (notificacao_id, usuario_email, tipo, titulo, mensagem, empresa_id, empresa_nome)
                     VALUES (:id, :email, 'rascunho_excluido', :titulo, :mensagem, :eid, :enome)
                 """), {
-                    "id": str(uuid.uuid4()),
-                    "email": r.email,
-                    "titulo": "Rascunho excluído automaticamente",
+                    "id":      str(uuid.uuid4()),
+                    "email":   r.email,
+                    "titulo":  "Rascunho excluído automaticamente",
                     "mensagem": f"O rascunho '{r.nome}' foi excluído por inatividade após 30 dias. Cadastre novamente se necessário.",
-                    "eid": r.empresa_id,
+                    "eid":   r.empresa_id,
                     "enome": r.nome,
                 })
-                # Exclui contatos e o rascunho
                 conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": r.empresa_id})
                 conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": r.empresa_id})
                 conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id"), {"id": r.empresa_id})
@@ -520,6 +472,23 @@ def verificar_rascunhos_expirados():
 # WEBHOOK HELPERS
 # =========================
 
+# Padrões de remetentes automáticos a ignorar
+BLOCKED_SENDER_PATTERNS = [
+    "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+    "mailer-daemon", "postmaster", "bounce", "bounces",
+    "notifications@", "notify@", "alert@", "alerts@",
+    "system@", "auto@", "automated@", "autoresponder",
+    "support@", "helpdesk@", "feedback@",
+    "unsubscribe", "newsletter", "news@", "info@noreply",
+    "microsoft@", "google@", "amazonses", "sendgrid",
+    "mailchimp", "hubspot", "salesforce",
+]
+
+def is_automated_sender(email: str) -> bool:
+    """Retorna True se o remetente parecer automático/noreply."""
+    email_lower = email.lower()
+    return any(pattern in email_lower for pattern in BLOCKED_SENDER_PATTERNS)
+
 def find_company_by_sender(conn, sender_email: str):
     result = conn.execute(text("""
         SELECT c.empresa_id, c.contato_id, e.nome as empresa_nome
@@ -532,16 +501,15 @@ def find_company_by_sender(conn, sender_email: str):
         return result._mapping["empresa_id"], result._mapping["contato_id"], result._mapping["empresa_nome"]
     return None, None, None
 
-
 def create_interaction_notification(conn, usuario_email: str, empresa_id, empresa_nome: str,
                                      platform: str, sender_name: str, sender_email: str, subject: str):
-    from datetime import timedelta
     cutoff = datetime.utcnow() - timedelta(minutes=10)
     existe = conn.execute(text("""
         SELECT 1 FROM notificacoes
-        WHERE empresa_id = :eid AND platform = :platform
+        WHERE empresa_id = :eid AND tipo = 'email_interaction' AND platform = :platform
+          AND meta->>'sender_email' = :semail
           AND criado_em >= :cutoff
-    """), {"eid": str(empresa_id), "platform": platform, "cutoff": cutoff}).fetchone()
+    """), {"eid": str(empresa_id), "platform": platform, "semail": sender_email, "cutoff": cutoff}).fetchone()
     if existe:
         return
 
@@ -554,17 +522,23 @@ def create_interaction_notification(conn, usuario_email: str, empresa_id, empres
             (:id, :email, 'email_interaction', :titulo, :mensagem,
              :eid, :enome, :platform, CAST(:meta AS JSONB), FALSE, NOW())
     """), {
-        "id": str(uuid.uuid4()),
-        "email": usuario_email,
-        "titulo": f"Cliente respondeu no {label}",
-        "mensagem": f"{sender_name or sender_email} ({empresa_nome}) enviou uma mensagem via {label}.",
-        "eid": str(empresa_id),
-        "enome": empresa_nome,
+        "id":       str(uuid.uuid4()),
+        "email":    usuario_email,
+        "titulo":   f"{empresa_nome} respondeu via {label}",
+        "mensagem": f"{sender_name or sender_email} enviou uma resposta via {label}.",
+        "eid":      str(empresa_id),
+        "enome":    empresa_nome,
         "platform": platform,
-        "meta": json.dumps({"sender_email": sender_email, "sender_name": sender_name, "subject": subject}),
+        "meta":     json.dumps({
+            "sender_email": sender_email,
+            "sender_name":  sender_name,
+            "subject":      subject,
+        }),
     })
 
-
+# =========================
+# GMAIL WATCH
+# =========================
 def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str, gmail_address: str):
     try:
         res = http_requests.post(
@@ -606,10 +580,11 @@ def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str,
     except Exception as e:
         print(f"[Gmail Watch] Exceção: {e}")
 
-
+# =========================
+# OUTLOOK EMAIL SUBSCRIPTION
+# =========================
 def setup_outlook_subscription(usuario_email: str, access_token: str, refresh_token: str):
     try:
-        from datetime import timedelta
         expires_at = datetime.utcnow() + timedelta(minutes=4000)
         res = http_requests.post(
             "https://graph.microsoft.com/v1.0/subscriptions",
@@ -658,192 +633,9 @@ def setup_outlook_subscription(usuario_email: str, access_token: str, refresh_to
     except Exception as e:
         print(f"[Outlook Sub] Exceção: {e}")
 
-
 # =========================
-# WEBHOOKS
+# OUTLOOK CALENDAR SUBSCRIPTION
 # =========================
-
-@app.post("/webhooks/gmail", include_in_schema=False)
-async def gmail_webhook(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return {"ok": True}
-
-    msg_data = body.get("message", {}).get("data", "")
-    if not msg_data:
-        return {"ok": True}
-
-    try:
-        decoded    = json.loads(base64.b64decode(msg_data).decode("utf-8"))
-        gmail_addr = decoded.get("emailAddress", "")
-        new_hist   = int(decoded.get("historyId", 0))
-    except Exception as e:
-        print(f"[Gmail Webhook] Decode erro: {e}")
-        return {"ok": True}
-
-    with engine.begin() as conn:
-        garantir_tabela_notificacoes(conn)
-        sub = conn.execute(text("""
-            SELECT * FROM email_subscriptions
-            WHERE provider='gmail' AND email_address=:addr
-        """), {"addr": gmail_addr}).fetchone()
-        if not sub:
-            return {"ok": True}
-
-        sub = dict(sub._mapping)
-        old_hist     = sub.get("history_id") or new_hist
-        access_token = sub.get("access_token", "")
-        refresh_token = sub.get("refresh_token", "")
-        usuario_email = sub.get("usuario_email", "")
-
-        if new_hist <= old_hist:
-            return {"ok": True}
-
-        # Atualiza historyId
-        conn.execute(text("""
-            UPDATE email_subscriptions SET history_id=:hid, atualizado_em=NOW()
-            WHERE provider='gmail' AND email_address=:addr
-        """), {"hid": new_hist, "addr": gmail_addr})
-
-    # Busca mensagens novas
-    hist_res = http_requests.get(
-        f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
-        f"?startHistoryId={old_hist}&historyTypes=messageAdded&labelId=INBOX",
-        headers={"Authorization": f"Bearer {access_token}"}, timeout=15,
-    )
-    if not hist_res.ok:
-        return {"ok": True}
-
-    for record in hist_res.json().get("history", []):
-        for entry in record.get("messagesAdded", []):
-            msg_id = entry.get("message", {}).get("id")
-            if not msg_id:
-                continue
-            msg_res = http_requests.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
-                "?format=metadata&metadataHeaders=From&metadataHeaders=Subject",
-                headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
-            )
-            if not msg_res.ok:
-                continue
-            headers_map = {h["name"].lower(): h["value"]
-                           for h in msg_res.json().get("payload", {}).get("headers", [])}
-            from_raw = headers_map.get("from", "")
-            subject  = headers_map.get("subject", "")
-            match = re.match(r'^(.*?)\s*<(.+?)>$', from_raw.strip())
-            sender_name  = match.group(1).strip().strip('"') if match else ""
-            sender_email = match.group(2).strip() if match else from_raw.strip()
-            if sender_email.lower() == gmail_addr.lower():
-                continue
-            with engine.begin() as conn:
-                empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
-                if empresa_id:
-                    create_interaction_notification(
-                        conn, usuario_email, empresa_id, empresa_nome,
-                        "gmail", sender_name, sender_email, subject
-                    )
-    return {"ok": True}
-
-
-@app.api_route("/webhooks/outlook", methods=["GET", "POST"], include_in_schema=False)
-async def outlook_webhook(request: Request):
-    validation_token = request.query_params.get("validationToken")
-    if validation_token:
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(content=validation_token, status_code=200)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return {"ok": True}
-
-    for notif in body.get("value", []):
-        if notif.get("clientState") != OUTLOOK_WEBHOOK_SECRET:
-            continue
-        sub_id  = notif.get("subscriptionId")
-        msg_id  = notif.get("resourceData", {}).get("id")
-        if not msg_id:
-            continue
-        with engine.begin() as conn:
-            garantir_tabela_notificacoes(conn)
-            sub = conn.execute(text("""
-                SELECT * FROM email_subscriptions
-                WHERE provider='outlook' AND subscription_id=:sid
-            """), {"sid": sub_id}).fetchone()
-            if not sub:
-                continue
-            sub = dict(sub._mapping)
-
-        access_token  = sub.get("access_token", "")
-        usuario_email = sub.get("usuario_email", "")
-        own_email     = sub.get("email_address", "")
-
-        msg_res = http_requests.get(
-            f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
-            "?$select=from,subject",
-            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
-        )
-        if not msg_res.ok:
-            continue
-        from_obj     = msg_res.json().get("from", {}).get("emailAddress", {})
-        sender_email = from_obj.get("address", "")
-        sender_name  = from_obj.get("name", "")
-        subject      = msg_res.json().get("subject", "")
-        if not sender_email or sender_email.lower() == own_email.lower():
-            continue
-        with engine.begin() as conn:
-            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
-            if empresa_id:
-                create_interaction_notification(
-                    conn, usuario_email, empresa_id, empresa_nome,
-                    "outlook", sender_name, sender_email, subject
-                )
-    return {"ok": True}
-
-def renovar_gmail_watches():
-    with engine.begin() as conn:
-        garantir_tabela_notificacoes(conn)
-        subs = conn.execute(text("""
-            SELECT * FROM email_subscriptions
-            WHERE provider='gmail'
-              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '36 hours')
-        """)).fetchall()
-    for sub in subs:
-        s = dict(sub._mapping)
-        setup_gmail_watch(
-            s["usuario_email"], s.get("access_token",""),
-            s.get("refresh_token",""), s.get("email_address","")
-        )
-
-def renovar_outlook_subscriptions():
-    with engine.begin() as conn:
-        garantir_tabela_notificacoes(conn)
-        subs = conn.execute(text("""
-            SELECT * FROM email_subscriptions
-            WHERE provider='outlook'
-              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '12 hours')
-        """)).fetchall()
-    for sub in subs:
-        s = dict(sub._mapping)
-        if not s.get("subscription_id"):
-            continue
-        from datetime import timedelta
-        new_exp = datetime.utcnow() + timedelta(minutes=4000)
-        http_requests.patch(
-            f"https://graph.microsoft.com/v1.0/subscriptions/{s['subscription_id']}",
-            headers={"Authorization": f"Bearer {s.get('access_token','')}",
-                     "Content-Type": "application/json"},
-            json={"expirationDateTime": new_exp.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")},
-            timeout=10,
-        )
-        with engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE email_subscriptions SET expires_at=:exp, atualizado_em=NOW()
-                WHERE subscription_id=:sid
-            """), {"exp": new_exp, "sid": s["subscription_id"]})
-
-
 def setup_outlook_calendar_subscription(usuario_email: str, access_token: str, refresh_token: str):
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=4000)
@@ -889,6 +681,180 @@ def setup_outlook_calendar_subscription(usuario_email: str, access_token: str, r
     except Exception as e:
         print(f"[Outlook Cal Sub] Exceção: {e}")
 
+# =========================
+# WEBHOOKS
+# =========================
+
+@app.post("/webhooks/gmail", include_in_schema=False)
+async def gmail_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    msg_data = body.get("message", {}).get("data", "")
+    if not msg_data:
+        return {"ok": True}
+
+    try:
+        decoded    = json.loads(base64.b64decode(msg_data).decode("utf-8"))
+        gmail_addr = decoded.get("emailAddress", "")
+        new_hist   = int(decoded.get("historyId", 0))
+    except Exception as e:
+        print(f"[Gmail Webhook] Decode erro: {e}")
+        return {"ok": True}
+
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        sub = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider='gmail' AND email_address=:addr
+        """), {"addr": gmail_addr}).fetchone()
+        if not sub:
+            return {"ok": True}
+
+        sub           = dict(sub._mapping)
+        old_hist      = sub.get("history_id") or new_hist
+        access_token  = sub.get("access_token", "")
+        usuario_email = sub.get("usuario_email", "")
+
+        if new_hist <= old_hist:
+            return {"ok": True}
+
+        conn.execute(text("""
+            UPDATE email_subscriptions SET history_id=:hid, atualizado_em=NOW()
+            WHERE provider='gmail' AND email_address=:addr
+        """), {"hid": new_hist, "addr": gmail_addr})
+
+    hist_res = http_requests.get(
+        f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
+        f"?startHistoryId={old_hist}&historyTypes=messageAdded&labelId=INBOX",
+        headers={"Authorization": f"Bearer {access_token}"}, timeout=15,
+    )
+    if not hist_res.ok:
+        return {"ok": True}
+
+    for record in hist_res.json().get("history", []):
+        for entry in record.get("messagesAdded", []):
+            msg_id = entry.get("message", {}).get("id")
+            if not msg_id:
+                continue
+            msg_res = http_requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
+                "?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=In-Reply-To",
+                headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+            )
+            if not msg_res.ok:
+                continue
+            headers_map = {h["name"].lower(): h["value"]
+                           for h in msg_res.json().get("payload", {}).get("headers", [])}
+            from_raw = headers_map.get("from", "")
+            subject  = headers_map.get("subject", "")
+            in_reply  = headers_map.get("in-reply-to", "")
+
+            # Só processa se for uma resposta real
+            is_reply = bool(in_reply) or subject.lower().startswith("re:")
+            if not is_reply:
+                continue
+
+            match = re.match(r'^(.*?)\s*<(.+?)>$', from_raw.strip())
+            sender_name  = match.group(1).strip().strip('"') if match else ""
+            sender_email = match.group(2).strip() if match else from_raw.strip()
+
+            if sender_email.lower() == gmail_addr.lower():
+                continue
+            if is_automated_sender(sender_email):
+                continue
+
+            with engine.begin() as conn:
+                empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+                if empresa_id:
+                    create_interaction_notification(
+                        conn, usuario_email, empresa_id, empresa_nome,
+                        "gmail", sender_name, sender_email, subject
+                    )
+    return {"ok": True}
+
+
+@app.api_route("/webhooks/outlook", methods=["GET", "POST"], include_in_schema=False)
+async def outlook_webhook(request: Request):
+    validation_token = request.query_params.get("validationToken")
+    if validation_token:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=validation_token, status_code=200)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    for notif in body.get("value", []):
+        if notif.get("clientState") != OUTLOOK_WEBHOOK_SECRET:
+            continue
+        sub_id = notif.get("subscriptionId")
+        msg_id = notif.get("resourceData", {}).get("id")
+        if not msg_id:
+            continue
+
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            sub = conn.execute(text("""
+                SELECT * FROM email_subscriptions
+                WHERE provider='outlook' AND subscription_id=:sid
+            """), {"sid": sub_id}).fetchone()
+            if not sub:
+                continue
+            sub = dict(sub._mapping)
+
+        access_token  = sub.get("access_token", "")
+        usuario_email = sub.get("usuario_email", "")
+        own_email     = sub.get("email_address", "")
+
+        # Busca mensagem com cabeçalhos de resposta para detectar replies reais
+        msg_res = http_requests.get(
+            f"https://graph.microsoft.com/v1.0/me/messages/{msg_id}"
+            "?$select=from,subject,conversationId,internetMessageHeaders",
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
+        )
+        if not msg_res.ok:
+            continue
+
+        msg_data = msg_res.json()
+        from_obj     = msg_data.get("from", {}).get("emailAddress", {})
+        sender_email = from_obj.get("address", "")
+        sender_name  = from_obj.get("name", "")
+        subject      = msg_data.get("subject", "")
+
+        # Verifica se é uma resposta real via cabeçalhos Internet padrão
+        internet_headers = {
+            h.get("name", "").lower(): h.get("value", "")
+            for h in msg_data.get("internetMessageHeaders", [])
+        }
+        in_reply_to = internet_headers.get("in-reply-to", "")
+        is_reply    = bool(in_reply_to) or subject.lower().startswith("re:")
+
+        if not is_reply:
+            print(f"[Outlook Webhook] Ignorado (não é reply): {subject}")
+            continue
+
+        if not sender_email:
+            continue
+        if sender_email.lower() == own_email.lower():
+            continue
+        if is_automated_sender(sender_email):
+            print(f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}")
+            continue
+
+        with engine.begin() as conn:
+            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+            if empresa_id:
+                create_interaction_notification(
+                    conn, usuario_email, empresa_id, empresa_nome,
+                    "outlook", sender_name, sender_email, subject
+                )
+
+    return {"ok": True}
+
 
 @app.api_route("/webhooks/outlook-calendar", methods=["GET", "POST"], include_in_schema=False)
 async def outlook_calendar_webhook(request: Request):
@@ -930,9 +896,9 @@ async def outlook_calendar_webhook(request: Request):
         if not event_res.ok:
             continue
 
-        event_data = event_res.json()
-        subject    = event_data.get("subject", "")
-        attendees  = event_data.get("attendees", [])
+        event_data    = event_res.json()
+        subject       = event_data.get("subject", "")
+        attendees     = event_data.get("attendees", [])
 
         with engine.begin() as conn:
             evento = conn.execute(text("""
@@ -942,9 +908,10 @@ async def outlook_calendar_webhook(request: Request):
             """), {"eid": event_id, "uemail": usuario_email}).fetchone()
             if not evento:
                 continue
-            evento       = dict(evento._mapping)
-            empresa_id   = evento.get("empresa_id")
-            empresa_nome = evento.get("empresa_nome")
+
+            evento        = dict(evento._mapping)
+            empresa_id    = evento.get("empresa_id")
+            empresa_nome  = evento.get("empresa_nome")
             titulo_evento = evento.get("titulo", subject)
             if not empresa_id or not empresa_nome:
                 continue
@@ -959,6 +926,7 @@ async def outlook_calendar_webhook(request: Request):
                 response   = attendee.get("status", {}).get("response", "")
                 email_addr = attendee.get("emailAddress", {}).get("address", "")
                 name       = attendee.get("emailAddress", {}).get("name", email_addr)
+
                 if response not in response_map:
                     continue
 
@@ -971,10 +939,10 @@ async def outlook_calendar_webhook(request: Request):
                       AND meta->>'attendee_email' = :aemail
                       AND meta->>'outlook_event_id' = :evid
                 """), {
-                    "eid":   str(empresa_id),
-                    "tipo":  notif_tipo,
+                    "eid":    str(empresa_id),
+                    "tipo":   notif_tipo,
                     "aemail": email_addr,
-                    "evid":  event_id,
+                    "evid":   event_id,
                 }).fetchone()
                 if existe:
                     continue
@@ -987,14 +955,14 @@ async def outlook_calendar_webhook(request: Request):
                         (:id, :uemail, :tipo, :titulo, :mensagem,
                          :eid, :enome, 'outlook', CAST(:meta AS JSONB), FALSE, NOW())
                 """), {
-                    "id":      str(uuid.uuid4()),
-                    "uemail":  usuario_email,
-                    "tipo":    notif_tipo,
-                    "titulo":  f"{empresa_nome} {verbo} a call",
+                    "id":       str(uuid.uuid4()),
+                    "uemail":   usuario_email,
+                    "tipo":     notif_tipo,
+                    "titulo":   f"{empresa_nome} {verbo} a call",
                     "mensagem": f"{name} {verbo} o convite para '{titulo_evento}'.",
-                    "eid":     str(empresa_id),
-                    "enome":   empresa_nome,
-                    "meta":    json.dumps({
+                    "eid":      str(empresa_id),
+                    "enome":    empresa_nome,
+                    "meta":     json.dumps({
                         "attendee_email":   email_addr,
                         "attendee_name":    name,
                         "outlook_event_id": event_id,
@@ -1002,13 +970,59 @@ async def outlook_calendar_webhook(request: Request):
                     }),
                 })
 
-    return {"ok": True}            
+    return {"ok": True}
 
-# Inicia o scheduler
+# =========================
+# RENOVAÇÃO DE SUBSCRIPTIONS
+# =========================
+def renovar_gmail_watches():
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        subs = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider='gmail'
+              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '36 hours')
+        """)).fetchall()
+    for sub in subs:
+        s = dict(sub._mapping)
+        setup_gmail_watch(
+            s["usuario_email"], s.get("access_token", ""),
+            s.get("refresh_token", ""), s.get("email_address", "")
+        )
+
+def renovar_outlook_subscriptions():
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        subs = conn.execute(text("""
+            SELECT * FROM email_subscriptions
+            WHERE provider IN ('outlook', 'outlook_calendar')
+              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '12 hours')
+        """)).fetchall()
+    for sub in subs:
+        s = dict(sub._mapping)
+        if not s.get("subscription_id"):
+            continue
+        new_exp = datetime.utcnow() + timedelta(minutes=4000)
+        http_requests.patch(
+            f"https://graph.microsoft.com/v1.0/subscriptions/{s['subscription_id']}",
+            headers={"Authorization": f"Bearer {s.get('access_token', '')}",
+                     "Content-Type": "application/json"},
+            json={"expirationDateTime": new_exp.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")},
+            timeout=10,
+        )
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE email_subscriptions SET expires_at=:exp, atualizado_em=NOW()
+                WHERE subscription_id=:sid
+            """), {"exp": new_exp, "sid": s["subscription_id"]})
+
+# =========================
+# SCHEDULER
+# =========================
 scheduler = BackgroundScheduler()
-scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)  # Roda todo dia às 8h UTC
-scheduler.add_job(renovar_gmail_watches,          "interval", hours=6, id="renew_gmail")
-scheduler.add_job(renovar_outlook_subscriptions,  "interval", hours=6, id="renew_outlook")
+scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
+scheduler.add_job(renovar_gmail_watches,         "interval", hours=6,  id="renew_gmail")
+scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6,  id="renew_outlook")
 scheduler.start()
 print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
 
@@ -1019,7 +1033,6 @@ print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
 def home():
     return {"msg": "API rodando 🚀"}
 
-# Rota manual para disparar o job (útil para testar)
 @app.post("/admin/verificar-rascunhos")
 def trigger_verificar_rascunhos():
     verificar_rascunhos_expirados()
@@ -1029,15 +1042,21 @@ def trigger_verificar_rascunhos():
 # NOTIFICAÇÕES
 # =========================
 @app.get("/notificacoes")
-def listar_notificacoes(email: str = Depends(get_current_user)):
+def listar_notificacoes(empresa_id: Optional[str] = None, email: str = Depends(get_current_user)):
     with engine.begin() as conn:
         garantir_tabela_notificacoes(conn)
-        result = conn.execute(text("""
-            SELECT * FROM notificacoes
-            WHERE usuario_email = :email
-            ORDER BY criado_em DESC
-            LIMIT 50
-        """), {"email": email})
+        if empresa_id:
+            result = conn.execute(text("""
+                SELECT * FROM notificacoes
+                WHERE usuario_email = :email AND empresa_id = :eid
+                ORDER BY criado_em DESC LIMIT 50
+            """), {"email": email, "eid": empresa_id})
+        else:
+            result = conn.execute(text("""
+                SELECT * FROM notificacoes
+                WHERE usuario_email = :email
+                ORDER BY criado_em DESC LIMIT 50
+            """), {"email": email})
         return [dict(row._mapping) for row in result]
 
 @app.get("/notificacoes/nao-lidas")
@@ -1120,13 +1139,7 @@ def outlook_login():
         f"&response_type=code"
         f"&redirect_uri={MICROSOFT_REDIRECT_URI}"
         f"&response_mode=query"
-        f"&scope="
-        f"openid%20profile%20email%20"
-        f"User.Read%20"
-        f"Mail.Read%20"
-        f"Mail.Send%20"
-        f"Calendars.ReadWrite%20"
-        f"offline_access"
+        f"&scope=openid%20profile%20email%20User.Read%20Mail.Read%20Mail.Send%20Calendars.ReadWrite%20offline_access"
     )
     return {"auth_url": url}
 
@@ -1145,20 +1158,17 @@ async def outlook_callback(code: str, email: str = Depends(get_current_user)):
         garantir_colunas_oauth(conn)
         conn.execute(text("UPDATE usuarios SET outlook_access_token = :a, outlook_refresh_token = :r WHERE email = :e"),
                      {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
-    # Configura a subscription do Outlook em background
     import threading
     threading.Thread(
         target=setup_outlook_subscription,
         args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
         daemon=True
     ).start()
-
     threading.Thread(
         target=setup_outlook_calendar_subscription,
         args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
         daemon=True
     ).start()
-
     return {"msg": "Outlook conectado com sucesso 🚀"}
 
 @app.get("/auth/outlook/status")
@@ -1183,7 +1193,10 @@ def google_login():
     url = (
         f"https://accounts.google.com/o/oauth2/v2/auth?client_id={GOOGLE_CLIENT_ID}"
         f"&response_type=code&redirect_uri={GOOGLE_REDIRECT_URI}"
-        f"&scope=https://www.googleapis.com/auth/gmail.send%20https://www.googleapis.com/auth/calendar.events%20https://www.googleapis.com/auth/calendar"
+        f"&scope=https://www.googleapis.com/auth/gmail.send%20"
+        f"https://www.googleapis.com/auth/gmail.readonly%20"
+        f"https://www.googleapis.com/auth/calendar.events%20"
+        f"https://www.googleapis.com/auth/calendar"
         f"&access_type=offline&prompt=consent"
     )
     return {"auth_url": url}
@@ -1203,22 +1216,18 @@ async def google_callback(code: str, email: str = Depends(get_current_user)):
         garantir_colunas_oauth(conn)
         conn.execute(text("UPDATE usuarios SET google_access_token = :a, google_refresh_token = :r WHERE email = :e"),
                      {"a": tokens.get("access_token"), "r": tokens.get("refresh_token"), "e": email})
-    # Busca o e-mail do usuário no Google
     async with httpx.AsyncClient() as client:
         userinfo_res = await client.get(
             "https://www.googleapis.com/oauth2/v2/userinfo",
             headers={"Authorization": f"Bearer {tokens.get('access_token')}"}
         )
     gmail_address = userinfo_res.json().get("email", email)
-
-    # Configura o watch do Gmail em background
     import threading
     threading.Thread(
         target=setup_gmail_watch,
         args=(email, tokens.get("access_token"), tokens.get("refresh_token", ""), gmail_address),
         daemon=True
     ).start()
-
     return {"msg": "Google conectado com sucesso 🚀"}
 
 @app.get("/auth/google/status")
@@ -1236,7 +1245,7 @@ def google_disconnect(email: str = Depends(get_current_user)):
     return {"msg": "Google desconectado com sucesso"}
 
 # =========================
-# REUNIÃO OUTLOOK
+# TOKEN REFRESH HELPERS
 # =========================
 async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
     async with httpx.AsyncClient() as client:
@@ -1244,9 +1253,9 @@ async def _refresh_outlook_token(refresh_token: str, email: str) -> str:
             f"https://login.microsoftonline.com/{MICROSOFT_TENANT_ID}/oauth2/v2.0/token",
             data={"client_id": MICROSOFT_CLIENT_ID, "client_secret": MICROSOFT_CLIENT_SECRET,
                   "refresh_token": refresh_token, "grant_type": "refresh_token",
-                  "scope": ( "openid profile email " "User.Read " "Mail.Read " "Mail.Send " "Calendars.ReadWrite " "offline_access")}
+                  "scope": "openid profile email User.Read Mail.Read Mail.Send Calendars.ReadWrite offline_access"}
         )
-    tokens = response.json() 
+    tokens = response.json()
     new_access = tokens.get("access_token")
     if new_access:
         with engine.begin() as conn:
@@ -1268,6 +1277,9 @@ async def _refresh_google_token(refresh_token: str, email: str) -> str:
             conn.execute(text("UPDATE usuarios SET google_access_token = :a WHERE email = :e"), {"a": new_access, "e": email})
     return new_access
 
+# =========================
+# REUNIÃO OUTLOOK
+# =========================
 @app.post("/eventos/{evento_id}/agendar-outlook")
 async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email: str = Depends(get_current_user)):
     try:
@@ -1275,7 +1287,7 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
             usuario = conn.execute(text("SELECT outlook_access_token, outlook_refresh_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
         if not usuario or not usuario._mapping.get("outlook_access_token"):
             raise HTTPException(400, "Outlook não conectado.")
-        access_token = usuario._mapping["outlook_access_token"]
+        access_token  = usuario._mapping["outlook_access_token"]
         refresh_token = usuario._mapping.get("outlook_refresh_token")
         data_str = reuniao.data.isoformat()
         evento_graph = {
@@ -1299,13 +1311,11 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Outlook: {response.text}")
         outlook_event = response.json()
-        # Salva o ID do evento Outlook na nossa tabela
         with engine.begin() as conn:
             conn.execute(text("""
                 UPDATE eventos SET outlook_event_id = :oid
                 WHERE evento_id = :id AND usuario_email = :email
             """), {"oid": outlook_event.get("id"), "id": evento_id, "email": email})
-
         return {"msg": "Reunião criada no Outlook Calendar 🚀", "outlook_event_id": outlook_event.get("id"), "link": outlook_event.get("webLink")}
     except HTTPException:
         raise
@@ -1322,7 +1332,7 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
             usuario = conn.execute(text("SELECT google_access_token, google_refresh_token FROM usuarios WHERE email = :email"), {"email": email}).fetchone()
         if not usuario or not usuario._mapping.get("google_access_token"):
             raise HTTPException(400, "Google Calendar não conectado.")
-        access_token = usuario._mapping["google_access_token"]
+        access_token  = usuario._mapping["google_access_token"]
         refresh_token = usuario._mapping.get("google_refresh_token")
         data_str = reuniao.data.isoformat()
         evento_google = {
@@ -1335,17 +1345,28 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
             evento_google["attendees"] = [{"email": reuniao.email_convidado}]
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient() as client:
-            response = await client.post("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", json=evento_google, headers=headers)
+            response = await client.post(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
+                json=evento_google, headers=headers
+            )
         if response.status_code == 401 and refresh_token:
             access_token = await _refresh_google_token(refresh_token, email)
             if not access_token:
                 raise HTTPException(401, "Token expirado. Reconecte o Google.")
             headers["Authorization"] = f"Bearer {access_token}"
             async with httpx.AsyncClient() as client:
-                response = await client.post("https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all", json=evento_google, headers=headers)
+                response = await client.post(
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all",
+                    json=evento_google, headers=headers
+                )
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Google Calendar: {response.text}")
         google_event = response.json()
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE eventos SET google_event_id = :gid
+                WHERE evento_id = :id AND usuario_email = :email
+            """), {"gid": google_event.get("id"), "id": evento_id, "email": email})
         return {"msg": "Reunião criada no Google Calendar 🚀", "google_event_id": google_event.get("id"), "link": google_event.get("htmlLink")}
     except HTTPException:
         raise
@@ -1365,6 +1386,7 @@ def listar_eventos(email: str = Depends(get_current_user)):
 def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
     evento_id = str(uuid.uuid4())
     with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
         conn.execute(text("""
             INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
                 empresa_id, empresa_nome, descricao, usuario_email, criado_em)
