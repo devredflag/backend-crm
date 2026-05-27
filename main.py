@@ -1052,7 +1052,7 @@ async def gmail_webhook(request: Request):
 
     hist_res = http_requests.get(
         f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
-        f"?startHistoryId={old_hist}&historyTypes=messageAdded&labelId=INBOX",
+        f"?startHistoryId={old_hist}&labelId=INBOX",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15,
     )
@@ -1060,7 +1060,15 @@ async def gmail_webhook(request: Request):
         return {"ok": True}
 
     for record in hist_res.json().get("history", []):
-        for entry in record.get("messagesAdded", []):
+
+        entries = []
+
+        entries.extend(record.get("messagesAdded", []))
+
+        for msg in record.get("messages", []):
+            entries.append({"message": msg})
+
+        for entry in entries:
 
             msg_id = entry.get("message", {}).get("id")
 
