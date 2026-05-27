@@ -1139,7 +1139,21 @@ async def gmail_webhook(request: Request):
 
             print("[GMAIL] sender_email:", sender_email)
 
-            if sender_email.lower() == gmail_addr.lower():
+            is_calendar_response = subject.lower().startswith(
+                (
+                    "aceito:",
+                    "accepted:",
+                    "recusado:",
+                    "declined:",
+                    "talvez:",
+                    "tentative:"
+                )
+            )
+
+            if (
+                sender_email.lower() == gmail_addr.lower()
+                and not is_calendar_response
+            ):
                 print("[GMAIL] ignorado - meu próprio email")
                 continue
 
@@ -1149,31 +1163,24 @@ async def gmail_webhook(request: Request):
 
             with engine.begin() as conn:
                 
-                if (
-                    sender_email.lower() == gmail_addr.lower()
-                    and subject.lower().startswith(
-                        (
-                            "aceito:",
-                            "accepted:",
-                            "recusado:",
-                            "declined:",
-                            "talvez:",
-                            "tentative:"
-                        )
-                    )
-                ):
+                if is_calendar_response:
                     print("[GMAIL] calendar response detectada")
 
-                    empresa = conn.execute(text("""
-                        SELECT id, nome
-                        FROM empresas
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    """)).fetchone()
+                    evento = conn.execute(
+                        text("""
+                            SELECT empresa_id, empresa_nome
+                            FROM eventos
+                            WHERE google_event_id IS NOT NULL
+                            AND usuario_email = :email
+                            ORDER BY criado_em DESC
+                            LIMIT 1
+                        """),
+                        {"email": usuario_email},
+                    ).fetchone()
 
-                    if empresa:
-                        empresa_id = str(empresa.id)
-                        empresa_nome = empresa.nome
+                    if evento:
+                        empresa_id = evento.empresa_id
+                        empresa_nome = evento.empresa_nome
 
                         print(
                             "[GMAIL] criando notificação calendário:",
@@ -2002,17 +2009,30 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
                 )
         if response.status_code not in (200, 201):
             raise HTTPException(500, f"Erro Google Calendar: {response.text}")
+        
         google_event = response.json()
+
+        print("[GOOGLE EVENT]")
+        print(json.dumps(google_event, indent=2))
+
         with engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                UPDATE eventos SET google_event_id = :gid
-                WHERE evento_id = :id AND usuario_email = :email
+                UPDATE eventos
+                SET google_event_id = :gid
+                WHERE evento_id = :id
+                AND usuario_email = :email
             """
                 ),
-                {"gid": google_event.get("id"), "id": evento_id, "email": email},
+                {
+                    "gid": google_event.get("id"),
+                    "id": evento_id,
+                    "email": email,
+                },
             )
+
+
         return {
             "msg": "Reunião criada no Google Calendar 🚀",
             "google_event_id": google_event.get("id"),
