@@ -1052,7 +1052,7 @@ async def gmail_webhook(request: Request):
 
     hist_res = http_requests.get(
         f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
-        f"?startHistoryId={old_hist}&labelId=INBOX",
+        f"?startHistoryId={old_hist}",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15,
     )
