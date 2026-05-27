@@ -1062,54 +1062,112 @@ async def gmail_webhook(request: Request):
     for record in hist_res.json().get("history", []):
         for entry in record.get("messagesAdded", []):
             msg_id = entry.get("message", {}).get("id")
-            if not msg_id:
-                continue
-            msg_res = http_requests.get(
+
+        if not msg_id:
+            continue
+
+        msg_res = http_requests.get(
             f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
             "?format=full",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=10,
         )
-            if not msg_res.ok:
-                continue
-            headers_map = {h["name"].lower(): h["value"] for h in msg_res.json().get("payload", {}).get("headers", [])}
-            msg_json = msg_res.json()
 
-            thread_id = msg_json.get("threadId", "")
+        if not msg_res.ok:
+            print("[GMAIL] erro ao buscar mensagem")
+            continue
 
-            from_raw = headers_map.get("from", "")
-            subject = headers_map.get("subject", "")
-            in_reply = headers_map.get("in-reply-to", "")
+        msg_json = msg_res.json()
 
-            # Só processa se for uma resposta real
-            is_reply = bool(in_reply) or subject.lower().startswith("re:")
-            if not is_reply:
-                continue
+        headers_map = {
+            h["name"].lower(): h["value"]
+            for h in msg_json.get("payload", {}).get("headers", [])
+        }
 
-            match = re.match(r"^(.*?)\s*<(.+?)>$", from_raw.strip())
-            sender_name = match.group(1).strip().strip('"') if match else ""
-            sender_email = match.group(2).strip() if match else from_raw.strip()
+        print("[GMAIL] headers:", headers_map)
 
-            if sender_email.lower() == gmail_addr.lower():
-                continue
-            if is_automated_sender(sender_email):
-                continue
+        thread_id = msg_json.get("threadId", "")
 
-            with engine.begin() as conn:
-                empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
-                if empresa_id:
-                    create_interaction_notification(
-                        conn,
-                        usuario_email,
-                        empresa_id,
-                        empresa_nome,
-                        "gmail",
-                        sender_name,
-                        sender_email,
-                        subject,
-                        thread_id,
-                    )
-        return {"ok": True}
+        from_raw = headers_map.get("from", "")
+        subject = headers_map.get("subject", "")
+        in_reply = headers_map.get("in-reply-to", "")
+
+        subject_clean = (subject or "").strip().lower()
+
+        reply_prefixes = (
+            "re:",
+            "res:",
+            "aw:",
+            "fw:",
+            "fwd:"
+        )
+
+        is_reply = (
+            bool(in_reply)
+            or subject_clean.startswith(reply_prefixes)
+        )
+
+        print("[GMAIL] subject:", subject)
+        print("[GMAIL] in_reply:", in_reply)
+        print("[GMAIL] is_reply:", is_reply)
+
+        if not is_reply:
+            print("[GMAIL] ignorado - não é reply")
+            continue
+
+        match = re.match(
+            r"^(.*?)\s*<(.+?)>$",
+            from_raw.strip()
+        )
+
+        sender_name = (
+            match.group(1).strip().strip('"')
+            if match else ""
+        )
+
+        sender_email = (
+            match.group(2).strip()
+            if match else from_raw.strip()
+        )
+
+        print("[GMAIL] sender_email:", sender_email)
+
+        if sender_email.lower() == gmail_addr.lower():
+            print("[GMAIL] ignorado - meu próprio email")
+            continue
+
+        if is_automated_sender(sender_email):
+            print("[GMAIL] ignorado - remetente automático")
+            continue
+
+        with engine.begin() as conn:
+            empresa_id, _, empresa_nome = find_company_by_sender(
+                conn,
+                sender_email
+            )
+
+            print(
+                "[GMAIL] empresa encontrada:",
+                empresa_id,
+                empresa_nome
+            )
+
+            if empresa_id:
+                print("[GMAIL] criando notificação")
+
+                create_interaction_notification(
+                    conn,
+                    usuario_email,
+                    empresa_id,
+                    empresa_nome,
+                    "gmail",
+                    sender_name,
+                    sender_email,
+                    subject,
+                    thread_id,
+                )
+
+    return {"ok": True}
 
 
 @app.api_route("/webhooks/outlook", methods=["GET", "POST"], include_in_schema=False)
