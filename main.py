@@ -1211,29 +1211,26 @@ async def gmail_webhook(request: Request):
 
                 sender_email = sender_email.strip().lower()
 
+                empresa = conn.execute(
+                    text("""
+                        SELECT
+                            e.empresa_id,
+                            e.nome
+                        FROM contatos c
+                        JOIN empresas e
+                            ON e.empresa_id = c.empresa_id
+                        WHERE LOWER(c.email) = :email
+                        LIMIT 1
+                    """),
+                    {"email": sender_email},
+                ).fetchone()
+
                 empresa_id = None
                 empresa_nome = None
 
-                empresas = conn.execute(text("""
-                    SELECT id, nome, email
-                    FROM empresas
-                """)).fetchall()
-
-                for emp in empresas:
-
-                    email_banco = (emp.email or "").strip().lower()
-
-                    print(
-                        "[DEBUG EMPRESA]",
-                        emp.id,
-                        emp.nome,
-                        repr(email_banco)
-                    )
-
-                    if email_banco == sender_email:
-                        empresa_id = str(emp.id)
-                        empresa_nome = emp.nome
-                        break
+                if empresa:
+                    empresa_id = str(empresa.empresa_id)
+                    empresa_nome = empresa.nome
 
                 print(
                     "[GMAIL] empresa encontrada:",
