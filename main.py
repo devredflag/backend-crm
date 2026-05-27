@@ -1056,10 +1056,15 @@ async def gmail_webhook(request: Request):
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15,
     )
+
+    print("[GMAIL] HISTORY RAW:")
+    print(hist_res.text[:5000])
+
     if not hist_res.ok:
         return {"ok": True}
 
     for record in hist_res.json().get("history", []):
+        print("[GMAIL] RECORD:", record)
 
         entries = []
 
