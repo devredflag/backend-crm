@@ -1148,6 +1148,52 @@ async def gmail_webhook(request: Request):
                 continue
 
             with engine.begin() as conn:
+                
+                if (
+                    sender_email.lower() == gmail_addr.lower()
+                    and subject.lower().startswith(
+                        (
+                            "aceito:",
+                            "accepted:",
+                            "recusado:",
+                            "declined:",
+                            "talvez:",
+                            "tentative:"
+                        )
+                    )
+                ):
+                    print("[GMAIL] calendar response detectada")
+
+                    empresa = conn.execute(text("""
+                        SELECT id, nome
+                        FROM empresas
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """)).fetchone()
+
+                    if empresa:
+                        empresa_id = str(empresa.id)
+                        empresa_nome = empresa.nome
+
+                        print(
+                            "[GMAIL] criando notificação calendário:",
+                            empresa_nome
+                        )
+
+                        create_interaction_notification(
+                            conn,
+                            usuario_email,
+                            empresa_id,
+                            empresa_nome,
+                            "gmail",
+                            "Resposta calendário",
+                            sender_email,
+                            subject,
+                            thread_id,
+                        )
+
+                    continue
+
                 empresa_id, _, empresa_nome = find_company_by_sender(
                     conn,
                     sender_email
