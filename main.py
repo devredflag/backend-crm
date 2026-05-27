@@ -1209,10 +1209,31 @@ async def gmail_webhook(request: Request):
 
                     continue
 
-                empresa_id, _, empresa_nome = find_company_by_sender(
-                    conn,
-                    sender_email
-                )
+                sender_email = sender_email.strip().lower()
+
+                empresa_id = None
+                empresa_nome = None
+
+                empresas = conn.execute(text("""
+                    SELECT id, nome, email
+                    FROM empresas
+                """)).fetchall()
+
+                for emp in empresas:
+
+                    email_banco = (emp.email or "").strip().lower()
+
+                    print(
+                        "[DEBUG EMPRESA]",
+                        emp.id,
+                        emp.nome,
+                        repr(email_banco)
+                    )
+
+                    if email_banco == sender_email:
+                        empresa_id = str(emp.id)
+                        empresa_nome = emp.nome
+                        break
 
                 print(
                     "[GMAIL] empresa encontrada:",
@@ -1234,8 +1255,6 @@ async def gmail_webhook(request: Request):
                         subject,
                         thread_id,
                     )
-
-    return {"ok": True}
 
 
 @app.api_route("/webhooks/outlook", methods=["GET", "POST"], include_in_schema=False)
