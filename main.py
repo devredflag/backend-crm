@@ -1035,6 +1035,7 @@ async def gmail_webhook(request: Request):
         sub = dict(sub._mapping)
         old_hist = sub.get("history_id") or new_hist
         access_token = sub.get("access_token", "")
+        refresh_token = sub.get("refresh_token", "")
         usuario_email = sub.get("usuario_email", "")
 
         if new_hist <= old_hist:
@@ -1052,10 +1053,21 @@ async def gmail_webhook(request: Request):
 
     hist_res = http_requests.get(
         f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
-        f"?startHistoryId={old_hist}",
+        f"?startHistoryId={old_hist}&historyTypes=messageAdded",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=15,
     )
+
+    if hist_res.status_code == 401 and refresh_token:
+        new_access = await _refresh_google_token(refresh_token, usuario_email)
+        if new_access:
+            access_token = new_access
+            hist_res = http_requests.get(
+                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/history"
+                f"?startHistoryId={old_hist}&historyTypes=messageAdded",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=15,
+            )
 
     print("[GMAIL] HISTORY RAW:")
     print(hist_res.text[:5000])
@@ -1326,6 +1338,8 @@ async def outlook_webhook(request: Request):
 
         subject_clean = (subject or "").strip().lower()
 
+        # Detecção de replies e respostas de calendário.
+        # Outlook usa assuntos localizados para aceite/recusa de convite.
         reply_prefixes = (
             "re:",
             "res:",
@@ -1333,22 +1347,120 @@ async def outlook_webhook(request: Request):
             "fw:",
             "fwd:",
         )
+        calendar_response_prefixes = (
+            "aceito:",
+            "accepted:",
+            "recusado:",
+            "declined:",
+            "talvez:",
+            "tentative:",
+        )
 
         is_reply = bool(in_reply_to) or subject_clean.startswith(reply_prefixes)
+        is_calendar_response = subject_clean.startswith(calendar_response_prefixes)
 
-        if not is_reply:
-            print(f"[Outlook Webhook] Ignorado (não é reply): {subject}")
+        if not is_reply and not is_calendar_response:
+            print(f"[Outlook Webhook] Ignorado (não é reply/calendário): {subject}")
             continue
 
         if not sender_email:
             continue
-        if sender_email.lower() == own_email.lower():
+        if sender_email.lower() == own_email.lower() and not is_calendar_response:
             continue
-        if is_automated_sender(sender_email):
+        if is_automated_sender(sender_email) and not is_calendar_response:
             print(f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}")
             continue
 
         with engine.begin() as conn:
+            if is_calendar_response:
+                evento = conn.execute(
+                    text(
+                        """
+                    SELECT evento_id, empresa_id, empresa_nome, titulo, outlook_event_id
+                    FROM eventos
+                    WHERE outlook_event_id IS NOT NULL AND usuario_email = :uemail
+                    ORDER BY criado_em DESC
+                    LIMIT 1
+                """
+                    ),
+                    {"uemail": usuario_email},
+                ).fetchone()
+                if not evento:
+                    continue
+
+                evento = dict(evento._mapping)
+                empresa_id = evento.get("empresa_id")
+                empresa_nome = evento.get("empresa_nome")
+                titulo_evento = evento.get("titulo") or subject
+                outlook_event_id = evento.get("outlook_event_id") or ""
+                if not empresa_id or not empresa_nome:
+                    continue
+
+                response_map = {
+                    "aceito:": ("calendar_accepted", "aceitou"),
+                    "accepted:": ("calendar_accepted", "aceitou"),
+                    "recusado:": ("calendar_declined", "recusou"),
+                    "declined:": ("calendar_declined", "recusou"),
+                    "talvez:": ("calendar_tentative", "disse talvez para"),
+                    "tentative:": ("calendar_tentative", "disse talvez para"),
+                }
+                notif_tipo, verbo = next(
+                    (value for prefix, value in response_map.items() if subject_clean.startswith(prefix)),
+                    ("calendar_response", "respondeu à"),
+                )
+
+                existe = conn.execute(
+                    text(
+                        """
+                    SELECT 1 FROM notificacoes
+                    WHERE empresa_id = :eid
+                      AND tipo = :tipo
+                      AND meta->>'attendee_email' = :aemail
+                      AND meta->>'outlook_event_id' = :evid
+                """
+                    ),
+                    {
+                        "eid": str(empresa_id),
+                        "tipo": notif_tipo,
+                        "aemail": sender_email,
+                        "evid": outlook_event_id,
+                    },
+                ).fetchone()
+                if existe:
+                    continue
+
+                conn.execute(
+                    text(
+                        """
+                    INSERT INTO notificacoes
+                        (notificacao_id, usuario_email, tipo, titulo, mensagem,
+                         empresa_id, empresa_nome, platform, meta, lida, criado_em)
+                    VALUES
+                        (:id, :uemail, :tipo, :titulo, :mensagem,
+                         :eid, :enome, 'outlook', CAST(:meta AS JSONB), FALSE, NOW())
+                """
+                    ),
+                    {
+                        "id": str(uuid.uuid4()),
+                        "uemail": usuario_email,
+                        "tipo": notif_tipo,
+                        "titulo": f"{empresa_nome} {verbo} a call",
+                        "mensagem": f"{sender_name or sender_email} {verbo} o convite para '{titulo_evento}'.",
+                        "eid": str(empresa_id),
+                        "enome": empresa_nome,
+                        "meta": json.dumps(
+                            {
+                                "attendee_email": sender_email,
+                                "attendee_name": sender_name,
+                                "outlook_event_id": outlook_event_id,
+                                "event_subject": subject,
+                                "conversation_id": conversation_id,
+                            }
+                        ),
+                    },
+                )
+                continue
+
             empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
             if empresa_id:
                 create_interaction_notification(
