@@ -1236,6 +1236,14 @@ async def gmail_webhook(request: Request):
                                 calendar_ref = match_calendar_ref.group(1)
                                 break
 
+                    subject_without_status = re.sub(
+                        r"^(aceito|accepted|recusado|declined|talvez|tentative):\s*",
+                        "",
+                        subject,
+                        flags=re.I,
+                    ).strip()
+                    subject_without_date = re.split(r"\s+-\s+", subject_without_status, maxsplit=1)[0].strip()
+
                     evento = conn.execute(
                         text("""
                             SELECT empresa_id, empresa_nome, titulo, google_event_id, google_ical_uid
@@ -1245,7 +1253,11 @@ async def gmail_webhook(request: Request):
                               AND (
                                   google_ical_uid = :calendar_ref
                                   OR google_event_id = :calendar_ref
-                                  OR :calendar_ref = ''
+                                  OR (
+                                      titulo IS NOT NULL
+                                      AND :subject_title <> ''
+                                      AND LOWER(:subject_title) LIKE '%' || LOWER(titulo) || '%'
+                                  )
                               )
                             ORDER BY criado_em DESC
                             LIMIT 1
@@ -1254,6 +1266,7 @@ async def gmail_webhook(request: Request):
                             "email": usuario_email,
                             "sender_email": sender_email.lower(),
                             "calendar_ref": calendar_ref,
+                            "subject_title": subject_without_date,
                         },
                     ).fetchone()
 
