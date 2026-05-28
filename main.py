@@ -323,6 +323,7 @@ class EventoCreate(BaseModel):
     empresa_id: Optional[str] = None
     empresa_nome: Optional[str] = None
     descricao: Optional[str] = None
+    email_convidado: Optional[str] = None
 
 
 class EventoUpdate(BaseModel):
@@ -334,6 +335,7 @@ class EventoUpdate(BaseModel):
     empresa_id: str | None = None
     empresa_nome: str | None = None
     descricao: str | None = None
+    email_convidado: str | None = None
 
 
 class AtivarConta(BaseModel):
@@ -528,6 +530,7 @@ def garantir_tabela_notificacoes(conn):
     )
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS email_convidado TEXT"))
 
 
 # =========================
@@ -1191,16 +1194,32 @@ async def gmail_webhook(request: Request):
                 if is_calendar_response:
                     print("[GMAIL] calendar response detectada")
 
+                    calendar_ref = ""
+                    for header_value in (in_reply, headers.get("references", "")):
+                        match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
+                        if match_calendar_ref:
+                            calendar_ref = match_calendar_ref.group(1)
+                            break
+
                     evento = conn.execute(
                         text("""
-                            SELECT empresa_id, empresa_nome
+                            SELECT empresa_id, empresa_nome, titulo, google_event_id
                             FROM eventos
-                            WHERE google_event_id IS NOT NULL
-                            AND usuario_email = :email
+                            WHERE usuario_email = :email
+                              AND LOWER(COALESCE(email_convidado, '')) = :sender_email
+                              AND (
+                                  google_event_id = :calendar_ref
+                                  OR :calendar_ref = ''
+                                  OR google_event_id IS NULL
+                              )
                             ORDER BY criado_em DESC
                             LIMIT 1
                         """),
-                        {"email": usuario_email},
+                        {
+                            "email": usuario_email,
+                            "sender_email": sender_email.lower(),
+                            "calendar_ref": calendar_ref,
+                        },
                     ).fetchone()
 
                     if evento:
@@ -1241,6 +1260,37 @@ async def gmail_webhook(request: Request):
                     """),
                     {"email": sender_email},
                 ).fetchone()
+
+                if not empresa:
+                    calendar_ref = ""
+                    for header_value in (in_reply, headers.get("references", "")):
+                        match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
+                        if match_calendar_ref:
+                            calendar_ref = match_calendar_ref.group(1)
+                            break
+
+                    empresa = conn.execute(
+                        text("""
+                            SELECT
+                                empresa_id,
+                                empresa_nome AS nome
+                            FROM eventos
+                            WHERE usuario_email = :email
+                              AND LOWER(COALESCE(email_convidado, '')) = :sender_email
+                              AND (
+                                  google_event_id = :calendar_ref
+                                  OR :calendar_ref = ''
+                                  OR google_event_id IS NULL
+                              )
+                            ORDER BY criado_em DESC
+                            LIMIT 1
+                        """),
+                        {
+                            "email": usuario_email,
+                            "sender_email": sender_email,
+                            "calendar_ref": calendar_ref,
+                        },
+                    ).fetchone()
 
                 empresa_id = None
                 empresa_nome = None
@@ -2161,13 +2211,15 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
                 text(
                     """
                 UPDATE eventos
-                SET google_event_id = :gid
+                SET google_event_id = :gid,
+                    email_convidado = COALESCE(:email_convidado, email_convidado)
                 WHERE evento_id = :id
                 AND usuario_email = :email
             """
                 ),
                 {
                     "gid": google_event.get("id"),
+                    "email_convidado": reuniao.email_convidado,
                     "id": evento_id,
                     "email": email,
                 },
@@ -2207,9 +2259,9 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
             text(
                 """
             INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
-                empresa_id, empresa_nome, descricao, usuario_email, criado_em)
+                empresa_id, empresa_nome, descricao, email_convidado, usuario_email, criado_em)
             VALUES (:id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
-                :empresa_id, :empresa_nome, :descricao, :email, NOW())
+                :empresa_id, :empresa_nome, :descricao, :email_convidado, :email, NOW())
         """
             ),
             {
@@ -2222,6 +2274,7 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
                 "empresa_id": evento.empresa_id,
                 "empresa_nome": evento.empresa_nome,
                 "descricao": evento.descricao,
+                "email_convidado": evento.email_convidado,
                 "email": email,
             },
         )
@@ -2243,7 +2296,8 @@ def atualizar_evento(evento_id: str, evento: EventoUpdate, email: str = Depends(
             UPDATE eventos SET titulo=COALESCE(:titulo,titulo), tipo=COALESCE(:tipo,tipo),
                 data=COALESCE(:data,data), hora_inicio=COALESCE(:hora_inicio,hora_inicio),
                 hora_fim=COALESCE(:hora_fim,hora_fim), empresa_id=COALESCE(:empresa_id,empresa_id),
-                empresa_nome=COALESCE(:empresa_nome,empresa_nome), descricao=COALESCE(:descricao,descricao)
+                empresa_nome=COALESCE(:empresa_nome,empresa_nome), descricao=COALESCE(:descricao,descricao),
+                email_convidado=COALESCE(:email_convidado,email_convidado)
             WHERE evento_id=:id AND usuario_email=:email
         """
             ),
@@ -2256,6 +2310,7 @@ def atualizar_evento(evento_id: str, evento: EventoUpdate, email: str = Depends(
                 "empresa_id": evento.empresa_id,
                 "empresa_nome": evento.empresa_nome,
                 "descricao": evento.descricao,
+                "email_convidado": evento.email_convidado,
                 "id": evento_id,
                 "email": email,
             },
