@@ -20,6 +20,7 @@ import httpx
 import resend
 import base64
 import json
+import base64
 import requests as http_requests
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
@@ -530,6 +531,7 @@ def garantir_tabela_notificacoes(conn):
     )
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_ical_uid TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS email_convidado TEXT"))
 
 
@@ -673,6 +675,37 @@ BLOCKED_SENDER_PATTERNS = [
     "hubspot",
     "salesforce",
 ]
+
+
+def extract_gmail_calendar_uid(part: dict) -> str:
+    if not part:
+        return ""
+
+    headers = {
+        h.get("name", "").lower(): h.get("value", "")
+        for h in part.get("headers", [])
+    }
+    mime_type = (part.get("mimeType") or "").lower()
+    content_type = headers.get("content-type", "").lower()
+
+    if "text/calendar" in mime_type or "text/calendar" in content_type:
+        data = part.get("body", {}).get("data", "")
+        if data:
+            padded = data + "=" * (-len(data) % 4)
+            try:
+                calendar_text = base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+                match_uid = re.search(r"^UID:(.+)$", calendar_text, re.M | re.I)
+                if match_uid:
+                    return match_uid.group(1).strip()
+            except Exception as exc:
+                print("[GMAIL] erro ao ler UID do calendário:", exc)
+
+    for child in part.get("parts", []) or []:
+        uid = extract_gmail_calendar_uid(child)
+        if uid:
+            return uid
+
+    return ""
 
 
 def is_automated_sender(email: str) -> bool:
@@ -1120,6 +1153,7 @@ async def gmail_webhook(request: Request):
             from_raw = headers_map.get("from", "")
             subject = headers_map.get("subject", "")
             in_reply = headers_map.get("in-reply-to", "")
+            gmail_calendar_uid = extract_gmail_calendar_uid(msg_json.get("payload", {}))
 
             subject_clean = (subject or "").strip().lower()
 
@@ -1194,23 +1228,24 @@ async def gmail_webhook(request: Request):
                 if is_calendar_response:
                     print("[GMAIL] calendar response detectada")
 
-                    calendar_ref = ""
-                    for header_value in (in_reply, headers_map.get("references", ""), headers_map.get("message-id", "")):
-                        match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
-                        if match_calendar_ref:
-                            calendar_ref = match_calendar_ref.group(1)
-                            break
+                    calendar_ref = gmail_calendar_uid
+                    if not calendar_ref:
+                        for header_value in (in_reply, headers_map.get("references", ""), headers_map.get("message-id", "")):
+                            match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
+                            if match_calendar_ref:
+                                calendar_ref = match_calendar_ref.group(1)
+                                break
 
                     evento = conn.execute(
                         text("""
-                            SELECT empresa_id, empresa_nome, titulo, google_event_id
+                            SELECT empresa_id, empresa_nome, titulo, google_event_id, google_ical_uid
                             FROM eventos
                             WHERE usuario_email = :email
                               AND LOWER(COALESCE(email_convidado, '')) = :sender_email
                               AND (
-                                  google_event_id = :calendar_ref
+                                  google_ical_uid = :calendar_ref
+                                  OR google_event_id = :calendar_ref
                                   OR :calendar_ref = ''
-                                  OR google_event_id IS NULL
                               )
                             ORDER BY criado_em DESC
                             LIMIT 1
@@ -1262,12 +1297,13 @@ async def gmail_webhook(request: Request):
                 ).fetchone()
 
                 if not empresa:
-                    calendar_ref = ""
-                    for header_value in (in_reply, headers_map.get("references", ""), headers_map.get("message-id", "")):
-                        match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
-                        if match_calendar_ref:
-                            calendar_ref = match_calendar_ref.group(1)
-                            break
+                    calendar_ref = gmail_calendar_uid
+                    if not calendar_ref:
+                        for header_value in (in_reply, headers_map.get("references", ""), headers_map.get("message-id", "")):
+                            match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
+                            if match_calendar_ref:
+                                calendar_ref = match_calendar_ref.group(1)
+                                break
 
                     empresa = conn.execute(
                         text("""
@@ -1278,9 +1314,9 @@ async def gmail_webhook(request: Request):
                             WHERE usuario_email = :email
                               AND LOWER(COALESCE(email_convidado, '')) = :sender_email
                               AND (
-                                  google_event_id = :calendar_ref
+                                  google_ical_uid = :calendar_ref
+                                  OR google_event_id = :calendar_ref
                                   OR :calendar_ref = ''
-                                  OR google_event_id IS NULL
                               )
                             ORDER BY criado_em DESC
                             LIMIT 1
@@ -2212,6 +2248,7 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
                     """
                 UPDATE eventos
                 SET google_event_id = :gid,
+                    google_ical_uid = :ical_uid,
                     email_convidado = COALESCE(:email_convidado, email_convidado)
                 WHERE evento_id = :id
                 AND usuario_email = :email
@@ -2219,6 +2256,7 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
                 ),
                 {
                     "gid": google_event.get("id"),
+                    "ical_uid": google_event.get("iCalUID"),
                     "email_convidado": reuniao.email_convidado,
                     "id": evento_id,
                     "email": email,
