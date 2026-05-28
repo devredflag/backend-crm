@@ -1182,7 +1182,7 @@ async def gmail_webhook(request: Request):
                 print("[GMAIL] ignorado - meu próprio email")
                 continue
 
-            if is_automated_sender(sender_email):
+            if is_automated_sender(sender_email) and not is_calendar_response:
                 print("[GMAIL] ignorado - remetente automático")
                 continue
 
