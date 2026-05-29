@@ -1464,10 +1464,14 @@ async def outlook_webhook(request: Request):
 
         if not sender_email:
             continue
-        if sender_email.lower() == own_email.lower() and not is_calendar_response:
+
+        if sender_email.lower() == own_email.lower():
             continue
-        if is_automated_sender(sender_email) and not is_calendar_response:
-            print(f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}")
+
+        if is_automated_sender(sender_email):
+            print(
+                f"[Outlook Webhook] Ignorado (remetente automático): {sender_email}"
+            )
             continue
 
         with engine.begin() as conn:
@@ -1495,7 +1499,10 @@ async def outlook_calendar_webhook(request: Request):
     if validation_token:
         from fastapi.responses import PlainTextResponse
 
-        return PlainTextResponse(content=validation_token, status_code=200)
+        return PlainTextResponse(
+            content=validation_token,
+            status_code=200
+        )
 
     try:
         body = await request.json()
@@ -1503,44 +1510,78 @@ async def outlook_calendar_webhook(request: Request):
         return {"ok": True}
 
     for notif in body.get("value", []):
+
+        print("[OUTLOOK CALENDAR] notif:", notif)
+
         if notif.get("clientState") != OUTLOOK_WEBHOOK_SECRET:
+            print("[OUTLOOK CALENDAR] clientState inválido")
             continue
+
         sub_id = notif.get("subscriptionId")
         event_id = notif.get("resourceData", {}).get("id")
+
+        print("[OUTLOOK CALENDAR] sub_id:", sub_id)
+        print("[OUTLOOK CALENDAR] event_id:", event_id)
+
         if not event_id:
+            print("[OUTLOOK CALENDAR] sem event_id")
             continue
 
         with engine.begin() as conn:
             garantir_tabela_notificacoes(conn)
+
             sub = conn.execute(
-                text(
-                    """
-                SELECT * FROM email_subscriptions
-                WHERE provider='outlook_calendar' AND subscription_id=:sid
-            """
-                ),
+                text("""
+                    SELECT *
+                    FROM email_subscriptions
+                    WHERE provider='outlook_calendar'
+                      AND subscription_id=:sid
+                """),
                 {"sid": sub_id},
             ).fetchone()
+
+            print("[OUTLOOK CALENDAR] sub:", sub)
+
             if not sub:
+                print("[OUTLOOK CALENDAR] subscription não encontrada")
                 continue
+
             sub = dict(sub._mapping)
 
         access_token = sub.get("access_token", "")
         usuario_email = sub.get("usuario_email", "")
 
         event_res = http_requests.get(
-            f"https://graph.microsoft.com/v1.0/me/events/{event_id}?$select=subject,attendees",
-            headers={"Authorization": f"Bearer {access_token}"},
+            f"https://graph.microsoft.com/v1.0/me/events/{event_id}"
+            "?$select=subject,attendees",
+            headers={
+                "Authorization": f"Bearer {access_token}"
+            },
             timeout=10,
         )
+
+        print(
+            "[OUTLOOK CALENDAR] event_res status:",
+            event_res.status_code
+        )
+
         if not event_res.ok:
+            print(
+                "[OUTLOOK CALENDAR] erro graph:",
+                event_res.text
+            )
             continue
 
         event_data = event_res.json()
+
+        print("[OUTLOOK CALENDAR] event_data:")
+        print(json.dumps(event_data, indent=2))
+
         subject = event_data.get("subject", "")
         attendees = event_data.get("attendees", [])
 
         with engine.begin() as conn:
+
             evento = conn.execute(
                 text("""
                     SELECT
@@ -1551,93 +1592,176 @@ async def outlook_calendar_webhook(request: Request):
                         outlook_event_id
                     FROM eventos
                     WHERE usuario_email = :uemail
-                    AND outlook_event_id IS NOT NULL
+                      AND outlook_event_id IS NOT NULL
                     ORDER BY criado_em DESC
                     LIMIT 1
                 """),
-                {"uemail": usuario_email},
+                {
+                    "uemail": usuario_email
+                },
             ).fetchone()
-
-            print(
-                "[OUTLOOK CALENDAR] event_id webhook:",
-                event_id
-            )
 
             print(
                 "[OUTLOOK CALENDAR] evento encontrado:",
                 evento
             )
+
             if not evento:
+                print(
+                    "[OUTLOOK CALENDAR] nenhum evento encontrado"
+                )
                 continue
 
             evento = dict(evento._mapping)
+
             empresa_id = evento.get("empresa_id")
             empresa_nome = evento.get("empresa_nome")
-            titulo_evento = evento.get("titulo", subject)
+            titulo_evento = (
+                evento.get("titulo")
+                or subject
+            )
+
+            print(
+                "[OUTLOOK CALENDAR] empresa:",
+                empresa_nome
+            )
+
             if not empresa_id or not empresa_nome:
+                print(
+                    "[OUTLOOK CALENDAR] empresa inválida"
+                )
                 continue
 
             response_map = {
-                "accepted": ("calendar_accepted", "aceitou"),
-                "declined": ("calendar_declined", "recusou"),
-                "tentativelyAccepted": ("calendar_tentative", "disse talvez para"),
+                "accepted": (
+                    "calendar_accepted",
+                    "aceitou"
+                ),
+                "declined": (
+                    "calendar_declined",
+                    "recusou"
+                ),
+                "tentativelyAccepted": (
+                    "calendar_tentative",
+                    "disse talvez para"
+                ),
             }
 
             for attendee in attendees:
-                response = attendee.get("status", {}).get("response", "")
-                email_addr = attendee.get("emailAddress", {}).get("address", "")
-                name = attendee.get("emailAddress", {}).get("name", email_addr)
+
+                response = attendee.get(
+                    "status",
+                    {}
+                ).get("response", "")
+
+                email_addr = attendee.get(
+                    "emailAddress",
+                    {}
+                ).get("address", "")
+
+                name = attendee.get(
+                    "emailAddress",
+                    {}
+                ).get("name", email_addr)
+
+                print(
+                    "[OUTLOOK CALENDAR] attendee:",
+                    name,
+                    email_addr,
+                    response
+                )
 
                 if response not in response_map:
+                    print(
+                        "[OUTLOOK CALENDAR] response ignorada:",
+                        response
+                    )
                     continue
 
-                notif_tipo, verbo = response_map[response]
+                notif_tipo, verbo = response_map[
+                    response
+                ]
 
                 existe = conn.execute(
-                    text(
-                        """
-                    SELECT 1 FROM notificacoes
-                    WHERE empresa_id = :eid
-                      AND tipo = :tipo
-                      AND meta->>'attendee_email' = :aemail
-                      AND meta->>'outlook_event_id' = :evid
-                """
-                    ),
+                    text("""
+                        SELECT 1
+                        FROM notificacoes
+                        WHERE empresa_id = :eid
+                          AND tipo = :tipo
+                          AND meta->>'attendee_email' = :aemail
+                          AND criado_em >= NOW()
+                          - INTERVAL '5 minutes'
+                    """),
                     {
                         "eid": str(empresa_id),
                         "tipo": notif_tipo,
                         "aemail": email_addr,
-                        "evid": event_id,
                     },
                 ).fetchone()
+
                 if existe:
+                    print(
+                        "[OUTLOOK CALENDAR] já existe"
+                    )
                     continue
 
+                print(
+                    "[OUTLOOK CALENDAR] criando notificação"
+                )
+
                 conn.execute(
-                    text(
-                        """
-                    INSERT INTO notificacoes
-                        (notificacao_id, usuario_email, tipo, titulo, mensagem,
-                         empresa_id, empresa_nome, platform, meta, lida, criado_em)
-                    VALUES
-                        (:id, :uemail, :tipo, :titulo, :mensagem,
-                         :eid, :enome, 'outlook', CAST(:meta AS JSONB), FALSE, NOW())
-                """
-                    ),
+                    text("""
+                        INSERT INTO notificacoes
+                            (
+                                notificacao_id,
+                                usuario_email,
+                                tipo,
+                                titulo,
+                                mensagem,
+                                empresa_id,
+                                empresa_nome,
+                                platform,
+                                meta,
+                                lida,
+                                criado_em
+                            )
+                        VALUES
+                            (
+                                :id,
+                                :uemail,
+                                :tipo,
+                                :titulo,
+                                :mensagem,
+                                :eid,
+                                :enome,
+                                'outlook',
+                                CAST(:meta AS JSONB),
+                                FALSE,
+                                NOW()
+                            )
+                    """),
                     {
                         "id": str(uuid.uuid4()),
                         "uemail": usuario_email,
                         "tipo": notif_tipo,
-                        "titulo": f"{empresa_nome} {verbo} a call",
-                        "mensagem": f"{name} {verbo} o convite para '{titulo_evento}'.",
+                        "titulo":
+                            f"{empresa_nome} {verbo} a call",
+                        "mensagem":
+                            f"{name} {verbo} "
+                            f"o convite para "
+                            f"'{titulo_evento}'.",
                         "eid": str(empresa_id),
                         "enome": empresa_nome,
                         "meta": json.dumps(
                             {
-                                "attendee_email": email_addr,
-                                "attendee_name": name,
-                                "outlook_event_id": event_id,
-                                "event_subject": subject,
+                                "attendee_email":
+                                    email_addr,
+                                "attendee_name":
+                                    name,
+                                "outlook_event_id":
+                                    event_id,
+                                "event_subject":
+                                    subject,
                             }
                         ),
                     },
