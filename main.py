@@ -1316,6 +1316,31 @@ async def gmail_webhook(request: Request):
                     empresa_id = str(empresa.empresa_id)
                     empresa_nome = empresa.nome
 
+                if not empresa_id:
+
+                    evento = conn.execute(
+                        text("""
+                            SELECT
+                                empresa_id,
+                                empresa_nome
+                            FROM eventos
+                            WHERE LOWER(email_convidado) = LOWER(:email)
+                            AND google_event_id IS NOT NULL
+                            ORDER BY criado_em DESC
+                            LIMIT 1
+                        """),
+                        {"email": sender_email},
+                    ).fetchone()
+
+                    if evento:
+                        empresa_id = str(evento.empresa_id)
+                        empresa_nome = evento.empresa_nome
+
+                        print(
+                            "[GMAIL] empresa encontrada por evento:",
+                            empresa_nome
+                        )
+
                 print(
                     "[GMAIL] empresa encontrada:",
                     empresa_id,
