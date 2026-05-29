@@ -1542,15 +1542,31 @@ async def outlook_calendar_webhook(request: Request):
 
         with engine.begin() as conn:
             evento = conn.execute(
-                text(
-                    """
-                SELECT evento_id, empresa_id, empresa_nome, titulo
-                FROM eventos
-                WHERE outlook_event_id = :eid AND usuario_email = :uemail
-            """
-                ),
-                {"eid": event_id, "uemail": usuario_email},
+                text("""
+                    SELECT
+                        evento_id,
+                        empresa_id,
+                        empresa_nome,
+                        titulo,
+                        outlook_event_id
+                    FROM eventos
+                    WHERE usuario_email = :uemail
+                    AND outlook_event_id IS NOT NULL
+                    ORDER BY criado_em DESC
+                    LIMIT 1
+                """),
+                {"uemail": usuario_email},
             ).fetchone()
+
+            print(
+                "[OUTLOOK CALENDAR] event_id webhook:",
+                event_id
+            )
+
+            print(
+                "[OUTLOOK CALENDAR] evento encontrado:",
+                evento
+            )
             if not evento:
                 continue
 
