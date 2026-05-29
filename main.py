@@ -1095,17 +1095,102 @@ async def gmail_webhook(request: Request):
             if not msg_id:
                 continue
 
+            # começa aqui
             msg_res = http_requests.get(
                 f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
                 "?format=full",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={
+                    "Authorization":
+                        f"Bearer {access_token}"
+                },
                 timeout=10,
             )
 
-            if not msg_res.ok:
-                print("[GMAIL] erro ao buscar mensagem")
-                continue
+            print(
+                "[GMAIL] msg status:",
+                msg_res.status_code
+            )
 
+            # token expirado → refresh automático
+            if msg_res.status_code == 401:
+
+                print(
+                    "[GMAIL] token expirado, renovando..."
+                )
+
+                refresh_res = http_requests.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id":
+                            GOOGLE_CLIENT_ID,
+                        "client_secret":
+                            GOOGLE_CLIENT_SECRET,
+                        "refresh_token":
+                            refresh_token,
+                        "grant_type":
+                            "refresh_token",
+                    },
+                    timeout=10,
+                )
+
+                print(
+                    "[GMAIL] refresh status:",
+                    refresh_res.status_code
+                )
+
+                if refresh_res.ok:
+
+                    refresh_json = refresh_res.json()
+
+                    access_token = refresh_json.get(
+                        "access_token",
+                        access_token
+                    )
+
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("""
+                                UPDATE email_subscriptions
+                                SET
+                                    access_token = :token,
+                                    atualizado_em = NOW()
+                                WHERE usuario_email = :uemail
+                                AND provider = 'gmail'
+                            """),
+                            {
+                                "token": access_token,
+                                "uemail": usuario_email,
+                            },
+                        )
+
+                    print(
+                        "[GMAIL] token renovado"
+                    )
+
+                    # retry request
+                    msg_res = http_requests.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/{gmail_addr}/messages/{msg_id}"
+                        "?format=full",
+                        headers={
+                            "Authorization":
+                                f"Bearer {access_token}"
+                        },
+                        timeout=10,
+                    )
+
+                    print(
+                        "[GMAIL] retry status:",
+                        msg_res.status_code
+                    )
+
+            if not msg_res.ok:
+                print(
+                    "[GMAIL] erro ao buscar mensagem:",
+                    msg_res.text
+                )
+                continue
+            
+            
             msg_json = msg_res.json()
 
             headers_map = {
@@ -1565,6 +1650,86 @@ async def outlook_calendar_webhook(request: Request):
             event_res.status_code
         )
 
+        # token expirado → tenta refresh automático
+        if event_res.status_code == 401:
+
+            print(
+                "[OUTLOOK CALENDAR] token expirado, renovando..."
+            )
+
+            refresh_res = http_requests.post(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                data={
+                    "client_id": OUTLOOK_CLIENT_ID,
+                    "client_secret": OUTLOOK_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": sub.get(
+                        "refresh_token",
+                        ""
+                    ),
+                    "scope":
+                        "offline_access "
+                        "https://graph.microsoft.com/.default",
+                },
+                timeout=10,
+            )
+
+            print(
+                "[OUTLOOK CALENDAR] refresh status:",
+                refresh_res.status_code
+            )
+
+            if refresh_res.ok:
+
+                refresh_json = refresh_res.json()
+
+                access_token = refresh_json.get(
+                    "access_token",
+                    access_token
+                )
+
+                new_refresh_token = refresh_json.get(
+                    "refresh_token",
+                    sub.get("refresh_token")
+                )
+
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("""
+                            UPDATE email_subscriptions
+                            SET
+                                access_token = :atoken,
+                                refresh_token = :rtoken,
+                                atualizado_em = NOW()
+                            WHERE subscription_id = :sid
+                        """),
+                        {
+                            "atoken": access_token,
+                            "rtoken": new_refresh_token,
+                            "sid": sub_id,
+                        },
+                    )
+
+                print(
+                    "[OUTLOOK CALENDAR] token renovado"
+                )
+
+                # tenta novamente
+                event_res = http_requests.get(
+                    f"https://graph.microsoft.com/v1.0/me/events/{event_id}"
+                    "?$select=subject,attendees",
+                    headers={
+                        "Authorization":
+                            f"Bearer {access_token}"
+                    },
+                    timeout=10,
+                )
+
+                print(
+                    "[OUTLOOK CALENDAR] retry status:",
+                    event_res.status_code
+                )
+
         if not event_res.ok:
             print(
                 "[OUTLOOK CALENDAR] erro graph:",
@@ -1573,6 +1738,8 @@ async def outlook_calendar_webhook(request: Request):
             continue
 
         event_data = event_res.json()
+
+
 
         print("[OUTLOOK CALENDAR] event_data:")
         print(json.dumps(event_data, indent=2))
