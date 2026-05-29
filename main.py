@@ -1195,7 +1195,7 @@ async def gmail_webhook(request: Request):
                     print("[GMAIL] calendar response detectada")
 
                     calendar_ref = ""
-                    for header_value in (in_reply, headers.get("references", "")):
+                    for header_value in (in_reply, headers_map.get("references", "")):
                         match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
                         if match_calendar_ref:
                             calendar_ref = match_calendar_ref.group(1)
@@ -1280,7 +1280,7 @@ async def gmail_webhook(request: Request):
 
                 if not empresa:
                     calendar_ref = ""
-                    for header_value in (in_reply, headers.get("references", "")):
+                    for header_value in (in_reply, headers_map.get("references", "")):
                         match_calendar_ref = re.search(r"calendar-([a-f0-9-]+)@google\.com", header_value or "", re.I)
                         if match_calendar_ref:
                             calendar_ref = match_calendar_ref.group(1)
