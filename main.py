@@ -531,6 +531,7 @@ def garantir_tabela_notificacoes(conn):
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS outlook_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS email_convidado TEXT"))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS status_resposta TEXT DEFAULT 'pendente'"))
 
 
 # =========================
@@ -2596,6 +2597,45 @@ def deletar_evento(evento_id: str, email: str = Depends(get_current_user)):
     if not result:
         raise HTTPException(404, "Evento não encontrado")
     return {"msg": "Evento deletado com sucesso"}
+
+
+@app.get("/empresas/{empresa_id}/atividades")
+def listar_atividades_empresa(empresa_id: str, email: str = Depends(get_current_user)):
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("""
+                SELECT evento_id, titulo, tipo, data, hora_inicio, hora_fim,
+                       empresa_id, empresa_nome, email_convidado, status_resposta, criado_em
+                FROM eventos
+                WHERE empresa_id = :empresa_id
+                  AND usuario_email = :email
+                ORDER BY data DESC, hora_inicio DESC
+            """),
+            {"empresa_id": empresa_id, "email": email},
+        )
+        rows = []
+        for row in result:
+            r = dict(row._mapping)
+            data = r.get("data")
+            hora = r.get("hora_inicio")
+            r["data_hora"] = f"{data}T{hora}" if data and hora else (str(data) if data else None)
+            rows.append(r)
+        return rows
+
+
+@app.put("/eventos/{evento_id}/status")
+def atualizar_status_evento(evento_id: str, body: dict, email: str = Depends(get_current_user)):
+    status = body.get("status_resposta")
+    if status not in ("aceito", "negado", "talvez", "novo_horario", "pendente"):
+        raise HTTPException(400, "Status inválido")
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("UPDATE eventos SET status_resposta=:status WHERE evento_id=:id AND usuario_email=:email RETURNING evento_id"),
+            {"status": status, "id": evento_id, "email": email},
+        ).fetchone()
+    if not result:
+        raise HTTPException(404, "Evento não encontrado")
+    return {"msg": "Status atualizado"}
 
 
 # =========================
