@@ -1289,7 +1289,7 @@ async def gmail_webhook(request: Request):
 
                     evento = conn.execute(
                         text("""
-                            SELECT empresa_id, empresa_nome, titulo, google_event_id
+                            SELECT evento_id, empresa_id, empresa_nome, titulo, google_event_id
                             FROM eventos
                             WHERE usuario_email = :email
                               AND LOWER(COALESCE(email_convidado, '')) = :sender_email
@@ -1309,25 +1309,76 @@ async def gmail_webhook(request: Request):
                     ).fetchone()
 
                     if evento:
-                        empresa_id = evento.empresa_id
+                        empresa_id   = evento.empresa_id
                         empresa_nome = evento.empresa_nome
+                        titulo_evento = evento.titulo or subject
+                        evento_id_db  = evento.evento_id
 
-                        print(
-                            "[GMAIL] criando notificação calendário:",
-                            empresa_nome
-                        )
+                        # Determina tipo e status a partir do assunto
+                        if subject_clean.startswith(("aceito:", "accepted:")):
+                            notif_tipo  = "calendar_accepted"
+                            verbo       = "aceitou"
+                            novo_status = "aceito"
+                        elif subject_clean.startswith(("recusado:", "declined:", "recusou:")):
+                            notif_tipo  = "calendar_declined"
+                            verbo       = "recusou"
+                            novo_status = "negado"
+                        elif subject_clean.startswith(("talvez:", "tentative:")):
+                            notif_tipo  = "calendar_tentative"
+                            verbo       = "disse talvez para"
+                            novo_status = "talvez"
+                        else:
+                            notif_tipo  = "calendar_accepted"
+                            verbo       = "respondeu"
+                            novo_status = "aceito"
 
-                        create_interaction_notification(
-                            conn,
-                            usuario_email,
-                            empresa_id,
-                            empresa_nome,
-                            "gmail",
-                            "Resposta calendário",
-                            sender_email,
-                            subject,
-                            thread_id,
+                        print(f"[GMAIL] notif tipo={notif_tipo} status={novo_status}")
+
+                        # Evita duplicata nos últimos 5 min
+                        existe = conn.execute(
+                            text("""
+                                SELECT 1 FROM notificacoes
+                                WHERE empresa_id = :eid
+                                  AND tipo = :tipo
+                                  AND meta->>'sender_email' = :semail
+                                  AND criado_em >= NOW() - INTERVAL '5 minutes'
+                            """),
+                            {"eid": str(empresa_id), "tipo": notif_tipo, "semail": sender_email},
+                        ).fetchone()
+
+                        if not existe:
+                            conn.execute(
+                                text("""
+                                    INSERT INTO notificacoes
+                                        (notificacao_id, usuario_email, tipo, titulo, mensagem,
+                                         empresa_id, empresa_nome, platform, meta, lida, criado_em)
+                                    VALUES
+                                        (:id, :uemail, :tipo, :titulo, :mensagem,
+                                         :eid, :enome, 'gmail', CAST(:meta AS JSONB), FALSE, NOW())
+                                """),
+                                {
+                                    "id":      str(uuid.uuid4()),
+                                    "uemail":  usuario_email,
+                                    "tipo":    notif_tipo,
+                                    "titulo":  f"{empresa_nome} {verbo} a call",
+                                    "mensagem": f"{sender_name or sender_email} {verbo} o convite para '{titulo_evento}'.",
+                                    "eid":     str(empresa_id),
+                                    "enome":   empresa_nome,
+                                    "meta":    json.dumps({
+                                        "sender_email":    sender_email,
+                                        "sender_name":     sender_name,
+                                        "subject":         subject,
+                                        "conversation_id": thread_id,
+                                    }),
+                                },
+                            )
+
+                        # Atualiza status_resposta no evento
+                        conn.execute(
+                            text("UPDATE eventos SET status_resposta = :status WHERE evento_id = :eid"),
+                            {"status": novo_status, "eid": str(evento_id_db)},
                         )
+                        print(f"[GMAIL] status_resposta atualizado: {novo_status}")
 
                     continue
 
@@ -1760,12 +1811,13 @@ async def outlook_calendar_webhook(request: Request):
                         outlook_event_id
                     FROM eventos
                     WHERE usuario_email = :uemail
-                      AND outlook_event_id IS NOT NULL
+                      AND outlook_event_id = :event_id
                     ORDER BY criado_em DESC
                     LIMIT 1
                 """),
                 {
-                    "uemail": usuario_email
+                    "uemail":   usuario_email,
+                    "event_id": event_id,
                 },
             ).fetchone()
 
@@ -1934,6 +1986,27 @@ async def outlook_calendar_webhook(request: Request):
                         ),
                     },
                 )
+
+                # Atualiza status_resposta no evento
+                status_map = {
+                    "accepted":           "aceito",
+                    "declined":           "negado",
+                    "tentativelyAccepted":"talvez",
+                }
+                novo_status = status_map.get(response)
+                if novo_status:
+                    conn.execute(
+                        text("""
+                            UPDATE eventos
+                            SET status_resposta = :status
+                            WHERE evento_id = :eid
+                        """),
+                        {
+                            "status": novo_status,
+                            "eid":    str(evento.get("evento_id")),
+                        },
+                    )
+                    print(f"[OUTLOOK CALENDAR] status_resposta atualizado: {novo_status}")
 
     return {"ok": True}
 
