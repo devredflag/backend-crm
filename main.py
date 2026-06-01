@@ -375,6 +375,7 @@ class ReuniaoOutlook(BaseModel):
     hora_inicio: str
     hora_fim: str
     email_convidado: Optional[str] = None
+    emails_convidados: Optional[list[str]] = None
 
 
 class ReuniaoGoogle(BaseModel):
@@ -384,6 +385,7 @@ class ReuniaoGoogle(BaseModel):
     hora_inicio: str
     hora_fim: str
     email_convidado: Optional[str] = None
+    emails_convidados: Optional[list[str]] = None
 
 
 # =========================
@@ -2458,8 +2460,10 @@ async def agendar_reuniao_outlook(evento_id: str, reuniao: ReuniaoOutlook, email
             "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
             "end": {"dateTime": f"{data_str}T{reuniao.hora_fim}:00", "timeZone": "America/Sao_Paulo"},
         }
-        if reuniao.email_convidado:
-            evento_graph["attendees"] = [{"emailAddress": {"address": reuniao.email_convidado}, "type": "required"}]
+        todos_emails = reuniao.emails_convidados or ([reuniao.email_convidado] if reuniao.email_convidado else [])
+        todos_emails = [e for e in todos_emails if e and e.strip()]
+        if todos_emails:
+            evento_graph["attendees"] = [{"emailAddress": {"address": e.strip()}, "type": "required"} for e in todos_emails]
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient() as client:
             response = await client.post("https://graph.microsoft.com/v1.0/me/events", json=evento_graph, headers=headers)
@@ -2520,8 +2524,10 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
             "start": {"dateTime": f"{data_str}T{reuniao.hora_inicio}:00", "timeZone": "America/Sao_Paulo"},
             "end": {"dateTime": f"{data_str}T{reuniao.hora_fim}:00", "timeZone": "America/Sao_Paulo"},
         }
-        if reuniao.email_convidado:
-            evento_google["attendees"] = [{"email": reuniao.email_convidado}]
+        todos_emails_g = reuniao.emails_convidados or ([reuniao.email_convidado] if reuniao.email_convidado else [])
+        todos_emails_g = [e for e in todos_emails_g if e and e.strip()]
+        if todos_emails_g:
+            evento_google["attendees"] = [{"email": e.strip()} for e in todos_emails_g]
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -2561,7 +2567,7 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
                 ),
                 {
                     "gid": google_event.get("id"),
-                    "email_convidado": reuniao.email_convidado,
+                    "email_convidado": (todos_emails_g[0] if todos_emails_g else reuniao.email_convidado),
                     "id": evento_id,
                     "email": email,
                 },
