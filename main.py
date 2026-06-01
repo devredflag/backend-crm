@@ -49,6 +49,7 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 BACKEND_URL = os.getenv("BACKEND_URL", "https://backend-crm-production-157b.up.railway.app")
 OUTLOOK_WEBHOOK_SECRET = os.getenv("OUTLOOK_WEBHOOK_SECRET", "crm-webhook-secret")
 GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "projects/SEU_PROJECT_ID/topics/gmail-crm-push")
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
 engine = create_engine(DATABASE_URL)
 security = HTTPBearer()
@@ -378,6 +379,28 @@ class ReuniaoOutlook(BaseModel):
     emails_convidados: Optional[list[str]] = None
 
 
+class PlacesSearchRequest(BaseModel):
+    query: str
+    lat: float | None = None
+    lng: float | None = None
+    radius: int = 15000
+
+
+class RascunhoCreate(BaseModel):
+    google_place_id: str | None = None
+    nome: str
+    endereco_completo: str | None = None
+    cidade: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    telefone_empresa: str | None = None
+    site: str | None = None
+    google_rating: float | None = None
+    google_rating_count: int | None = None
+    business_status: str | None = None
+    segmento: str | None = None
+
+
 class ReuniaoGoogle(BaseModel):
     titulo: str
     descricao: Optional[str] = None
@@ -480,6 +503,18 @@ def garantir_campos_pipeline(conn):
     """
         )
     )
+
+
+def garantir_colunas_places(conn):
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS google_place_id TEXT"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS google_rating DOUBLE PRECISION"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS google_rating_count INTEGER"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS endereco_completo TEXT"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS telefone_empresa TEXT"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS business_status TEXT"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS status_cadastro TEXT DEFAULT 'ativo'"))
 
 
 def garantir_colunas_oauth(conn):
@@ -2738,6 +2773,115 @@ def criar_segmento(segmento: SegmentoCreate):
 # =========================
 # EMPRESAS
 # =========================
+@app.post("/places/search")
+async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(get_current_user)):
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(503, "Google Places API não configurada")
+    lat = req.lat or -15.7801
+    lng = req.lng or -47.9292
+    payload = {
+        "textQuery": req.query,
+        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(req.radius)}},
+        "languageCode": "pt-BR",
+        "regionCode": "BR",
+        "maxResultCount": 20,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.businessStatus,places.regularOpeningHours,places.primaryTypeDisplayName",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=headers)
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Google Places erro: {resp.text}")
+    data = resp.json()
+    places = data.get("places", [])
+    place_ids = [p["id"] for p in places if "id" in p]
+    ja_cadastradas = set()
+    if place_ids:
+        with engine.connect() as conn:
+            garantir_colunas_places(conn)
+            rows = conn.execute(
+                text("SELECT google_place_id FROM empresas WHERE google_place_id = ANY(:ids)"),
+                {"ids": place_ids},
+            )
+            ja_cadastradas = {r[0] for r in rows}
+    result = []
+    for p in places:
+        loc = p.get("location", {})
+        nome_obj = p.get("displayName", {})
+        tipo_obj = p.get("primaryTypeDisplayName", {})
+        opening = p.get("regularOpeningHours", {})
+        result.append({
+            "place_id": p.get("id"),
+            "nome": nome_obj.get("text", ""),
+            "endereco": p.get("formattedAddress", ""),
+            "lat": loc.get("latitude"),
+            "lng": loc.get("longitude"),
+            "rating": p.get("rating"),
+            "rating_count": p.get("userRatingCount"),
+            "telefone": p.get("nationalPhoneNumber") or p.get("internationalPhoneNumber"),
+            "site": p.get("websiteUri"),
+            "business_status": p.get("businessStatus"),
+            "open_now": opening.get("openNow"),
+            "tipo": tipo_obj.get("text") if tipo_obj else None,
+            "ja_cadastrada": p.get("id") in ja_cadastradas,
+        })
+    return result
+
+
+@app.get("/empresas/rascunhos")
+def listar_rascunhos(usuario_email: str = Depends(get_current_user)):
+    with engine.connect() as conn:
+        garantir_colunas_places(conn)
+        rows = conn.execute(
+            text("SELECT * FROM empresas WHERE status_cadastro = 'rascunho' ORDER BY status_atualizado_em DESC NULLS LAST"),
+        )
+        return [dict(r._mapping) for r in rows]
+
+
+@app.post("/empresas/rascunho", status_code=201)
+def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        garantir_colunas_places(conn)
+        garantir_campos_pipeline(conn)
+        # Verifica duplicata por google_place_id
+        if rascunho.google_place_id:
+            existing = conn.execute(
+                text("SELECT empresa_id FROM empresas WHERE google_place_id = :gid"),
+                {"gid": rascunho.google_place_id},
+            ).fetchone()
+            if existing:
+                raise HTTPException(409, {"msg": "Empresa já cadastrada", "empresa_id": str(existing[0])})
+        empresa_id = str(uuid.uuid4())
+        conn.execute(
+            text("""
+                INSERT INTO empresas (empresa_id, nome, cidade, endereco_completo, site, telefone_empresa,
+                    google_place_id, latitude, longitude, google_rating, google_rating_count, business_status,
+                    status, status_cadastro, origem_lead, temperatura, ultima_interacao, status_atualizado_em)
+                VALUES (:id, :nome, :cidade, :endereco_completo, :site, :telefone_empresa,
+                    :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status,
+                    'Lead', 'rascunho', 'Google Maps', 'Frio', NOW(), NOW())
+            """),
+            {
+                "id": empresa_id,
+                "nome": rascunho.nome,
+                "cidade": rascunho.cidade,
+                "endereco_completo": rascunho.endereco_completo,
+                "site": rascunho.site,
+                "telefone_empresa": rascunho.telefone_empresa,
+                "google_place_id": rascunho.google_place_id,
+                "latitude": rascunho.latitude,
+                "longitude": rascunho.longitude,
+                "google_rating": rascunho.google_rating,
+                "google_rating_count": rascunho.google_rating_count,
+                "business_status": rascunho.business_status,
+            },
+        )
+    return {"empresa_id": empresa_id}
+
+
 @app.get("/empresas")
 def listar_empresas():
     with engine.begin() as conn:
