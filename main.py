@@ -3105,4 +3105,4 @@ def login(dados: Login):
     if not verificar_senha(dados.senha, usuario["senha_hash"]):
         raise HTTPException(401, "Senha inválida")
     token = criar_token_acesso({"sub": usuario["email"]})
-    return {"access_token": token, "token_type": "bearer"}ll
+    return {"access_token": token, "token_type": "bearer"}
