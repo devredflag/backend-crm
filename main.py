@@ -303,6 +303,7 @@ class EmpresaUpdate(BaseModel):
     responsavel_principal: str | None = None
     ticket_medio_estimado: float | None = None
     status: str | None = None
+    status_cadastro: str | None = None
     origem_lead: str | None = None
     ultima_interacao: datetime | None = None
     proxima_acao: str | None = None
@@ -2836,7 +2837,12 @@ def listar_rascunhos(usuario_email: str = Depends(get_current_user)):
     with engine.connect() as conn:
         garantir_colunas_places(conn)
         rows = conn.execute(
-            text("SELECT * FROM empresas WHERE status_cadastro = 'rascunho' ORDER BY status_atualizado_em DESC NULLS LAST"),
+            text(
+                "SELECT * FROM empresas WHERE status_cadastro = 'rascunho'"
+                " AND responsavel_principal = :email"
+                " ORDER BY status_atualizado_em DESC NULLS LAST"
+            ),
+            {"email": usuario_email},
         )
         return [dict(r._mapping) for r in rows]
 
@@ -2853,16 +2859,18 @@ def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_cu
                 {"gid": rascunho.google_place_id},
             ).fetchone()
             if existing:
-                raise HTTPException(409, {"msg": "Empresa já cadastrada", "empresa_id": str(existing[0])})
+                raise HTTPException(409, {"message": "Empresa já cadastrada", "empresa_id": str(existing[0])})
         empresa_id = str(uuid.uuid4())
         conn.execute(
             text("""
                 INSERT INTO empresas (empresa_id, nome, cidade, endereco_completo, site, telefone_empresa,
                     google_place_id, latitude, longitude, google_rating, google_rating_count, business_status,
-                    status, status_cadastro, origem_lead, temperatura, ultima_interacao, status_atualizado_em)
+                    status, status_cadastro, origem_lead, temperatura, responsavel_principal,
+                    ultima_interacao, status_atualizado_em)
                 VALUES (:id, :nome, :cidade, :endereco_completo, :site, :telefone_empresa,
                     :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status,
-                    'Lead', 'rascunho', 'Google Maps', 'Frio', NOW(), NOW())
+                    'Lead', 'rascunho', 'Google Maps', 'Frio', :responsavel_principal,
+                    NOW(), NOW())
             """),
             {
                 "id": empresa_id,
@@ -2877,9 +2885,10 @@ def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_cu
                 "google_rating": rascunho.google_rating,
                 "google_rating_count": rascunho.google_rating_count,
                 "business_status": rascunho.business_status,
+                "responsavel_principal": usuario_email,
             },
         )
-    return {"empresa_id": empresa_id}
+    return {"empresa_id": empresa_id, "status_cadastro": "rascunho"}
 
 
 @app.get("/empresas")
@@ -3034,7 +3043,8 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                 linkedin_empresa=COALESCE(:linkedin_empresa,linkedin_empresa),
                 responsavel_principal=COALESCE(:responsavel_principal,responsavel_principal),
                 ticket_medio_estimado=COALESCE(:ticket_medio_estimado,ticket_medio_estimado),
-                status=COALESCE(:status,status), origem_lead=COALESCE(:origem_lead,origem_lead),
+                status=COALESCE(:status,status), status_cadastro=COALESCE(:status_cadastro,status_cadastro),
+                origem_lead=COALESCE(:origem_lead,origem_lead),
                 ultima_interacao=COALESCE(:ultima_interacao,ultima_interacao),
                 proxima_acao=COALESCE(:proxima_acao,proxima_acao), data_proxima_acao=:data_proxima_acao,
                 status_atualizado_em=CASE WHEN :status IS NOT NULL AND :status<>status THEN NOW() ELSE status_atualizado_em END,
@@ -3060,6 +3070,7 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
                 "responsavel_principal": empresa.responsavel_principal,
                 "ticket_medio_estimado": empresa.ticket_medio_estimado,
                 "status": empresa.status,
+                "status_cadastro": empresa.status_cadastro,
                 "origem_lead": empresa.origem_lead,
                 "ultima_interacao": empresa.ultima_interacao,
                 "proxima_acao": empresa.proxima_acao,
