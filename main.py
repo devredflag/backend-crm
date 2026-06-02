@@ -3096,6 +3096,7 @@ def listar_empresas():
                 SELECT email, celular, whatsapp FROM contatos WHERE empresa_id = e.empresa_id
                 ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
             ) c ON TRUE
+            WHERE COALESCE(e.status_cadastro, 'ativo') != 'rascunho'
             ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
         """
             )
