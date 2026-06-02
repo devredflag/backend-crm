@@ -2794,6 +2794,30 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=headers)
+    if resp.status_code == 429 or (
+        resp.status_code not in (200,) and
+        any(k in resp.text.upper() for k in ("RESOURCE_EXHAUSTED", "QUOTA", "RATE_LIMIT"))
+    ):
+        with engine.begin() as conn:
+            garantir_tabela_notificacoes(conn)
+            existe = conn.execute(
+                text("SELECT 1 FROM notificacoes WHERE usuario_email=:e AND tipo='quota_exceeded' AND criado_em >= NOW() - INTERVAL '1 hour'"),
+                {"e": usuario_email},
+            ).fetchone()
+            if not existe:
+                conn.execute(
+                    text("""
+                        INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, lida, criado_em)
+                        VALUES (:id, :e, 'quota_exceeded', :titulo, :msg, FALSE, NOW())
+                    """),
+                    {
+                        "id": str(uuid.uuid4()),
+                        "e": usuario_email,
+                        "titulo": "Limite do Google Places atingido",
+                        "msg": "O limite gratuito da API foi atingido. A busca de empresas voltará disponível amanhã.",
+                    },
+                )
+        raise HTTPException(429, "Cota da Google Places API esgotada. A busca voltará disponível amanhã.")
     if resp.status_code != 200:
         raise HTTPException(502, f"Google Places erro: {resp.text}")
     data = resp.json()
