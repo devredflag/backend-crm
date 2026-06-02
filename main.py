@@ -3097,6 +3097,7 @@ def listar_empresas():
                 ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
             ) c ON TRUE
             WHERE COALESCE(e.status_cadastro, 'ativo') != 'rascunho'
+              AND COALESCE(e.status, '') != 'Rascunho'
             ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
         """
             )
