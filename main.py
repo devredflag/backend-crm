@@ -518,6 +518,35 @@ def garantir_colunas_places(conn):
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS status_cadastro TEXT DEFAULT 'ativo'"))
 
 
+def garantir_tabelas_places_cache(conn):
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS places_cache (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            query TEXT NOT NULL,
+            lat_grid DOUBLE PRECISION NOT NULL,
+            lng_grid DOUBLE PRECISION NOT NULL,
+            results JSONB NOT NULL,
+            search_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(query, lat_grid, lng_grid)
+        )
+    """))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS places_ranking (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            query TEXT NOT NULL,
+            lat_grid DOUBLE PRECISION NOT NULL,
+            lng_grid DOUBLE PRECISION NOT NULL,
+            results JSONB NOT NULL,
+            search_count INTEGER NOT NULL,
+            rank_position INTEGER NOT NULL,
+            month VARCHAR(7) NOT NULL,
+            saved_date TIMESTAMP DEFAULT NOW()
+        )
+    """))
+
+
 def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_access_token text"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_refresh_token text"))
@@ -2113,12 +2142,65 @@ def renovar_outlook_subscriptions():
 
 
 # =========================
+# RANKING MENSAL
+# =========================
+def gerar_ranking_mensal():
+    print("📊 Gerando ranking mensal do Places...")
+    mes_atual = datetime.utcnow().strftime("%Y-%m")
+    try:
+        with engine.begin() as conn:
+            garantir_tabelas_places_cache(conn)
+
+            top10 = conn.execute(text("""
+                SELECT id, query, lat_grid, lng_grid, results, search_count
+                FROM places_cache
+                ORDER BY search_count DESC
+                LIMIT 10
+            """)).fetchall()
+
+            if not top10:
+                print("📊 Nenhuma pesquisa no cache, ranking não gerado.")
+                return
+
+            # Limpa ranking atual e insere o novo top 10
+            conn.execute(text("DELETE FROM places_ranking"))
+            for i, row in enumerate(top10, 1):
+                results_json = json.dumps(row.results) if not isinstance(row.results, str) else row.results
+                conn.execute(text("""
+                    INSERT INTO places_ranking
+                        (id, query, lat_grid, lng_grid, results, search_count, rank_position, month, saved_date)
+                    VALUES (:id, :q, :lat, :lng, CAST(:results AS JSONB), :count, :pos, :month, NOW())
+                """), {
+                    "id": str(uuid.uuid4()),
+                    "q": row.query,
+                    "lat": row.lat_grid,
+                    "lng": row.lng_grid,
+                    "results": results_json,
+                    "count": row.search_count,
+                    "pos": i,
+                    "month": mes_atual,
+                })
+
+            # Remove do cache tudo que não está no top 10
+            top_ids = [str(row.id) for row in top10]
+            conn.execute(text("DELETE FROM places_cache WHERE id != ALL(:ids)"), {"ids": top_ids})
+
+            # Reseta contadores para o novo mês
+            conn.execute(text("UPDATE places_cache SET search_count = 0, updated_at = NOW()"))
+
+        print(f"✅ Ranking mensal gerado: {mes_atual} — {len(top10)} entradas salvas.")
+    except Exception as e:
+        print(f"🔴 Erro ao gerar ranking: {e}")
+
+
+# =========================
 # SCHEDULER
 # =========================
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
+scheduler.add_job(gerar_ranking_mensal, "cron", day="last", hour=23, minute=30)
 scheduler.start()
 print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
 
@@ -2774,12 +2856,65 @@ def criar_segmento(segmento: SegmentoCreate):
 # =========================
 # EMPRESAS
 # =========================
+def _recalcular_cadastradas(results_list: list) -> list:
+    place_ids = [r["place_id"] for r in results_list if r.get("place_id")]
+    if not place_ids:
+        return results_list
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT google_place_id FROM empresas WHERE google_place_id = ANY(:ids)"),
+            {"ids": place_ids},
+        )
+        ja_cadastradas = {r[0] for r in rows}
+    for r in results_list:
+        r["ja_cadastrada"] = r.get("place_id") in ja_cadastradas
+    return results_list
+
+
 @app.post("/places/search")
 async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(get_current_user)):
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(503, "Google Places API não configurada")
+
     lat = req.lat or -15.7801
     lng = req.lng or -47.9292
+    lat_grid = round(lat, 1)
+    lng_grid = round(lng, 1)
+    query_norm = req.query.lower().strip()
+
+    # 1. Verifica ranking permanente (sem expiração)
+    with engine.begin() as conn:
+        garantir_tabelas_places_cache(conn)
+        ranking = conn.execute(
+            text("SELECT results FROM places_ranking WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng LIMIT 1"),
+            {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
+        ).fetchone()
+        if ranking:
+            results = ranking.results if isinstance(ranking.results, list) else json.loads(ranking.results)
+            conn.execute(
+                text("UPDATE places_cache SET search_count=search_count+1, updated_at=NOW() WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng"),
+                {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
+            )
+            return _recalcular_cadastradas(results)
+
+        # 2. Verifica cache (válido 30 dias)
+        cached = conn.execute(
+            text("""
+                SELECT id, results FROM places_cache
+                WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng
+                AND updated_at >= NOW() - INTERVAL '30 days'
+            """),
+            {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
+        ).fetchone()
+        if cached:
+            conn.execute(
+                text("UPDATE places_cache SET search_count=search_count+1, updated_at=NOW() WHERE id=:id"),
+                {"id": cached.id},
+            )
+            results = cached.results if isinstance(cached.results, list) else json.loads(cached.results)
+            return _recalcular_cadastradas(results)
+
+    # 3. Chama Google Places API
     payload = {
         "textQuery": req.query,
         "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(req.radius)}},
@@ -2787,15 +2922,16 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         "regionCode": "BR",
         "maxResultCount": 20,
     }
-    headers = {
+    api_headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
         "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.businessStatus,places.regularOpeningHours,places.primaryTypeDisplayName",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=headers)
+        resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=api_headers)
+
     if resp.status_code == 429 or (
-        resp.status_code not in (200,) and
+        resp.status_code != 200 and
         any(k in resp.text.upper() for k in ("RESOURCE_EXHAUSTED", "QUOTA", "RATE_LIMIT"))
     ):
         with engine.begin() as conn:
@@ -2806,20 +2942,14 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
             ).fetchone()
             if not existe:
                 conn.execute(
-                    text("""
-                        INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, lida, criado_em)
-                        VALUES (:id, :e, 'quota_exceeded', :titulo, :msg, FALSE, NOW())
-                    """),
-                    {
-                        "id": str(uuid.uuid4()),
-                        "e": usuario_email,
-                        "titulo": "Limite do Google Places atingido",
-                        "msg": "O limite gratuito da API foi atingido. A busca de empresas voltará disponível amanhã.",
-                    },
+                    text("INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, lida, criado_em) VALUES (:id, :e, 'quota_exceeded', :titulo, :msg, FALSE, NOW())"),
+                    {"id": str(uuid.uuid4()), "e": usuario_email, "titulo": "Limite do Google Places atingido", "msg": "O limite gratuito da API foi atingido. A busca voltará disponível amanhã."},
                 )
         raise HTTPException(429, "Cota da Google Places API esgotada. A busca voltará disponível amanhã.")
+
     if resp.status_code != 200:
         raise HTTPException(502, f"Google Places erro: {resp.text}")
+
     data = resp.json()
     places = data.get("places", [])
     place_ids = [p["id"] for p in places if "id" in p]
@@ -2827,11 +2957,9 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
     if place_ids:
         with engine.connect() as conn:
             garantir_colunas_places(conn)
-            rows = conn.execute(
-                text("SELECT google_place_id FROM empresas WHERE google_place_id = ANY(:ids)"),
-                {"ids": place_ids},
-            )
+            rows = conn.execute(text("SELECT google_place_id FROM empresas WHERE google_place_id = ANY(:ids)"), {"ids": place_ids})
             ja_cadastradas = {r[0] for r in rows}
+
     result = []
     for p in places:
         loc = p.get("location", {})
@@ -2853,7 +2981,47 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
             "tipo": tipo_obj.get("text") if tipo_obj else None,
             "ja_cadastrada": p.get("id") in ja_cadastradas,
         })
+
+    # 4. Salva no cache
+    with engine.begin() as conn:
+        garantir_tabelas_places_cache(conn)
+        conn.execute(
+            text("""
+                INSERT INTO places_cache (id, query, lat_grid, lng_grid, results, search_count, created_at, updated_at)
+                VALUES (:id, :q, :lat, :lng, CAST(:results AS JSONB), 1, NOW(), NOW())
+                ON CONFLICT (query, lat_grid, lng_grid)
+                DO UPDATE SET results=CAST(:results AS JSONB), search_count=places_cache.search_count+1, updated_at=NOW()
+            """),
+            {"id": str(uuid.uuid4()), "q": query_norm, "lat": lat_grid, "lng": lng_grid, "results": json.dumps(result)},
+        )
+
     return result
+
+
+@app.post("/places/generate-ranking")
+def generate_ranking(usuario_email: str = Depends(get_current_user)):
+    gerar_ranking_mensal()
+    return {"msg": "Ranking gerado com sucesso"}
+
+
+@app.get("/places/top10")
+def top10_places(usuario_email: str = Depends(get_current_user)):
+    with engine.begin() as conn:
+        garantir_tabelas_places_cache(conn)
+        rows = conn.execute(
+            text("SELECT rank_position, query, search_count, results, month FROM places_ranking ORDER BY rank_position ASC")
+        ).fetchall()
+    top = []
+    for row in rows:
+        results = row.results if isinstance(row.results, list) else json.loads(row.results)
+        top.append({
+            "posicao": row.rank_position,
+            "query": row.query,
+            "total_buscas": row.search_count,
+            "mes": row.month,
+            "primeiros_resultados": results[:5],
+        })
+    return top
 
 
 @app.get("/empresas/rascunhos")
