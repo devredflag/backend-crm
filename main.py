@@ -2968,20 +2968,34 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         opening = p.get("regularOpeningHours", {})
         address_components = p.get("addressComponents", [])
         cidade = ""
+        bairro = ""
+        cep = ""
+        rua = ""
+        numero = ""
         for comp in address_components:
-            if "locality" in comp.get("types", []):
-                cidade = comp.get("longText", "")
-                break
-        if not cidade:
-            for comp in address_components:
-                if "administrative_area_level_2" in comp.get("types", []):
-                    cidade = comp.get("longText", "")
-                    break
+            types = comp.get("types", [])
+            text = comp.get("longText", "")
+            if "locality" in types and not cidade:
+                cidade = text
+            elif "administrative_area_level_2" in types and not cidade:
+                cidade = text
+            elif ("sublocality_level_1" in types or "sublocality" in types) and not bairro:
+                bairro = text
+            elif "postal_code" in types:
+                cep = text.replace("-", "").replace(" ", "")
+            elif "route" in types:
+                rua = text
+            elif "street_number" in types:
+                numero = text
+        endereco_rua = f"{rua}, {numero}".strip(", ") if rua else ""
         result.append({
             "place_id": p.get("id"),
             "nome": nome_obj.get("text", ""),
             "endereco": p.get("formattedAddress", ""),
+            "endereco_rua": endereco_rua,
             "cidade": cidade,
+            "bairro": bairro,
+            "cep": cep,
             "lat": loc.get("latitude"),
             "lng": loc.get("longitude"),
             "rating": p.get("rating"),
