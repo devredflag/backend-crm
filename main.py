@@ -2925,7 +2925,7 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
     api_headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.businessStatus,places.regularOpeningHours,places.primaryTypeDisplayName",
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.location,places.rating,places.userRatingCount,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.businessStatus,places.regularOpeningHours,places.primaryTypeDisplayName",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=api_headers)
@@ -2966,10 +2966,22 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         nome_obj = p.get("displayName", {})
         tipo_obj = p.get("primaryTypeDisplayName", {})
         opening = p.get("regularOpeningHours", {})
+        address_components = p.get("addressComponents", [])
+        cidade = ""
+        for comp in address_components:
+            if "locality" in comp.get("types", []):
+                cidade = comp.get("longText", "")
+                break
+        if not cidade:
+            for comp in address_components:
+                if "administrative_area_level_2" in comp.get("types", []):
+                    cidade = comp.get("longText", "")
+                    break
         result.append({
             "place_id": p.get("id"),
             "nome": nome_obj.get("text", ""),
             "endereco": p.get("formattedAddress", ""),
+            "cidade": cidade,
             "lat": loc.get("latitude"),
             "lng": loc.get("longitude"),
             "rating": p.get("rating"),
