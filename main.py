@@ -2151,44 +2151,40 @@ def gerar_ranking_mensal():
         with engine.begin() as conn:
             garantir_tabelas_places_cache(conn)
 
+            # Snapshot de popularidade — APENAS analítico (termo + nº de buscas).
+            # Não copiamos conteúdo de places para cá, então nada aqui vence o
+            # limite de cache de 30 dias dos Termos do Google.
             top10 = conn.execute(text("""
-                SELECT id, query, lat_grid, lng_grid, results, search_count
+                SELECT query, lat_grid, lng_grid, search_count
                 FROM places_cache
                 ORDER BY search_count DESC
                 LIMIT 10
             """)).fetchall()
 
-            if not top10:
-                print("📊 Nenhuma pesquisa no cache, ranking não gerado.")
-                return
-
-            # Limpa ranking atual e insere o novo top 10
             conn.execute(text("DELETE FROM places_ranking"))
             for i, row in enumerate(top10, 1):
-                results_json = json.dumps(row.results) if not isinstance(row.results, str) else row.results
                 conn.execute(text("""
                     INSERT INTO places_ranking
                         (id, query, lat_grid, lng_grid, results, search_count, rank_position, month, saved_date)
-                    VALUES (:id, :q, :lat, :lng, CAST(:results AS JSONB), :count, :pos, :month, NOW())
+                    VALUES (:id, :q, :lat, :lng, '[]'::jsonb, :count, :pos, :month, NOW())
                 """), {
                     "id": str(uuid.uuid4()),
                     "q": row.query,
                     "lat": row.lat_grid,
                     "lng": row.lng_grid,
-                    "results": results_json,
                     "count": row.search_count,
                     "pos": i,
                     "month": mes_atual,
                 })
 
-            # Remove do cache tudo que não está no top 10
-            top_ids = [str(row.id) for row in top10]
-            conn.execute(text("DELETE FROM places_cache WHERE id != ALL(:ids)"), {"ids": top_ids})
+            # Limpeza compatível com os Termos: remove só o conteúdo já expirado
+            # (> 30 dias). O cache ainda fresco continua válido e evita rebuscas
+            # pagas no Google.
+            conn.execute(text(
+                "DELETE FROM places_cache WHERE updated_at < NOW() - INTERVAL '30 days'"
+            ))
 
-            # Reseta contadores para o novo mês
-            conn.execute(text("UPDATE places_cache SET search_count = 0, updated_at = NOW()"))
-
-        print(f"✅ Ranking mensal gerado: {mes_atual} — {len(top10)} entradas salvas.")
+        print(f"✅ Ranking mensal gerado: {mes_atual} — {len(top10)} termos.")
     except Exception as e:
         print(f"🔴 Erro ao gerar ranking: {e}")
 
@@ -2856,6 +2852,14 @@ def criar_segmento(segmento: SegmentoCreate):
 # =========================
 # EMPRESAS
 # =========================
+def _normalizar_query(q: str) -> str:
+    # Normaliza acentos/caixa/espaços para maximizar acertos no cache
+    # (ex.: "Metalúrgicas ", "metalurgicas" -> "metalurgicas") e reduzir
+    # chamadas pagas à API do Google.
+    q = unicodedata.normalize("NFKD", q or "").encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", q).strip().lower()
+
+
 def _recalcular_cadastradas(results_list: list) -> list:
     place_ids = [r["place_id"] for r in results_list if r.get("place_id")]
     if not place_ids:
@@ -2880,24 +2884,20 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
     lng = req.lng or -47.9292
     lat_grid = round(lat, 1)
     lng_grid = round(lng, 1)
-    query_norm = req.query.lower().strip()
+    query_norm = _normalizar_query(req.query)
 
-    # 1. Verifica ranking permanente (sem expiração)
+    # Bloqueia queries vazias/curtas demais para não gastar chamada paga.
+    if len(query_norm) < 2:
+        return []
+
+    # Cache de conteúdo — válido por 30 dias (limite dos Termos do Google Maps
+    # Platform). Após esse prazo o conteúdo expira e é rebuscado. O place_id é o
+    # único dado de Places guardado permanentemente (na tabela 'empresas').
+    # IMPORTANTE: no acerto de cache só incrementamos o contador de popularidade;
+    # NÃO mexemos em updated_at, senão o conteúdo nunca expiraria (violaria a
+    # regra dos 30 dias).
     with engine.begin() as conn:
         garantir_tabelas_places_cache(conn)
-        ranking = conn.execute(
-            text("SELECT results FROM places_ranking WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng LIMIT 1"),
-            {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
-        ).fetchone()
-        if ranking:
-            results = ranking.results if isinstance(ranking.results, list) else json.loads(ranking.results)
-            conn.execute(
-                text("UPDATE places_cache SET search_count=search_count+1, updated_at=NOW() WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng"),
-                {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
-            )
-            return _recalcular_cadastradas(results)
-
-        # 2. Verifica cache (válido 30 dias)
         cached = conn.execute(
             text("""
                 SELECT id, results FROM places_cache
@@ -2908,7 +2908,7 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         ).fetchone()
         if cached:
             conn.execute(
-                text("UPDATE places_cache SET search_count=search_count+1, updated_at=NOW() WHERE id=:id"),
+                text("UPDATE places_cache SET search_count=search_count+1 WHERE id=:id"),
                 {"id": cached.id},
             )
             results = cached.results if isinstance(cached.results, list) else json.loads(cached.results)
@@ -3035,19 +3035,19 @@ def top10_places(usuario_email: str = Depends(get_current_user)):
     with engine.begin() as conn:
         garantir_tabelas_places_cache(conn)
         rows = conn.execute(
-            text("SELECT rank_position, query, search_count, results, month FROM places_ranking ORDER BY rank_position ASC")
+            text("SELECT rank_position, query, search_count, month FROM places_ranking ORDER BY rank_position ASC")
         ).fetchall()
-    top = []
-    for row in rows:
-        results = row.results if isinstance(row.results, list) else json.loads(row.results)
-        top.append({
+    # Apenas termos mais buscados (analítico). Não devolvemos conteúdo de places
+    # aqui para respeitar o limite de cache de 30 dias do Google.
+    return [
+        {
             "posicao": row.rank_position,
             "query": row.query,
             "total_buscas": row.search_count,
             "mes": row.month,
-            "primeiros_resultados": results[:5],
-        })
-    return top
+        }
+        for row in rows
+    ]
 
 
 @app.get("/empresas/rascunhos")
