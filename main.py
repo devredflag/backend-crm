@@ -20,6 +20,7 @@ import httpx
 import resend
 import base64
 import json
+import asyncio
 import requests as http_requests
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
@@ -3179,6 +3180,81 @@ def listar_contatos_por_empresa(empresa_id: str):
             {"id": empresa_id},
         )
         return [dict(row._mapping) for row in result]
+
+
+# Empresas sem coordenada mas com algum endereço aproveitável
+_SQL_SEM_COORD = """
+    (latitude IS NULL OR longitude IS NULL)
+    AND COALESCE(NULLIF(TRIM(endereco), ''), NULLIF(TRIM(cidade), '')) IS NOT NULL
+"""
+
+
+@app.post("/empresas/geocodificar")
+async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(get_current_user)):
+    """Backfill de coordenadas (custo zero) via Nominatim/OpenStreetMap a partir do
+    endereço já salvo. Processa em lote pequeno; o frontend chama em loop até
+    'restantes' == 0. Respeita a política do OSM: <=1 req/seg e User-Agent próprio."""
+    limite = max(1, min(limite, 30))
+    with engine.connect() as conn:
+        garantir_colunas_places(conn)
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT empresa_id, endereco, bairro, cidade, cep
+                FROM empresas
+                WHERE {_SQL_SEM_COORD}
+                ORDER BY status_atualizado_em DESC NULLS LAST
+                LIMIT :lim
+            """
+            ),
+            {"lim": limite},
+        ).fetchall()
+
+    geocodificadas = 0
+    falharam = 0
+    headers = {"User-Agent": "CRM-Prospeccao/1.0 (https://frontend-crm-xi-plum.vercel.app)"}
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+        for i, r in enumerate(rows):
+            if i > 0:
+                await asyncio.sleep(1.1)  # política do Nominatim
+            partes = [r.endereco, r.bairro, r.cidade, r.cep]
+            q = ", ".join([p.strip() for p in partes if p and p.strip()])
+            if not q:
+                falharam += 1
+                continue
+            try:
+                resp = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"format": "json", "limit": 1, "countrycodes": "br", "q": f"{q}, Brasil"},
+                )
+                data = resp.json() if resp.status_code == 200 else []
+            except Exception:
+                data = []
+            if data:
+                try:
+                    lat = float(data[0]["lat"])
+                    lng = float(data[0]["lon"])
+                except (KeyError, ValueError, TypeError):
+                    falharam += 1
+                    continue
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("UPDATE empresas SET latitude = :lat, longitude = :lng WHERE empresa_id = :id"),
+                        {"lat": lat, "lng": lng, "id": r.empresa_id},
+                    )
+                geocodificadas += 1
+            else:
+                falharam += 1
+
+    with engine.connect() as conn:
+        restantes = conn.execute(text(f"SELECT COUNT(*) FROM empresas WHERE {_SQL_SEM_COORD}")).scalar()
+
+    return {
+        "processadas": len(rows),
+        "geocodificadas": geocodificadas,
+        "falharam": falharam,
+        "restantes": restantes,
+    }
 
 
 @app.get("/empresas/{empresa_id}/google-refresh")
