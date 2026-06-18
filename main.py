@@ -285,6 +285,14 @@ class EmpresaCreate(BaseModel):
     data_proxima_acao: date | None = None
     motivo_perdido: str | None = None
     temperatura: str | None = None
+    # snapshot do Google Places (vindos da tela de busca/prefill)
+    google_place_id: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    google_rating: float | None = None
+    google_rating_count: int | None = None
+    business_status: str | None = None
+    google_synced_at: datetime | None = None
 
 
 class EmpresaUpdate(BaseModel):
@@ -515,6 +523,7 @@ def garantir_colunas_places(conn):
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS endereco_completo TEXT"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS telefone_empresa TEXT"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS business_status TEXT"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS google_synced_at TIMESTAMP WITHOUT TIME ZONE"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS status_cadastro TEXT DEFAULT 'ativo'"))
 
 
@@ -3172,6 +3181,80 @@ def listar_contatos_por_empresa(empresa_id: str):
         return [dict(row._mapping) for row in result]
 
 
+@app.get("/empresas/{empresa_id}/google-refresh")
+async def refresh_google_empresa(empresa_id: str, usuario_email: str = Depends(get_current_user)):
+    """Re-busca o snapshot volátil do Google (rating/contagem/status) usando o
+    google_place_id já persistido na empresa. Usa Place Details by ID com field
+    mask enxuto — mais barato que o text search e fora da quota da tela de busca."""
+    if not GOOGLE_PLACES_API_KEY:
+        raise HTTPException(503, "Google Places API não configurada")
+
+    with engine.connect() as conn:
+        garantir_colunas_places(conn)
+        row = conn.execute(
+            text("SELECT google_place_id FROM empresas WHERE empresa_id = :id"),
+            {"id": empresa_id},
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Empresa não encontrada")
+    place_id = row[0]
+    if not place_id:
+        raise HTTPException(422, "Empresa sem google_place_id — não foi importada do Google.")
+
+    api_headers = {
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": "id,rating,userRatingCount,businessStatus",
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"https://places.googleapis.com/v1/places/{place_id}",
+            headers=api_headers,
+            params={"languageCode": "pt-BR", "regionCode": "BR"},
+        )
+
+    if resp.status_code == 429 or (
+        resp.status_code != 200 and
+        any(k in resp.text.upper() for k in ("RESOURCE_EXHAUSTED", "QUOTA", "RATE_LIMIT"))
+    ):
+        raise HTTPException(429, "Cota da Google Places API esgotada. Tente mais tarde.")
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Google Places erro: {resp.text}")
+
+    p = resp.json()
+    rating = p.get("rating")
+    rating_count = p.get("userRatingCount")
+    business_status = p.get("businessStatus")
+
+    with engine.begin() as conn:
+        updated = conn.execute(
+            text(
+                """
+                UPDATE empresas
+                SET google_rating = :rating,
+                    google_rating_count = :rating_count,
+                    business_status = :business_status,
+                    google_synced_at = NOW()
+                WHERE empresa_id = :id
+                RETURNING google_synced_at
+            """
+            ),
+            {
+                "id": empresa_id,
+                "rating": rating,
+                "rating_count": rating_count,
+                "business_status": business_status,
+            },
+        ).fetchone()
+
+    synced_at = updated[0] if updated else None
+    return {
+        "google_rating": rating,
+        "google_rating_count": rating_count,
+        "business_status": business_status,
+        "google_synced_at": synced_at.isoformat() if synced_at else None,
+    }
+
+
 @app.post("/empresas")
 def criar_empresa(empresa: EmpresaCreate):
     empresa_id = str(uuid.uuid4())
@@ -3185,6 +3268,7 @@ def criar_empresa(empresa: EmpresaCreate):
         segmento = limpar_segmento(empresa.segmento) if empresa.segmento.strip() else None
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
+        garantir_colunas_places(conn)
         if segmento:
             segmento = salvar_segmento(conn, segmento)
         conn.execute(
@@ -3193,11 +3277,13 @@ def criar_empresa(empresa: EmpresaCreate):
             INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
                 observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
                 status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
-                motivo_perdido, temperatura)
+                motivo_perdido, temperatura,
+                google_place_id, latitude, longitude, google_rating, google_rating_count, business_status, google_synced_at)
             VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
                 :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
                 :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
-                :motivo_perdido, :temperatura)
+                :motivo_perdido, :temperatura,
+                :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status, :google_synced_at)
         """
             ),
             {
@@ -3223,6 +3309,13 @@ def criar_empresa(empresa: EmpresaCreate):
                 "data_proxima_acao": empresa.data_proxima_acao,
                 "motivo_perdido": empresa.motivo_perdido,
                 "temperatura": empresa.temperatura,
+                "google_place_id": empresa.google_place_id,
+                "latitude": empresa.latitude,
+                "longitude": empresa.longitude,
+                "google_rating": empresa.google_rating,
+                "google_rating_count": empresa.google_rating_count,
+                "business_status": empresa.business_status,
+                "google_synced_at": empresa.google_synced_at,
             },
         )
         conn.execute(
