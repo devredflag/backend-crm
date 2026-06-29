@@ -2935,7 +2935,12 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
     api_headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.location,places.rating,places.userRatingCount,places.internationalPhoneNumber,places.nationalPhoneNumber,places.websiteUri,places.businessStatus,places.regularOpeningHours,places.primaryTypeDisplayName",
+        # Field mask enxuto: mantém apenas campos da faixa Pro (endereço/local/nome).
+        # Removidos rating/userRatingCount (Atmosphere) e telefone/site/horários
+        # (Enterprise) para a busca cair da faixa Enterprise para a Pro, mais barata.
+        # addressComponents fornece cidade, bairro, cep e rua; os demais campos Pro
+        # (id/displayName/formattedAddress/location) não adicionam custo.
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.location,places.businessStatus,places.primaryTypeDisplayName",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=api_headers)
@@ -2975,7 +2980,6 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         loc = p.get("location", {})
         nome_obj = p.get("displayName", {})
         tipo_obj = p.get("primaryTypeDisplayName", {})
-        opening = p.get("regularOpeningHours", {})
         address_components = p.get("addressComponents", [])
         cidade = ""
         bairro = ""
@@ -3008,12 +3012,7 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
             "cep": cep,
             "lat": loc.get("latitude"),
             "lng": loc.get("longitude"),
-            "rating": p.get("rating"),
-            "rating_count": p.get("userRatingCount"),
-            "telefone": p.get("nationalPhoneNumber") or p.get("internationalPhoneNumber"),
-            "site": p.get("websiteUri"),
             "business_status": p.get("businessStatus"),
-            "open_now": opening.get("openNow"),
             "tipo": tipo_obj.get("text") if tipo_obj else None,
             "ja_cadastrada": p.get("id") in ja_cadastradas,
         })
