@@ -232,6 +232,61 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(401, "Token inválido")
 
 
+# Flag de processo: garante que o schema multiusuário (contas/role/conta_id)
+# foi criado/migrado uma vez antes do primeiro acesso autenticado.
+_schema_multiusuario_pronto = False
+
+
+def get_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Identidade completa do usuário autenticado: além do email, traz a conta
+    (assinatura) e o papel (gerente/vendedor). É a base do controle de acesso:
+    - vendedor: enxerga apenas a própria carteira;
+    - gerente: enxerga tudo da conta dele."""
+    global _schema_multiusuario_pronto
+    email = get_current_user(credentials)
+    with engine.begin() as conn:
+        if not _schema_multiusuario_pronto:
+            garantir_multiusuario(conn)
+            _schema_multiusuario_pronto = True
+        row = conn.execute(
+            text("SELECT usuario_id, email, conta_id, role FROM usuarios WHERE email = :e"),
+            {"e": email},
+        ).fetchone()
+    if not row:
+        raise HTTPException(401, "Usuário não encontrado")
+    role = (row.role or "vendedor")
+    return {
+        "email": row.email,
+        "usuario_id": str(row.usuario_id),
+        "conta_id": str(row.conta_id) if row.conta_id else None,
+        "role": role,
+        "is_gerente": role == "gerente",
+    }
+
+
+def exigir_gerente(auth: dict = Depends(get_auth)) -> dict:
+    """Dependência para rotas restritas ao gerente (ADM da assinatura)."""
+    if not auth["is_gerente"]:
+        raise HTTPException(403, "Acesso restrito ao gerente da conta")
+    return auth
+
+
+def checar_acesso_empresa(conn, empresa_id: str, auth: dict):
+    """Garante que a empresa pertence à conta do usuário e, para vendedores,
+    que ele é o dono. Levanta 404 (não revela existência fora do escopo)."""
+    row = conn.execute(
+        text("SELECT conta_id, vendedor_id FROM empresas WHERE empresa_id = :id"),
+        {"id": empresa_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Empresa não encontrada")
+    if auth["conta_id"] and str(row.conta_id) != auth["conta_id"]:
+        raise HTTPException(404, "Empresa não encontrada")
+    if not auth["is_gerente"] and str(row.vendedor_id) != auth["usuario_id"]:
+        raise HTTPException(404, "Empresa não encontrada")
+    return row
+
+
 # =========================
 # EMAIL (Resend)
 # =========================
@@ -252,6 +307,19 @@ async def enviar_email(destino: str, token: str):
 # =========================
 class UsuarioCreate(BaseModel):
     nome: str
+    email: EmailStr
+    telefone: str | None = None
+    role: str | None = None  # 'vendedor' (padrão) ou 'gerente'
+
+
+class UsuarioGerenciar(BaseModel):
+    ativo: bool | None = None
+    role: str | None = None  # 'vendedor' | 'gerente'
+
+
+class ContaSignup(BaseModel):
+    empresa_nome: str       # nome da conta/empresa que assina
+    nome: str               # nome do gerente (ADM)
     email: EmailStr
     telefone: str | None = None
 
@@ -564,6 +632,92 @@ def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_refresh_token text"))
 
 
+def garantir_multiusuario(conn):
+    """Schema do modelo multiusuário (assinatura → gerente + vendedores):
+    - tabela `contas` (a assinatura, paga pelo ADM/gerente);
+    - `usuarios.conta_id` + `usuarios.role` ('gerente' | 'vendedor');
+    - `empresas.conta_id` + `empresas.vendedor_id` (dono da carteira);
+    - `eventos.conta_id` (para o gerente ver a agenda de todos).
+    Inclui a migração do pool antigo (dados sem conta) para uma conta inicial."""
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS contas (
+            conta_id uuid PRIMARY KEY,
+            nome text NOT NULL,
+            criado_em timestamp without time zone DEFAULT CURRENT_TIMESTAMP
+        )
+    """
+        )
+    )
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS conta_id uuid"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS role text DEFAULT 'vendedor'"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS conta_id uuid"))
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS vendedor_id uuid"))
+    conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS conta_id uuid"))
+
+    # ---- Migração do pool antigo (idempotente) ----
+    orfaos_usuario = conn.execute(text("SELECT 1 FROM usuarios WHERE conta_id IS NULL LIMIT 1")).fetchone()
+    orfaos_empresa = conn.execute(text("SELECT 1 FROM empresas WHERE conta_id IS NULL LIMIT 1")).fetchone()
+    if not (orfaos_usuario or orfaos_empresa):
+        return
+
+    conta_id = conn.execute(text("SELECT conta_id FROM contas ORDER BY criado_em ASC LIMIT 1")).scalar()
+    if not conta_id:
+        conta_id = str(uuid.uuid4())
+        conn.execute(
+            text("INSERT INTO contas (conta_id, nome) VALUES (:id, :nome)"),
+            {"id": conta_id, "nome": "Conta Principal"},
+        )
+
+    # Vincula usuários órfãos à conta inicial e normaliza role
+    conn.execute(text("UPDATE usuarios SET conta_id = :cid WHERE conta_id IS NULL"), {"cid": conta_id})
+    conn.execute(text("UPDATE usuarios SET role = 'vendedor' WHERE role IS NULL"))
+
+    # O usuário mais antigo da conta vira gerente, se ainda não houver um
+    tem_gerente = conn.execute(
+        text("SELECT 1 FROM usuarios WHERE conta_id = :cid AND role = 'gerente' LIMIT 1"),
+        {"cid": conta_id},
+    ).fetchone()
+    if not tem_gerente:
+        conn.execute(
+            text(
+                """
+                UPDATE usuarios SET role = 'gerente'
+                WHERE usuario_id = (
+                    SELECT usuario_id FROM usuarios WHERE conta_id = :cid
+                    ORDER BY data_criacao ASC NULLS LAST LIMIT 1
+                )
+            """
+            ),
+            {"cid": conta_id},
+        )
+
+    # Vincula empresas órfãs à conta e tenta inferir o dono pelo responsavel_principal
+    conn.execute(text("UPDATE empresas SET conta_id = :cid WHERE conta_id IS NULL"), {"cid": conta_id})
+    conn.execute(
+        text(
+            """
+            UPDATE empresas e SET vendedor_id = u.usuario_id
+            FROM usuarios u
+            WHERE e.vendedor_id IS NULL
+              AND e.responsavel_principal IS NOT NULL
+              AND lower(u.email) = lower(e.responsavel_principal)
+        """
+        )
+    )
+    # Eventos herdam a conta do dono (usuario_email)
+    conn.execute(
+        text(
+            """
+            UPDATE eventos ev SET conta_id = u.conta_id
+            FROM usuarios u
+            WHERE ev.conta_id IS NULL AND lower(u.email) = lower(ev.usuario_email)
+        """
+        )
+    )
+
+
 def garantir_tabela_notificacoes(conn):
     conn.execute(
         text(
@@ -624,13 +778,18 @@ def verificar_rascunhos_expirados():
             limite_aviso = agora - timedelta(days=25)
             limite_exclusao = agora - timedelta(days=30)
 
-            # Rascunhos com 25-29 dias → aviso
+            # Rascunhos com 25-29 dias → aviso.
+            # Notificação é isolada por usuário: vai SÓ para o dono (vendedor) do
+            # rascunho. O gerente não recebe (evita volume alto); o que o gerente
+            # vê é decidido à parte.
             avisos = conn.execute(
                 text(
                     """
                 SELECT e.empresa_id, e.nome, e.status_atualizado_em, u.email
                 FROM empresas e
-                JOIN usuarios u ON u.ativo = TRUE
+                JOIN usuarios u
+                  ON u.ativo = TRUE
+                 AND u.usuario_id = e.vendedor_id
                 WHERE e.status = 'Rascunho'
                   AND e.status_atualizado_em <= :limite_aviso
                   AND e.status_atualizado_em > :limite_exclusao
@@ -646,10 +805,11 @@ def verificar_rascunhos_expirados():
                         """
                     SELECT 1 FROM notificacoes
                     WHERE empresa_id = :eid AND tipo = 'rascunho_aviso'
+                      AND usuario_email = :email
                       AND criado_em >= NOW() - INTERVAL '23 hours'
                 """
                     ),
-                    {"eid": r.empresa_id},
+                    {"eid": r.empresa_id, "email": r.email},
                 ).fetchone()
                 if not existe:
                     conn.execute(
@@ -671,13 +831,15 @@ def verificar_rascunhos_expirados():
                     )
                     print(f"📢 Aviso gerado para rascunho: {r.nome}")
 
-            # Rascunhos com 30+ dias → excluir
+            # Rascunhos com 30+ dias → excluir. Notifica SÓ o dono (vendedor).
             expirados = conn.execute(
                 text(
                     """
                 SELECT e.empresa_id, e.nome, u.email
                 FROM empresas e
-                JOIN usuarios u ON u.ativo = TRUE
+                JOIN usuarios u
+                  ON u.ativo = TRUE
+                 AND u.usuario_id = e.vendedor_id
                 WHERE e.status = 'Rascunho'
                   AND e.status_atualizado_em <= :limite_exclusao
             """
@@ -685,6 +847,7 @@ def verificar_rascunhos_expirados():
                 {"limite_exclusao": limite_exclusao},
             ).fetchall()
 
+            empresas_excluidas = set()
             for r in expirados:
                 conn.execute(
                     text(
@@ -703,10 +866,12 @@ def verificar_rascunhos_expirados():
                         "enome": r.nome,
                     },
                 )
-                conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": r.empresa_id})
-                conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": r.empresa_id})
-                conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id"), {"id": r.empresa_id})
-                print(f"🗑️ Rascunho excluído: {r.nome}")
+                if r.empresa_id not in empresas_excluidas:
+                    conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": r.empresa_id})
+                    conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": r.empresa_id})
+                    conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id"), {"id": r.empresa_id})
+                    empresas_excluidas.add(r.empresa_id)
+                    print(f"🗑️ Rascunho excluído: {r.nome}")
 
         print("✅ JOB: verificação de rascunhos concluída")
     except Exception as e:
@@ -759,7 +924,9 @@ def is_automated_sender(email: str) -> bool:
     return any(pattern in email_lower for pattern in BLOCKED_SENDER_PATTERNS)
 
 
-def find_company_by_sender(conn, sender_email: str):
+def find_company_by_sender(conn, sender_email: str, conta_id=None):
+    # Quando conta_id é informado, restringe a busca às empresas daquela conta —
+    # evita casar com empresa de outro tenant e vazar o nome em notificação.
     results = conn.execute(
         text(
             """
@@ -773,6 +940,7 @@ def find_company_by_sender(conn, sender_email: str):
         JOIN empresas e
             ON e.empresa_id = c.empresa_id
         WHERE LOWER(c.email) = LOWER(:email)
+          AND (:conta_id IS NULL OR e.conta_id = :conta_id)
         ORDER BY
             c.decisor DESC NULLS LAST,
             c.data_ultimo_contato DESC NULLS LAST,
@@ -780,7 +948,7 @@ def find_company_by_sender(conn, sender_email: str):
         LIMIT 1
     """
         ),
-        {"email": sender_email.strip()},
+        {"email": sender_email.strip(), "conta_id": conta_id},
     ).fetchone()
 
     if results:
@@ -1540,10 +1708,11 @@ async def gmail_webhook(request: Request):
                             FROM eventos
                             WHERE LOWER(email_convidado) = LOWER(:email)
                             AND google_event_id IS NOT NULL
+                            AND conta_id = (SELECT conta_id FROM usuarios WHERE email = :uemail)
                             ORDER BY criado_em DESC
                             LIMIT 1
                         """),
-                        {"email": sender_email},
+                        {"email": sender_email, "uemail": usuario_email},
                     ).fetchone()
 
                     if evento:
@@ -1690,7 +1859,11 @@ async def outlook_webhook(request: Request):
 
         with engine.begin() as conn:
 
-            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email)
+            conta_dono = conn.execute(
+                text("SELECT conta_id FROM usuarios WHERE email = :e"),
+                {"e": usuario_email},
+            ).scalar()
+            empresa_id, _, empresa_nome = find_company_by_sender(conn, sender_email, conta_dono)
             if empresa_id:
                 create_interaction_notification(
                     conn,
@@ -2322,17 +2495,25 @@ def deletar_notificacao(notificacao_id: str, email: str = Depends(get_current_us
 # MEU PERFIL
 # =========================
 @app.get("/me")
-def get_me(email: str = Depends(get_current_user)):
+def get_me(auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
         usuario = conn.execute(
             text(
-                "SELECT usuario_id, nome, email, telefone, cargo, empresa_nome, bio, data_criacao FROM usuarios WHERE email = :email"
+                """
+                SELECT u.usuario_id, u.nome, u.email, u.telefone, u.cargo, u.empresa_nome, u.bio,
+                       u.data_criacao, u.role, u.conta_id, ct.nome AS conta_nome
+                FROM usuarios u
+                LEFT JOIN contas ct ON ct.conta_id = u.conta_id
+                WHERE u.email = :email
+            """
             ),
-            {"email": email},
+            {"email": auth["email"]},
         ).fetchone()
     if not usuario:
         raise HTTPException(404, "Usuário não encontrado")
-    return dict(usuario._mapping)
+    dados = dict(usuario._mapping)
+    dados["is_gerente"] = (dados.get("role") or "vendedor") == "gerente"
+    return dados
 
 
 @app.put("/me")
@@ -2713,17 +2894,24 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
 # EVENTOS
 # =========================
 @app.get("/eventos")
-def listar_eventos(email: str = Depends(get_current_user)):
+def listar_eventos(auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"),
-            {"email": email},
-        )
+        # Gerente enxerga a agenda de toda a conta; vendedor, só a sua.
+        if auth["is_gerente"]:
+            result = conn.execute(
+                text("SELECT * FROM eventos WHERE conta_id = :cid ORDER BY data, hora_inicio"),
+                {"cid": auth["conta_id"]},
+            )
+        else:
+            result = conn.execute(
+                text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"),
+                {"email": auth["email"]},
+            )
         return [dict(row._mapping) for row in result]
 
 
 @app.post("/eventos", status_code=201)
-def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
+def criar_evento(evento: EventoCreate, auth: dict = Depends(get_auth)):
     evento_id = str(uuid.uuid4())
     with engine.begin() as conn:
         garantir_tabela_notificacoes(conn)
@@ -2731,9 +2919,9 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
             text(
                 """
             INSERT INTO eventos (evento_id, titulo, tipo, data, hora_inicio, hora_fim,
-                empresa_id, empresa_nome, descricao, email_convidado, usuario_email, criado_em)
+                empresa_id, empresa_nome, descricao, email_convidado, usuario_email, conta_id, criado_em)
             VALUES (:id, :titulo, :tipo, :data, :hora_inicio, :hora_fim,
-                :empresa_id, :empresa_nome, :descricao, :email_convidado, :email, NOW())
+                :empresa_id, :empresa_nome, :descricao, :email_convidado, :email, :conta_id, NOW())
         """
             ),
             {
@@ -2747,7 +2935,8 @@ def criar_evento(evento: EventoCreate, email: str = Depends(get_current_user)):
                 "empresa_nome": evento.empresa_nome,
                 "descricao": evento.descricao,
                 "email_convidado": evento.email_convidado,
-                "email": email,
+                "email": auth["email"],
+                "conta_id": auth["conta_id"],
             },
         )
     return {"msg": "Evento criado com sucesso 🚀", "id": evento_id}
@@ -2803,18 +2992,26 @@ def deletar_evento(evento_id: str, email: str = Depends(get_current_user)):
 
 
 @app.get("/empresas/{empresa_id}/atividades")
-def listar_atividades_empresa(empresa_id: str, email: str = Depends(get_current_user)):
+def listar_atividades_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
+        checar_acesso_empresa(conn, empresa_id, auth)
+        # Gerente vê todas as atividades da empresa; vendedor, só as suas.
+        if auth["is_gerente"]:
+            escopo = ""
+            params = {"empresa_id": empresa_id}
+        else:
+            escopo = "AND usuario_email = :email"
+            params = {"empresa_id": empresa_id, "email": auth["email"]}
         result = conn.execute(
-            text("""
+            text(f"""
                 SELECT evento_id, titulo, tipo, data, hora_inicio, hora_fim,
                        empresa_id, empresa_nome, email_convidado, status_resposta, criado_em
                 FROM eventos
                 WHERE empresa_id = :empresa_id
-                  AND usuario_email = :email
+                  {escopo}
                 ORDER BY data DESC, hora_inicio DESC
             """),
-            {"empresa_id": empresa_id, "email": email},
+            params,
         )
         rows = []
         for row in result:
@@ -3060,30 +3257,37 @@ def top10_places(usuario_email: str = Depends(get_current_user)):
 
 
 @app.get("/empresas/rascunhos")
-def listar_rascunhos(usuario_email: str = Depends(get_current_user)):
+def listar_rascunhos(auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
         garantir_colunas_places(conn)
+        # Vendedor: só os seus rascunhos. Gerente: todos da conta.
+        if auth["is_gerente"]:
+            escopo = "AND conta_id = :cid"
+            params = {"cid": auth["conta_id"]}
+        else:
+            escopo = "AND conta_id = :cid AND vendedor_id = :vid"
+            params = {"cid": auth["conta_id"], "vid": auth["usuario_id"]}
         rows = conn.execute(
             text(
                 "SELECT * FROM empresas WHERE status_cadastro = 'rascunho'"
-                " AND responsavel_principal = :email"
+                f" {escopo}"
                 " ORDER BY status_atualizado_em DESC NULLS LAST"
             ),
-            {"email": usuario_email},
+            params,
         )
         return [dict(r._mapping) for r in rows]
 
 
 @app.post("/empresas/rascunho", status_code=201)
-def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_current_user)):
+def criar_rascunho(rascunho: RascunhoCreate, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_colunas_places(conn)
         garantir_campos_pipeline(conn)
-        # Verifica duplicata por google_place_id
+        # Verifica duplicata por google_place_id dentro da mesma conta
         if rascunho.google_place_id:
             existing = conn.execute(
-                text("SELECT empresa_id FROM empresas WHERE google_place_id = :gid"),
-                {"gid": rascunho.google_place_id},
+                text("SELECT empresa_id FROM empresas WHERE google_place_id = :gid AND conta_id = :cid"),
+                {"gid": rascunho.google_place_id, "cid": auth["conta_id"]},
             ).fetchone()
             if existing:
                 raise HTTPException(409, {"message": "Empresa já cadastrada", "empresa_id": str(existing[0])})
@@ -3093,11 +3297,11 @@ def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_cu
                 INSERT INTO empresas (empresa_id, nome, cidade, endereco_completo, site, telefone_empresa,
                     google_place_id, latitude, longitude, google_rating, google_rating_count, business_status,
                     status, status_cadastro, origem_lead, temperatura, responsavel_principal,
-                    ultima_interacao, status_atualizado_em)
+                    conta_id, vendedor_id, ultima_interacao, status_atualizado_em)
                 VALUES (:id, :nome, :cidade, :endereco_completo, :site, :telefone_empresa,
                     :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status,
                     'Lead', 'rascunho', 'Google Maps', 'Frio', :responsavel_principal,
-                    NOW(), NOW())
+                    :conta_id, :vendedor_id, NOW(), NOW())
             """),
             {
                 "id": empresa_id,
@@ -3112,36 +3316,48 @@ def criar_rascunho(rascunho: RascunhoCreate, usuario_email: str = Depends(get_cu
                 "google_rating": rascunho.google_rating,
                 "google_rating_count": rascunho.google_rating_count,
                 "business_status": rascunho.business_status,
-                "responsavel_principal": usuario_email,
+                "responsavel_principal": auth["email"],
+                "conta_id": auth["conta_id"],
+                "vendedor_id": auth["usuario_id"],
             },
         )
     return {"empresa_id": empresa_id, "status_cadastro": "rascunho"}
 
 
 @app.get("/empresas")
-def listar_empresas():
+def listar_empresas(auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
+        # Vendedor: só a própria carteira. Gerente: tudo da conta.
+        if auth["is_gerente"]:
+            escopo = "WHERE e.conta_id = :cid"
+            params = {"cid": auth["conta_id"]}
+        else:
+            escopo = "WHERE e.conta_id = :cid AND e.vendedor_id = :vid"
+            params = {"cid": auth["conta_id"], "vid": auth["usuario_id"]}
         result = conn.execute(
             text(
-                """
+                f"""
             SELECT e.*, c.email AS contato_email, c.celular AS contato_celular, c.whatsapp AS contato_whatsapp
             FROM empresas e
             LEFT JOIN LATERAL (
                 SELECT email, celular, whatsapp FROM contatos WHERE empresa_id = e.empresa_id
                 ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
             ) c ON TRUE
+            {escopo}
             ORDER BY COALESCE(e.status_atualizado_em, e.ultima_interacao) DESC NULLS LAST, e.nome ASC
         """
-            )
+            ),
+            params,
         )
         return [dict(row._mapping) for row in result]
 
 
 @app.get("/empresas/{empresa_id}")
-def buscar_empresa(empresa_id: str):
+def buscar_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
         result = conn.execute(
             text(
                 """
@@ -3161,9 +3377,10 @@ def buscar_empresa(empresa_id: str):
 
 
 @app.get("/empresas/{empresa_id}/historico-status")
-def historico_status_empresa(empresa_id: str):
+def historico_status_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
         result = conn.execute(
             text("SELECT * FROM empresa_status_historico WHERE empresa_id = :id ORDER BY alterado_em DESC"),
             {"id": empresa_id},
@@ -3172,8 +3389,9 @@ def historico_status_empresa(empresa_id: str):
 
 
 @app.get("/empresas/{empresa_id}/contatos")
-def listar_contatos_por_empresa(empresa_id: str):
+def listar_contatos_por_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
+        checar_acesso_empresa(conn, empresa_id, auth)
         result = conn.execute(
             text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
             {"id": empresa_id},
@@ -3331,7 +3549,7 @@ async def refresh_google_empresa(empresa_id: str, usuario_email: str = Depends(g
 
 
 @app.post("/empresas")
-def criar_empresa(empresa: EmpresaCreate):
+def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
     empresa_id = str(uuid.uuid4())
     segmento = None
     is_rascunho = (empresa.status or "").lower() == "rascunho"
@@ -3352,12 +3570,12 @@ def criar_empresa(empresa: EmpresaCreate):
             INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
                 observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
                 status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
-                motivo_perdido, temperatura,
+                motivo_perdido, temperatura, conta_id, vendedor_id,
                 google_place_id, latitude, longitude, google_rating, google_rating_count, business_status, google_synced_at)
             VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
                 :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
                 :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
-                :motivo_perdido, :temperatura,
+                :motivo_perdido, :temperatura, :conta_id, :vendedor_id,
                 :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status, :google_synced_at)
         """
             ),
@@ -3375,8 +3593,10 @@ def criar_empresa(empresa: EmpresaCreate):
                 "cnpj": empresa.cnpj,
                 "site": empresa.site,
                 "linkedin_empresa": empresa.linkedin_empresa,
-                "responsavel_principal": empresa.responsavel_principal,
+                "responsavel_principal": empresa.responsavel_principal or auth["email"],
                 "ticket_medio_estimado": empresa.ticket_medio_estimado,
+                "conta_id": auth["conta_id"],
+                "vendedor_id": auth["usuario_id"],
                 "status": empresa.status or "Lead",
                 "origem_lead": empresa.origem_lead,
                 "ultima_interacao": empresa.ultima_interacao or datetime.utcnow(),
@@ -3411,9 +3631,10 @@ def criar_empresa(empresa: EmpresaCreate):
 
 
 @app.put("/empresas/{empresa_id}")
-def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
+def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
         result = conn.execute(text("SELECT empresa_id, status FROM empresas WHERE empresa_id = :id"), {"id": empresa_id}).fetchone()
         if not result:
             raise HTTPException(404, "Empresa não encontrada")
@@ -3485,8 +3706,9 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate):
 
 
 @app.delete("/empresas/{empresa_id}")
-def deletar_empresa(empresa_id: str):
+def deletar_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
+        checar_acesso_empresa(conn, empresa_id, auth)
         conn.execute(text("DELETE FROM contatos WHERE empresa_id = :id"), {"id": empresa_id})
         conn.execute(text("DELETE FROM empresa_status_historico WHERE empresa_id = :id"), {"id": empresa_id})
         result = conn.execute(text("DELETE FROM empresas WHERE empresa_id = :id RETURNING empresa_id"), {"id": empresa_id}).fetchone()
@@ -3499,8 +3721,9 @@ def deletar_empresa(empresa_id: str):
 # CONTATOS
 # =========================
 @app.get("/contatos/{empresa_id}")
-def listar_contatos_empresa(empresa_id: str):
+def listar_contatos_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
+        checar_acesso_empresa(conn, empresa_id, auth)
         result = conn.execute(
             text("SELECT * FROM contatos WHERE empresa_id = :id ORDER BY data_criacao ASC NULLS LAST"),
             {"id": empresa_id},
@@ -3509,8 +3732,9 @@ def listar_contatos_empresa(empresa_id: str):
 
 
 @app.post("/contatos")
-def criar_contato(contato: dict):
+def criar_contato(contato: dict, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
+        checar_acesso_empresa(conn, contato.get("empresa_id"), auth)
         conn.execute(
             text(
                 """
@@ -3541,11 +3765,12 @@ def criar_contato(contato: dict):
 
 
 @app.put("/contatos/{contato_id}")
-def atualizar_contato(contato_id: str, contato: ContatoUpdate):
+def atualizar_contato(contato_id: str, contato: ContatoUpdate, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
-        result = conn.execute(text("SELECT contato_id FROM contatos WHERE contato_id = :id"), {"id": contato_id}).fetchone()
+        result = conn.execute(text("SELECT empresa_id FROM contatos WHERE contato_id = :id"), {"id": contato_id}).fetchone()
         if not result:
             raise HTTPException(404, "Contato não encontrado")
+        checar_acesso_empresa(conn, str(result.empresa_id), auth)
         conn.execute(
             text(
                 """
@@ -3579,27 +3804,56 @@ def atualizar_contato(contato_id: str, contato: ContatoUpdate):
 
 
 @app.delete("/contatos/{contato_id}")
-def deletar_contato(contato_id: str):
+def deletar_contato(contato_id: str, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
-        result = conn.execute(text("DELETE FROM contatos WHERE contato_id = :id RETURNING contato_id"), {"id": contato_id}).fetchone()
-    if not result:
-        raise HTTPException(404, "Contato não encontrado")
+        alvo = conn.execute(text("SELECT empresa_id FROM contatos WHERE contato_id = :id"), {"id": contato_id}).fetchone()
+        if not alvo:
+            raise HTTPException(404, "Contato não encontrado")
+        checar_acesso_empresa(conn, str(alvo.empresa_id), auth)
+        conn.execute(text("DELETE FROM contatos WHERE contato_id = :id"), {"id": contato_id})
     return {"msg": "Contato deletado com sucesso"}
 
 
 # =========================
 # USUÁRIOS
 # =========================
+@app.get("/usuarios")
+def listar_usuarios(auth: dict = Depends(exigir_gerente)):
+    """Tela de gerenciamento de usuários (somente gerente): lista os usuários
+    da conta com papel, status e um resumo da carteira de cada vendedor."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo, u.data_criacao,
+                       COUNT(e.empresa_id) AS total_empresas
+                FROM usuarios u
+                LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id
+                WHERE u.conta_id = :cid
+                GROUP BY u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo, u.data_criacao
+                ORDER BY u.role DESC, u.nome ASC
+            """
+            ),
+            {"cid": auth["conta_id"]},
+        )
+        return [dict(r._mapping) for r in rows]
+
+
 @app.post("/usuarios", status_code=201)
-async def criar_usuario(usuario: UsuarioCreate):
+async def criar_usuario(usuario: UsuarioCreate, auth: dict = Depends(exigir_gerente)):
+    """Gerente adiciona um novo usuário (vendedor por padrão) já vinculado à sua
+    conta. O usuário recebe email de ativação para criar a senha e então loga."""
     token_ativacao = str(uuid.uuid4())
+    role = "gerente" if (usuario.role or "").lower() == "gerente" else "vendedor"
     try:
         with engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao, data_criacao)
-                VALUES (:usuario_id, :nome, :email, :telefone, FALSE, :token, NOW())
+                INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao,
+                    conta_id, role, data_criacao)
+                VALUES (:usuario_id, :nome, :email, :telefone, FALSE, :token,
+                    :conta_id, :role, NOW())
             """
                 ),
                 {
@@ -3608,10 +3862,164 @@ async def criar_usuario(usuario: UsuarioCreate):
                     "email": usuario.email,
                     "telefone": usuario.telefone,
                     "token": token_ativacao,
+                    "conta_id": auth["conta_id"],
+                    "role": role,
                 },
             )
         await enviar_email(usuario.email, token_ativacao)
         return {"msg": "Usuário criado. Verifique seu email 📩"}
+    except IntegrityError:
+        raise HTTPException(400, "Email já cadastrado")
+
+
+@app.patch("/usuarios/{usuario_id}")
+def gerenciar_usuario(usuario_id: str, dados: UsuarioGerenciar, auth: dict = Depends(exigir_gerente)):
+    """Gerente ativa/desativa um usuário ou altera o papel (vendedor/gerente),
+    sempre dentro da própria conta. Não pode rebaixar a si mesmo."""
+    with engine.begin() as conn:
+        alvo = conn.execute(
+            text("SELECT usuario_id, conta_id, role FROM usuarios WHERE usuario_id = :id"),
+            {"id": usuario_id},
+        ).fetchone()
+        if not alvo or str(alvo.conta_id) != auth["conta_id"]:
+            raise HTTPException(404, "Usuário não encontrado")
+        if usuario_id == auth["usuario_id"] and dados.role and dados.role != "gerente":
+            raise HTTPException(400, "Você não pode rebaixar a si mesmo")
+        nova_role = None
+        if dados.role is not None:
+            nova_role = "gerente" if dados.role.lower() == "gerente" else "vendedor"
+        conn.execute(
+            text(
+                """
+                UPDATE usuarios SET
+                    ativo = COALESCE(:ativo, ativo),
+                    role  = COALESCE(:role, role)
+                WHERE usuario_id = :id
+            """
+            ),
+            {"ativo": dados.ativo, "role": nova_role, "id": usuario_id},
+        )
+    return {"msg": "Usuário atualizado com sucesso"}
+
+
+@app.get("/gerencia/dashboard")
+def dashboard_gerente(auth: dict = Depends(exigir_gerente)):
+    """Visão geral da conta para o gerente: totais e desempenho por vendedor
+    (empresas, distribuição por status e ticket estimado)."""
+    cid = auth["conta_id"]
+    with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
+
+        totais = conn.execute(
+            text(
+                """
+                SELECT
+                    COUNT(*) AS total_empresas,
+                    COUNT(*) FILTER (WHERE status = 'Ganho') AS ganhos,
+                    COUNT(*) FILTER (WHERE status = 'Perdido') AS perdidos,
+                    COUNT(*) FILTER (WHERE status_cadastro = 'rascunho') AS rascunhos,
+                    COALESCE(SUM(ticket_medio_estimado), 0) AS ticket_total
+                FROM empresas WHERE conta_id = :cid
+            """
+            ),
+            {"cid": cid},
+        ).fetchone()
+
+        total_vendedores = conn.execute(
+            text("SELECT COUNT(*) FROM usuarios WHERE conta_id = :cid AND role = 'vendedor'"),
+            {"cid": cid},
+        ).scalar()
+
+        # Desempenho por vendedor
+        por_vendedor = conn.execute(
+            text(
+                """
+                SELECT u.usuario_id, u.nome, u.email, u.ativo,
+                       COUNT(e.empresa_id) AS total_empresas,
+                       COUNT(e.empresa_id) FILTER (WHERE e.status = 'Ganho') AS ganhos,
+                       COUNT(e.empresa_id) FILTER (WHERE e.status = 'Perdido') AS perdidos,
+                       COUNT(e.empresa_id) FILTER (WHERE e.status_cadastro = 'rascunho') AS rascunhos,
+                       COALESCE(SUM(e.ticket_medio_estimado), 0) AS ticket_total,
+                       MAX(e.status_atualizado_em) AS ultima_atividade
+                FROM usuarios u
+                LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id AND e.conta_id = :cid
+                WHERE u.conta_id = :cid AND u.role = 'vendedor'
+                GROUP BY u.usuario_id, u.nome, u.email, u.ativo
+                ORDER BY total_empresas DESC, u.nome ASC
+            """
+            ),
+            {"cid": cid},
+        )
+        vendedores = [dict(r._mapping) for r in por_vendedor]
+
+        # Distribuição por status (conta inteira)
+        por_status = conn.execute(
+            text(
+                """
+                SELECT COALESCE(status, 'Sem status') AS status, COUNT(*) AS total
+                FROM empresas WHERE conta_id = :cid
+                GROUP BY status ORDER BY total DESC
+            """
+            ),
+            {"cid": cid},
+        )
+        distribuicao_status = [dict(r._mapping) for r in por_status]
+
+    return {
+        "conta": {
+            "total_empresas": totais.total_empresas,
+            "ganhos": totais.ganhos,
+            "perdidos": totais.perdidos,
+            "rascunhos": totais.rascunhos,
+            "ticket_total": float(totais.ticket_total or 0),
+            "total_vendedores": total_vendedores,
+        },
+        "distribuicao_status": distribuicao_status,
+        "vendedores": vendedores,
+    }
+
+
+@app.post("/signup", status_code=201)
+async def signup_conta(dados: ContaSignup):
+    """Cadastro de uma NOVA assinatura: cria a conta e o primeiro usuário como
+    gerente (ADM). O gerente recebe email para ativar a conta e definir a senha.
+    Pagamento/cobrança fica fora deste fluxo por enquanto."""
+    token_ativacao = str(uuid.uuid4())
+    conta_id = str(uuid.uuid4())
+    try:
+        with engine.begin() as conn:
+            garantir_multiusuario(conn)
+            existe = conn.execute(
+                text("SELECT 1 FROM usuarios WHERE LOWER(email) = LOWER(:e)"),
+                {"e": dados.email},
+            ).fetchone()
+            if existe:
+                raise HTTPException(400, "Email já cadastrado")
+            conn.execute(
+                text("INSERT INTO contas (conta_id, nome) VALUES (:id, :nome)"),
+                {"id": conta_id, "nome": dados.empresa_nome.strip() or "Minha empresa"},
+            )
+            conn.execute(
+                text(
+                    """
+                INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao,
+                    conta_id, role, empresa_nome, data_criacao)
+                VALUES (:uid, :nome, :email, :tel, FALSE, :token,
+                    :cid, 'gerente', :empnome, NOW())
+            """
+                ),
+                {
+                    "uid": str(uuid.uuid4()),
+                    "nome": dados.nome,
+                    "email": dados.email,
+                    "tel": dados.telefone,
+                    "token": token_ativacao,
+                    "cid": conta_id,
+                    "empnome": dados.empresa_nome.strip() or None,
+                },
+            )
+        await enviar_email(dados.email, token_ativacao)
+        return {"msg": "Conta criada! Verifique seu email para ativar. 📩", "conta_id": conta_id}
     except IntegrityError:
         raise HTTPException(400, "Email já cadastrado")
 
