@@ -10,3 +10,7 @@ resend
 email-validator
 httpx
 apscheduler
+slowapi
+pyotp
+qrcode[pil]
+requests

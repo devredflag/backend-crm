@@ -1,7 +1,7 @@
 # =========================
 # IMPORTAÇÕES
 # =========================
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -11,16 +11,25 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta, date
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import uuid
 import jwt
 import os
 import re
+import time
+import hmac
+import hashlib
+import secrets as _secrets
+import threading
 import unicodedata
 import httpx
 import resend
 import base64
 import json
 import asyncio
+import pyotp
 import requests as http_requests
 
 print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
@@ -32,9 +41,28 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("🚨 DATABASE_URL não encontrada!")
 
-SECRET_KEY = "super_secret_key"
+# Chave de assinatura do JWT — NUNCA hardcoded. Deve vir do ambiente (Railway Variables).
+SECRET_KEY = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    SECRET_KEY = _secrets.token_urlsafe(64)
+    print(
+        "⚠️  JWT_SECRET não definido no ambiente — usando chave aleatória temporária "
+        "(todos os tokens invalidam a cada restart). Defina JWT_SECRET no Railway."
+    )
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+# Access token curto + refresh token de vida longa (cookie httpOnly).
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+# Origem(ns) do frontend autorizadas (CORS). Configurável por env (lista separada por vírgula).
+FRONTEND_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "FRONTEND_ORIGINS",
+        "https://frontend-crm-xi-plum.vercel.app,http://localhost:3000",
+    ).split(",")
+    if o.strip()
+]
 
 resend.api_key = os.getenv("RESEND_API_KEY")
 
@@ -55,14 +83,20 @@ GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 engine = create_engine(DATABASE_URL)
 security = HTTPBearer()
 
+# Rate limiting em nível de aplicação (in-memory; para múltiplas instâncias trocar
+# o storage por Redis via storage_uri=os.getenv("REDIS_URL")).
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+
 app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 SEGMENTOS_PADRAO = [
@@ -232,6 +266,230 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(401, "Token inválido")
 
 
+# =========================================================================
+# AUTH HARDENING — lockout, auditoria, refresh tokens, MFA
+# =========================================================================
+
+# Hash "dummy" para comparar senha mesmo quando o usuário não existe.
+# Evita timing attack que revela se um e-mail está cadastrado (enumeração).
+_DUMMY_HASH = pwd_context.hash("dummy-password-para-timing-constante")
+
+# Mensagem genérica única para login — não revela se é e-mail ou senha o erro.
+CREDENCIAIS_INVALIDAS = "E-mail ou senha inválidos."
+
+# --- Bloqueio progressivo por conta (in-memory; single instance) ---
+_login_lock = threading.Lock()
+_login_attempts: dict[str, dict] = {}
+MAX_TENTATIVAS = 5
+JANELA_LOCKOUT_SEG = 15 * 60
+
+
+def _now() -> float:
+    return time.time()
+
+
+def checar_lockout(email: str):
+    """Bloqueia por 15 min após MAX_TENTATIVAS falhas na janela. Levanta 429."""
+    email = (email or "").lower()
+    with _login_lock:
+        rec = _login_attempts.get(email)
+        if not rec:
+            return
+        if rec["count"] >= MAX_TENTATIVAS and _now() < rec["until"]:
+            restante = int((rec["until"] - _now()) / 60) + 1
+            raise HTTPException(
+                429,
+                f"Muitas tentativas de login. Tente novamente em {restante} min.",
+            )
+
+
+def registrar_falha_login(email: str) -> int:
+    email = (email or "").lower()
+    with _login_lock:
+        rec = _login_attempts.get(email)
+        if not rec or _now() >= rec.get("until", 0):
+            rec = {"count": 0, "until": 0.0}
+        rec["count"] += 1
+        if rec["count"] >= MAX_TENTATIVAS:
+            rec["until"] = _now() + JANELA_LOCKOUT_SEG
+        else:
+            rec["until"] = _now() + JANELA_LOCKOUT_SEG
+        _login_attempts[email] = rec
+        return rec["count"]
+
+
+def limpar_falhas_login(email: str):
+    with _login_lock:
+        _login_attempts.pop((email or "").lower(), None)
+
+
+def client_ip(request: Optional[Request]) -> Optional[str]:
+    """IP real do cliente considerando proxies (Cloudflare/Railway)."""
+    if not request:
+        return None
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+# --- Auditoria ---
+def registrar_auditoria(
+    *,
+    usuario: Optional[dict] = None,
+    email: Optional[str] = None,
+    acao: str,
+    recurso: Optional[str] = None,
+    recurso_id: Optional[str] = None,
+    quantidade: Optional[int] = None,
+    request: Optional[Request] = None,
+    meta: Optional[dict] = None,
+    conn=None,
+):
+    """Grava um evento no audit_log. Nunca inclui senha/segredos."""
+    def _do(c):
+        c.execute(
+            text(
+                """
+                INSERT INTO audit_log
+                    (usuario_id, usuario_email, conta_id, acao, recurso, recurso_id,
+                     quantidade, ip, user_agent, meta)
+                VALUES
+                    (:uid, :email, :cid, :acao, :recurso, :rid,
+                     :qtd, :ip, :ua, CAST(:meta AS JSONB))
+                """
+            ),
+            {
+                "uid": (usuario or {}).get("usuario_id"),
+                "email": (usuario or {}).get("email") or email,
+                "cid": (usuario or {}).get("conta_id"),
+                "acao": acao,
+                "recurso": recurso,
+                "rid": str(recurso_id) if recurso_id is not None else None,
+                "qtd": quantidade,
+                "ip": client_ip(request),
+                "ua": request.headers.get("user-agent") if request else None,
+                "meta": json.dumps(meta or {}),
+            },
+        )
+    try:
+        if conn is not None:
+            _do(conn)
+        else:
+            with engine.begin() as c:
+                _do(c)
+    except Exception as e:
+        # Auditoria nunca deve derrubar a requisição principal.
+        print(f"⚠️ Falha ao gravar auditoria ({acao}): {e}")
+
+
+# --- Refresh tokens (opacos, armazenados com hash) ---
+def _hash_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def criar_refresh_token(conn, usuario_id: str, familia: Optional[str] = None,
+                        request: Optional[Request] = None) -> str:
+    raw = _secrets.token_urlsafe(48)
+    familia = familia or str(uuid.uuid4())
+    conn.execute(
+        text(
+            """
+            INSERT INTO refresh_tokens
+                (usuario_id, token_hash, familia, user_agent, ip, expira_em)
+            VALUES (:uid, :h, :fam, :ua, :ip,
+                    NOW() + (:dias || ' days')::interval)
+            """
+        ),
+        {
+            "uid": usuario_id,
+            "h": _hash_token(raw),
+            "fam": familia,
+            "ua": request.headers.get("user-agent") if request else None,
+            "ip": client_ip(request),
+            "dias": str(REFRESH_TOKEN_EXPIRE_DAYS),
+        },
+    )
+    return f"{familia}.{raw}"
+
+
+def revogar_refresh_familia(conn, familia: str):
+    conn.execute(
+        text("UPDATE refresh_tokens SET revogado = TRUE WHERE familia = :f"),
+        {"f": familia},
+    )
+
+
+def revogar_refresh_usuario(conn, usuario_id: str):
+    conn.execute(
+        text("UPDATE refresh_tokens SET revogado = TRUE WHERE usuario_id = :u"),
+        {"u": usuario_id},
+    )
+
+
+# --- MFA / TOTP ---
+def mfa_gerar_backup_codes(n: int = 10):
+    """Gera N códigos de uso único; retorna (lista_plana, lista_hash)."""
+    codes = [f"{_secrets.randbelow(10**8):08d}" for _ in range(n)]
+    hashes = [_hash_token(c) for c in codes]
+    return codes, hashes
+
+
+def mfa_verificar_totp(secret: str, code: str) -> bool:
+    if not secret or not code:
+        return False
+    return pyotp.TOTP(secret).verify(str(code).strip(), valid_window=1)
+
+
+# --- Migration de segurança (lazy, roda junto do schema multiusuário) ---
+def garantir_seguranca(conn):
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            usuario_id UUID,
+            usuario_email TEXT,
+            conta_id UUID,
+            acao TEXT NOT NULL,
+            recurso TEXT,
+            recurso_id TEXT,
+            quantidade INTEGER,
+            ip TEXT,
+            user_agent TEXT,
+            meta JSONB DEFAULT '{}',
+            criado_em TIMESTAMP DEFAULT NOW()
+        )
+        """
+        )
+    )
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_audit_conta_data ON audit_log (conta_id, criado_em DESC)")
+    )
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            usuario_id UUID NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            familia UUID NOT NULL,
+            user_agent TEXT,
+            ip TEXT,
+            revogado BOOLEAN DEFAULT FALSE,
+            expira_em TIMESTAMP NOT NULL,
+            criado_em TIMESTAMP DEFAULT NOW(),
+            usado_em TIMESTAMP
+        )
+        """
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_refresh_hash ON refresh_tokens (token_hash)"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mfa_secret TEXT"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mfa_ativado BOOLEAN DEFAULT FALSE"))
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS mfa_backup_codes JSONB"))
+
+
 # Flag de processo: garante que o schema multiusuário (contas/role/conta_id)
 # foi criado/migrado uma vez antes do primeiro acesso autenticado.
 _schema_multiusuario_pronto = False
@@ -247,6 +505,7 @@ def get_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> d
     with engine.begin() as conn:
         if not _schema_multiusuario_pronto:
             garantir_multiusuario(conn)
+            garantir_seguranca(conn)
             _schema_multiusuario_pronto = True
         row = conn.execute(
             text("SELECT usuario_id, email, conta_id, role FROM usuarios WHERE email = :e"),
@@ -425,11 +684,20 @@ class AtivarConta(BaseModel):
 class Login(BaseModel):
     email: EmailStr
     senha: str
+    mfa_code: Optional[str] = None
 
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+
+class MFAAtivar(BaseModel):
+    code: str
+
+
+class MFADesativar(BaseModel):
+    senha: str
 
 
 class ContatoUpdate(BaseModel):
@@ -2373,6 +2641,60 @@ def gerar_ranking_mensal():
 
 
 # =========================
+# JOB: RETENÇÃO LGPD
+# =========================
+# Meses sem interação após os quais um lead vira candidato a anonimização/exclusão.
+LGPD_RETENCAO_MESES = int(os.getenv("LGPD_RETENCAO_MESES", "18"))
+# Por segurança, o job só REPORTA por padrão. Exclusão automática exige opt-in
+# explícito (LGPD_RETENCAO_AUTO=true), pois apaga dados de produção.
+LGPD_RETENCAO_AUTO = os.getenv("LGPD_RETENCAO_AUTO", "false").lower() == "true"
+
+
+def retencao_lgpd():
+    """Identifica leads sem interação há mais de LGPD_RETENCAO_MESES meses.
+    Registra em auditoria; só exclui se LGPD_RETENCAO_AUTO estiver ligado."""
+    print("⏰ JOB: revisão de retenção LGPD...")
+    try:
+        with engine.begin() as conn:
+            garantir_seguranca(conn)
+            limite = datetime.utcnow() - timedelta(days=LGPD_RETENCAO_MESES * 30)
+            candidatos = conn.execute(
+                text(
+                    """
+                    SELECT empresa_id, conta_id, nome
+                    FROM empresas
+                    WHERE COALESCE(ultima_interacao, status_atualizado_em, data_criacao) < :limite
+                      AND status NOT IN ('Cliente', 'Fechado', 'Ganho')
+                    """
+                ),
+                {"limite": limite},
+            ).fetchall()
+            if not candidatos:
+                print("✅ Retenção LGPD: nenhum lead elegível.")
+                return
+            print(f"📋 Retenção LGPD: {len(candidatos)} lead(s) sem interação há >{LGPD_RETENCAO_MESES} meses.")
+            registrar_auditoria(
+                acao="RETENCAO_LGPD_REVISAO", recurso="empresas",
+                quantidade=len(candidatos),
+                meta={"auto": LGPD_RETENCAO_AUTO, "meses": LGPD_RETENCAO_MESES},
+                conn=conn,
+            )
+            if LGPD_RETENCAO_AUTO:
+                ids = [str(c.empresa_id) for c in candidatos]
+                conn.execute(
+                    text("DELETE FROM empresas WHERE empresa_id = ANY(:ids)"),
+                    {"ids": ids},
+                )
+                registrar_auditoria(
+                    acao="RETENCAO_LGPD_EXCLUSAO", recurso="empresas",
+                    quantidade=len(ids), conn=conn,
+                )
+                print(f"🗑️ Retenção LGPD: {len(ids)} lead(s) excluído(s) (auto).")
+    except Exception as e:
+        print(f"🔴 Erro no job de retenção LGPD: {e}")
+
+
+# =========================
 # SCHEDULER
 # =========================
 scheduler = BackgroundScheduler()
@@ -2380,6 +2702,7 @@ scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
 scheduler.add_job(gerar_ranking_mensal, "cron", day="last", hour=23, minute=30)
+scheduler.add_job(retencao_lgpd, "cron", hour=4, minute=0, id="retencao_lgpd")
 scheduler.start()
 print("⏰ Scheduler iniciado — verificação diária às 8h UTC")
 
@@ -2501,7 +2824,8 @@ def get_me(auth: dict = Depends(get_auth)):
             text(
                 """
                 SELECT u.usuario_id, u.nome, u.email, u.telefone, u.cargo, u.empresa_nome, u.bio,
-                       u.data_criacao, u.role, u.conta_id, ct.nome AS conta_nome
+                       u.data_criacao, u.role, u.conta_id, ct.nome AS conta_nome,
+                       COALESCE(u.mfa_ativado, FALSE) AS mfa_ativado
                 FROM usuarios u
                 LEFT JOIN contas ct ON ct.conta_id = u.conta_id
                 WHERE u.email = :email
@@ -3324,8 +3648,11 @@ def criar_rascunho(rascunho: RascunhoCreate, auth: dict = Depends(get_auth)):
     return {"empresa_id": empresa_id, "status_cadastro": "rascunho"}
 
 
+ALERTA_EXPORTACAO_MASSA = int(os.getenv("ALERTA_EXPORTACAO_MASSA", "100"))
+
+
 @app.get("/empresas")
-def listar_empresas(auth: dict = Depends(get_auth)):
+def listar_empresas(request: Request, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
         # Vendedor: só a própria carteira. Gerente: tudo da conta.
@@ -3350,7 +3677,14 @@ def listar_empresas(auth: dict = Depends(get_auth)):
             ),
             params,
         )
-        return [dict(row._mapping) for row in result]
+        rows = [dict(row._mapping) for row in result]
+        # Auditoria de acesso à base de leads + alerta de leitura em massa (LGPD).
+        acao = "LEADS_EXPORTACAO_MASSA" if len(rows) >= ALERTA_EXPORTACAO_MASSA else "LEADS_LISTADOS"
+        registrar_auditoria(usuario=auth, acao=acao, recurso="empresas",
+                            quantidade=len(rows), request=request, conn=conn)
+        if len(rows) >= ALERTA_EXPORTACAO_MASSA:
+            print(f"🚨 ALERTA: {auth['email']} listou {len(rows)} leads de uma vez (conta {auth['conta_id']}).")
+        return rows
 
 
 @app.get("/empresas/{empresa_id}")
@@ -3980,7 +4314,8 @@ def dashboard_gerente(auth: dict = Depends(exigir_gerente)):
 
 
 @app.post("/signup", status_code=201)
-async def signup_conta(dados: ContaSignup):
+@limiter.limit("10/hour")
+async def signup_conta(dados: ContaSignup, request: Request):
     """Cadastro de uma NOVA assinatura: cria a conta e o primeiro usuário como
     gerente (ADM). O gerente recebe email para ativar a conta e definir a senha.
     Pagamento/cobrança fica fora deste fluxo por enquanto."""
@@ -4042,16 +4377,268 @@ def ativar_conta(dados: AtivarConta):
     return {"msg": "Conta ativada com sucesso 🚀"}
 
 
-@app.post("/login", response_model=Token)
-def login(dados: Login):
-    with engine.connect() as conn:
-        usuario = conn.execute(text("SELECT * FROM usuarios WHERE email = :email"), {"email": dados.email}).fetchone()
-    if not usuario:
-        raise HTTPException(401, "Usuário não encontrado")
-    usuario = dict(usuario._mapping)
-    if not usuario["ativo"]:
-        raise HTTPException(401, "Conta não ativada")
-    if not verificar_senha(dados.senha, usuario["senha_hash"]):
-        raise HTTPException(401, "Senha inválida")
-    token = criar_token_acesso({"sub": usuario["email"]})
-    return {"access_token": token, "token_type": "bearer"}
+# Cookie do refresh token. Frontend (vercel.app) e backend (railway.app) são
+# cross-site → exige SameSite=None + Secure para o cookie ser enviado.
+REFRESH_COOKIE = "refresh_token"
+
+
+def set_refresh_cookie(response: Response, token: str):
+    response.set_cookie(
+        key=REFRESH_COOKIE,
+        value=token,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/",
+    )
+
+
+def clear_refresh_cookie(response: Response):
+    response.set_cookie(
+        key=REFRESH_COOKIE, value="", httponly=True, secure=True,
+        samesite="none", max_age=0, path="/",
+    )
+
+
+def emitir_sessao(conn, usuario: dict, request: Request, response: Response,
+                  familia: Optional[str] = None) -> dict:
+    """Emite access token (JWT curto) + refresh token (cookie httpOnly)."""
+    access = criar_token_acesso({"sub": usuario["email"]})
+    raw_refresh = criar_refresh_token(conn, str(usuario["usuario_id"]), familia, request)
+    set_refresh_cookie(response, raw_refresh)
+    return {"access_token": access, "token_type": "bearer"}
+
+
+@app.post("/login")
+@limiter.limit("10/15minutes")
+def login(dados: Login, request: Request, response: Response):
+    # Lockout progressivo por conta (além do rate limit por IP do slowapi).
+    checar_lockout(dados.email)
+
+    with engine.begin() as conn:
+        garantir_seguranca(conn)
+        usuario = conn.execute(
+            text("SELECT * FROM usuarios WHERE email = :email"), {"email": dados.email}
+        ).fetchone()
+
+        # Anti-enumeração: mensagem única e verificação de senha em tempo ~constante
+        # mesmo quando o e-mail não existe (evita timing attack).
+        if not usuario:
+            verificar_senha(dados.senha, _DUMMY_HASH)
+            registrar_falha_login(dados.email)
+            registrar_auditoria(email=dados.email, acao="LOGIN_FALHOU",
+                                request=request, meta={"motivo": "email_inexistente"}, conn=conn)
+            raise HTTPException(401, CREDENCIAIS_INVALIDAS)
+
+        usuario = dict(usuario._mapping)
+
+        if not usuario.get("senha_hash") or not verificar_senha(dados.senha, usuario["senha_hash"]):
+            registrar_falha_login(dados.email)
+            registrar_auditoria(email=dados.email, acao="LOGIN_FALHOU",
+                                request=request, meta={"motivo": "senha_invalida"}, conn=conn)
+            raise HTTPException(401, CREDENCIAIS_INVALIDAS)
+
+        if not usuario["ativo"]:
+            raise HTTPException(401, "Conta não ativada. Verifique seu e-mail de ativação.")
+
+        # MFA obrigatório quando ativado na conta.
+        if usuario.get("mfa_ativado"):
+            code = (dados.mfa_code or "").strip()
+            if not code:
+                # Senha OK mas falta o 2º fator — sinaliza ao frontend sem emitir token.
+                return {"mfa_required": True}
+            ok = mfa_verificar_totp(usuario.get("mfa_secret"), code)
+            if not ok:
+                # Tenta como código de backup (uso único).
+                backups = usuario.get("mfa_backup_codes") or []
+                h = _hash_token(code)
+                if h in backups:
+                    backups = [b for b in backups if b != h]
+                    conn.execute(
+                        text("UPDATE usuarios SET mfa_backup_codes = CAST(:b AS JSONB) WHERE usuario_id = :id"),
+                        {"b": json.dumps(backups), "id": usuario["usuario_id"]},
+                    )
+                    ok = True
+            if not ok:
+                registrar_falha_login(dados.email)
+                registrar_auditoria(usuario={"usuario_id": str(usuario["usuario_id"]),
+                                             "email": usuario["email"],
+                                             "conta_id": str(usuario.get("conta_id")) if usuario.get("conta_id") else None},
+                                    acao="MFA_FALHOU", request=request, conn=conn)
+                raise HTTPException(401, "Código de verificação inválido.")
+
+        limpar_falhas_login(dados.email)
+        sessao = emitir_sessao(conn, usuario, request, response)
+        registrar_auditoria(usuario={"usuario_id": str(usuario["usuario_id"]),
+                                     "email": usuario["email"],
+                                     "conta_id": str(usuario.get("conta_id")) if usuario.get("conta_id") else None},
+                            acao="LOGIN_OK", request=request, conn=conn)
+    return sessao
+
+
+@app.post("/refresh")
+def refresh_token_endpoint(request: Request, response: Response):
+    """Rotação de refresh token: valida o cookie, revoga o antigo e emite novos.
+    Reuso de token já usado/revogado → revoga a família inteira (proteção contra roubo)."""
+    raw = request.cookies.get(REFRESH_COOKIE)
+    if not raw or "." not in raw:
+        raise HTTPException(401, "Sessão expirada, faça login novamente.")
+    familia, _, _ = raw.partition(".")
+    h = _hash_token(raw.split(".", 1)[1])
+    with engine.begin() as conn:
+        garantir_seguranca(conn)
+        row = conn.execute(
+            text(
+                """
+                SELECT rt.id, rt.usuario_id, rt.familia, rt.revogado, rt.expira_em, rt.usado_em,
+                       u.email, u.conta_id, u.ativo
+                FROM refresh_tokens rt
+                JOIN usuarios u ON u.usuario_id = rt.usuario_id
+                WHERE rt.token_hash = :h
+                """
+            ),
+            {"h": h},
+        ).fetchone()
+        if not row or str(row.familia) != familia:
+            clear_refresh_cookie(response)
+            raise HTTPException(401, "Sessão expirada, faça login novamente.")
+        if row.revogado or row.usado_em is not None:
+            # Reuso detectado → revoga toda a família (possível token roubado).
+            revogar_refresh_familia(conn, familia)
+            registrar_auditoria(email=row.email, acao="REFRESH_REUSO_DETECTADO",
+                                request=request, conn=conn)
+            clear_refresh_cookie(response)
+            raise HTTPException(401, "Sessão inválida, faça login novamente.")
+        if row.expira_em < datetime.utcnow() or not row.ativo:
+            clear_refresh_cookie(response)
+            raise HTTPException(401, "Sessão expirada, faça login novamente.")
+
+        # Marca o atual como usado/revogado e emite um novo na mesma família.
+        conn.execute(
+            text("UPDATE refresh_tokens SET revogado = TRUE, usado_em = NOW() WHERE id = :id"),
+            {"id": row.id},
+        )
+        usuario = {"usuario_id": str(row.usuario_id), "email": row.email}
+        sessao = emitir_sessao(conn, usuario, request, response, familia=familia)
+    return sessao
+
+
+@app.post("/logout")
+def logout(request: Request, response: Response):
+    raw = request.cookies.get(REFRESH_COOKIE)
+    if raw and "." in raw:
+        familia = raw.split(".", 1)[0]
+        with engine.begin() as conn:
+            revogar_refresh_familia(conn, familia)
+    clear_refresh_cookie(response)
+    return {"msg": "Sessão encerrada."}
+
+
+@app.post("/logout-all")
+def logout_all(request: Request, response: Response, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        revogar_refresh_usuario(conn, auth["usuario_id"])
+        registrar_auditoria(usuario=auth, acao="LOGOUT_TODOS", request=request, conn=conn)
+    clear_refresh_cookie(response)
+    return {"msg": "Todas as sessões foram encerradas."}
+
+
+# =========================
+# MFA / TOTP
+# =========================
+@app.post("/mfa/setup")
+def mfa_setup(auth: dict = Depends(get_auth)):
+    """Gera um segredo TOTP (ainda não ativado) e devolve o QR code para
+    escanear no Google Authenticator/Authy."""
+    secret = pyotp.random_base32()
+    otpauth = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=auth["email"], issuer_name="CRM Prospecção"
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE usuarios SET mfa_secret = :s WHERE usuario_id = :id"),
+            {"s": secret, "id": auth["usuario_id"]},
+        )
+    qr_data_url = None
+    try:
+        import qrcode
+        import io
+        img = qrcode.make(otpauth)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        qr_data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print(f"⚠️ QR não gerado: {e}")
+    return {"secret": secret, "otpauth_url": otpauth, "qr_code": qr_data_url}
+
+
+@app.post("/mfa/ativar")
+def mfa_ativar(dados: MFAAtivar, request: Request, auth: dict = Depends(get_auth)):
+    """Confirma o código do app autenticador, ativa o MFA e devolve os
+    códigos de backup (mostrados UMA única vez)."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT mfa_secret FROM usuarios WHERE usuario_id = :id"),
+            {"id": auth["usuario_id"]},
+        ).fetchone()
+        if not row or not row.mfa_secret:
+            raise HTTPException(400, "Inicie a configuração do MFA primeiro.")
+        if not mfa_verificar_totp(row.mfa_secret, dados.code):
+            raise HTTPException(400, "Código inválido. Tente novamente.")
+        codes, hashes = mfa_gerar_backup_codes()
+        conn.execute(
+            text(
+                "UPDATE usuarios SET mfa_ativado = TRUE, mfa_backup_codes = CAST(:b AS JSONB) "
+                "WHERE usuario_id = :id"
+            ),
+            {"b": json.dumps(hashes), "id": auth["usuario_id"]},
+        )
+        registrar_auditoria(usuario=auth, acao="MFA_ATIVADO", request=request, conn=conn)
+    return {"msg": "MFA ativado com sucesso.", "backup_codes": codes}
+
+
+@app.post("/mfa/desativar")
+def mfa_desativar(dados: MFADesativar, request: Request, auth: dict = Depends(get_auth)):
+    """Desativa o MFA (exige a senha da conta como confirmação)."""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT senha_hash FROM usuarios WHERE usuario_id = :id"),
+            {"id": auth["usuario_id"]},
+        ).fetchone()
+        if not row or not verificar_senha(dados.senha, row.senha_hash):
+            raise HTTPException(401, "Senha inválida.")
+        conn.execute(
+            text(
+                "UPDATE usuarios SET mfa_ativado = FALSE, mfa_secret = NULL, mfa_backup_codes = NULL "
+                "WHERE usuario_id = :id"
+            ),
+            {"id": auth["usuario_id"]},
+        )
+        registrar_auditoria(usuario=auth, acao="MFA_DESATIVADO", request=request, conn=conn)
+    return {"msg": "MFA desativado."}
+
+
+@app.get("/gerencia/auditoria")
+def listar_auditoria(auth: dict = Depends(exigir_gerente), limite: int = 200):
+    """Logs de auditoria da conta (acesso a leads, autenticação, exportações).
+    Restrito ao gerente. Atende rastreabilidade exigida pela LGPD."""
+    limite = max(1, min(limite, 1000))
+    with engine.begin() as conn:
+        garantir_seguranca(conn)
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, usuario_email, acao, recurso, recurso_id, quantidade,
+                       ip, criado_em
+                FROM audit_log
+                WHERE conta_id = :cid
+                   OR (conta_id IS NULL AND usuario_email IN (
+                        SELECT email FROM usuarios WHERE conta_id = :cid))
+                ORDER BY criado_em DESC
+                LIMIT :lim
+                """
+            ),
+            {"cid": auth["conta_id"], "lim": limite},
+        )
+        return [dict(r._mapping) for r in rows]
