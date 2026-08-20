@@ -5152,3 +5152,5 @@ def insights_vendas(auth: dict = Depends(get_auth)):
                 for r in ranking
             ],
         }
+
+# deploy marker: forca o webhook do Railway a reconhecer o modulo de vendas (bf01191)
