@@ -757,6 +757,44 @@ class ReuniaoGoogle(BaseModel):
     emails_convidados: Optional[list[str]] = None
 
 
+class EquipamentoCreate(BaseModel):
+    nome: str
+    descricao: Optional[str] = None
+    preco_base: float = 0
+
+
+class EquipamentoUpdate(BaseModel):
+    nome: Optional[str] = None
+    descricao: Optional[str] = None
+    preco_base: Optional[float] = None
+    ativo: Optional[bool] = None
+
+
+class OrcamentoItemIn(BaseModel):
+    equipamento_id: Optional[str] = None
+    descricao: str
+    quantidade: int = 1
+    preco_unitario: float = 0
+
+
+class OrcamentoCreate(BaseModel):
+    empresa_id: str
+    titulo: Optional[str] = None
+    observacoes: Optional[str] = None
+    itens: list[OrcamentoItemIn] = []
+
+
+class OrcamentoUpdate(BaseModel):
+    titulo: Optional[str] = None
+    observacoes: Optional[str] = None
+    itens: Optional[list[OrcamentoItemIn]] = None
+
+
+class OrcamentoStatusUpdate(BaseModel):
+    status: str
+    motivo_recusa: Optional[str] = None
+
+
 # =========================
 # SEGMENTOS (helpers)
 # =========================
@@ -1031,6 +1069,71 @@ def garantir_tabela_notificacoes(conn):
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS email_convidado TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS status_resposta TEXT DEFAULT 'pendente'"))
+
+
+# Status possíveis de um orçamento, na ordem do fluxo.
+ORCAMENTO_STATUS = ["rascunho", "enviado", "em_negociacao", "aprovado", "recusado"]
+
+
+def garantir_vendas(conn):
+    """Catálogo de equipamentos + orçamentos e seus itens.
+
+    Escopo por conta (assinatura), igual a empresas: o vendedor enxerga o que é
+    dele, o gerente enxerga tudo da conta."""
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS equipamentos (
+            equipamento_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            conta_id UUID NOT NULL,
+            nome TEXT NOT NULL,
+            descricao TEXT,
+            preco_base NUMERIC(12,2) DEFAULT 0,
+            ativo BOOLEAN DEFAULT TRUE,
+            criado_em TIMESTAMP DEFAULT NOW()
+        )
+    """
+        )
+    )
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS orcamentos (
+            orcamento_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            conta_id UUID NOT NULL,
+            empresa_id UUID NOT NULL,
+            vendedor_id UUID,
+            titulo TEXT,
+            observacoes TEXT,
+            status VARCHAR(20) NOT NULL DEFAULT 'rascunho',
+            total NUMERIC(12,2) DEFAULT 0,
+            data_envio TIMESTAMP,
+            data_decisao TIMESTAMP,
+            motivo_recusa TEXT,
+            criado_em TIMESTAMP DEFAULT NOW(),
+            atualizado_em TIMESTAMP DEFAULT NOW()
+        )
+    """
+        )
+    )
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS orcamento_itens (
+            item_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            orcamento_id UUID NOT NULL REFERENCES orcamentos(orcamento_id) ON DELETE CASCADE,
+            equipamento_id UUID,
+            descricao TEXT NOT NULL,
+            quantidade INTEGER NOT NULL DEFAULT 1,
+            preco_unitario NUMERIC(12,2) NOT NULL DEFAULT 0
+        )
+    """
+        )
+    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orcamentos_conta ON orcamentos(conta_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orcamentos_empresa ON orcamentos(empresa_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orc_itens_orcamento ON orcamento_itens(orcamento_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_equipamentos_conta ON equipamentos(conta_id)"))
 
 
 # =========================
@@ -4642,3 +4745,410 @@ def listar_auditoria(auth: dict = Depends(exigir_gerente), limite: int = 200):
             {"cid": auth["conta_id"], "lim": limite},
         )
         return [dict(r._mapping) for r in rows]
+
+
+# =========================
+# VENDAS: EQUIPAMENTOS
+# =========================
+def _escopo_vendas(auth: dict, alias: str = "o"):
+    """Vendedor enxerga só o que é dele; gerente enxerga tudo da conta."""
+    if auth["is_gerente"]:
+        return f"{alias}.conta_id = :cid", {"cid": auth["conta_id"]}
+    return (
+        f"{alias}.conta_id = :cid AND {alias}.vendedor_id = :vid",
+        {"cid": auth["conta_id"], "vid": auth["usuario_id"]},
+    )
+
+
+@app.get("/equipamentos")
+def listar_equipamentos(auth: dict = Depends(get_auth), incluir_inativos: bool = False):
+    """Catálogo de equipamentos da conta, usado para montar orçamentos."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        filtro = "" if incluir_inativos else " AND ativo = TRUE"
+        rows = conn.execute(
+            text(
+                f"""SELECT equipamento_id, nome, descricao, preco_base, ativo, criado_em
+                    FROM equipamentos WHERE conta_id = :cid{filtro} ORDER BY nome ASC"""
+            ),
+            {"cid": auth["conta_id"]},
+        )
+        return [dict(r._mapping) for r in rows]
+
+
+@app.post("/equipamentos")
+def criar_equipamento(dados: EquipamentoCreate, auth: dict = Depends(get_auth)):
+    nome = (dados.nome or "").strip()
+    if not nome:
+        raise HTTPException(400, "Nome do equipamento é obrigatório")
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        row = conn.execute(
+            text(
+                """INSERT INTO equipamentos (conta_id, nome, descricao, preco_base)
+                   VALUES (:cid, :n, :d, :p)
+                   RETURNING equipamento_id, nome, descricao, preco_base, ativo, criado_em"""
+            ),
+            {"cid": auth["conta_id"], "n": nome, "d": dados.descricao, "p": dados.preco_base or 0},
+        ).fetchone()
+        return dict(row._mapping)
+
+
+@app.put("/equipamentos/{equipamento_id}")
+def atualizar_equipamento(equipamento_id: str, dados: EquipamentoUpdate, auth: dict = Depends(get_auth)):
+    campos = {k: v for k, v in dados.dict().items() if v is not None}
+    if not campos:
+        raise HTTPException(400, "Nada para atualizar")
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        sets = ", ".join(f"{k} = :{k}" for k in campos)
+        params = {**campos, "eid": equipamento_id, "cid": auth["conta_id"]}
+        row = conn.execute(
+            text(
+                f"""UPDATE equipamentos SET {sets}
+                    WHERE equipamento_id = :eid AND conta_id = :cid
+                    RETURNING equipamento_id, nome, descricao, preco_base, ativo, criado_em"""
+            ),
+            params,
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Equipamento não encontrado")
+        return dict(row._mapping)
+
+
+@app.delete("/equipamentos/{equipamento_id}")
+def desativar_equipamento(equipamento_id: str, auth: dict = Depends(get_auth)):
+    """Desativa em vez de apagar: orçamentos antigos continuam apontando pro item."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        row = conn.execute(
+            text(
+                """UPDATE equipamentos SET ativo = FALSE
+                   WHERE equipamento_id = :eid AND conta_id = :cid RETURNING equipamento_id"""
+            ),
+            {"eid": equipamento_id, "cid": auth["conta_id"]},
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "Equipamento não encontrado")
+        return {"msg": "Equipamento desativado"}
+
+
+# =========================
+# VENDAS: ORÇAMENTOS
+# =========================
+def _carregar_itens(conn, orcamento_id: str):
+    rows = conn.execute(
+        text(
+            """SELECT item_id, equipamento_id, descricao, quantidade, preco_unitario
+               FROM orcamento_itens WHERE orcamento_id = :oid ORDER BY descricao ASC"""
+        ),
+        {"oid": orcamento_id},
+    )
+    return [dict(r._mapping) for r in rows]
+
+
+def _regravar_itens(conn, orcamento_id: str, itens: list) -> float:
+    """Troca os itens do orçamento e devolve o novo total."""
+    conn.execute(text("DELETE FROM orcamento_itens WHERE orcamento_id = :oid"), {"oid": orcamento_id})
+    total = 0.0
+    for item in itens:
+        qtd = max(1, int(item.quantidade or 1))
+        preco = float(item.preco_unitario or 0)
+        total += qtd * preco
+        conn.execute(
+            text(
+                """INSERT INTO orcamento_itens
+                   (orcamento_id, equipamento_id, descricao, quantidade, preco_unitario)
+                   VALUES (:oid, :eq, :d, :q, :p)"""
+            ),
+            {
+                "oid": orcamento_id,
+                "eq": item.equipamento_id or None,
+                "d": (item.descricao or "").strip() or "Item",
+                "q": qtd,
+                "p": preco,
+            },
+        )
+    conn.execute(
+        text("UPDATE orcamentos SET total = :t, atualizado_em = NOW() WHERE orcamento_id = :oid"),
+        {"t": total, "oid": orcamento_id},
+    )
+    return total
+
+
+def _orcamento_do_usuario(conn, orcamento_id: str, auth: dict):
+    """Carrega o orçamento respeitando a carteira. 404 se não for visível."""
+    escopo, params = _escopo_vendas(auth)
+    row = conn.execute(
+        text(f"SELECT * FROM orcamentos o WHERE o.orcamento_id = :oid AND {escopo}"),
+        {**params, "oid": orcamento_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Orçamento não encontrado")
+    return dict(row._mapping)
+
+
+@app.get("/orcamentos")
+def listar_orcamentos(auth: dict = Depends(get_auth), status: Optional[str] = None,
+                      empresa_id: Optional[str] = None):
+    """Lista orçamentos da carteira, com o nome da empresa já resolvido."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        escopo, params = _escopo_vendas(auth)
+        if status:
+            escopo += " AND o.status = :st"
+            params["st"] = status
+        if empresa_id:
+            escopo += " AND o.empresa_id = :eid"
+            params["eid"] = empresa_id
+        rows = conn.execute(
+            text(
+                f"""SELECT o.*, e.nome AS empresa_nome
+                    FROM orcamentos o
+                    LEFT JOIN empresas e ON e.empresa_id = o.empresa_id
+                    WHERE {escopo}
+                    ORDER BY o.atualizado_em DESC NULLS LAST, o.criado_em DESC"""
+            ),
+            params,
+        )
+        return [dict(r._mapping) for r in rows]
+
+
+@app.get("/orcamentos/{orcamento_id}")
+def obter_orcamento(orcamento_id: str, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        orc = _orcamento_do_usuario(conn, orcamento_id, auth)
+        orc["itens"] = _carregar_itens(conn, orcamento_id)
+        return orc
+
+
+@app.post("/orcamentos")
+def criar_orcamento(dados: OrcamentoCreate, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        emp = conn.execute(
+            text("SELECT empresa_id FROM empresas WHERE empresa_id = :eid AND conta_id = :cid"),
+            {"eid": dados.empresa_id, "cid": auth["conta_id"]},
+        ).fetchone()
+        if not emp:
+            raise HTTPException(404, "Empresa não encontrada")
+        row = conn.execute(
+            text(
+                """INSERT INTO orcamentos (conta_id, empresa_id, vendedor_id, titulo, observacoes)
+                   VALUES (:cid, :eid, :vid, :t, :o) RETURNING orcamento_id"""
+            ),
+            {
+                "cid": auth["conta_id"],
+                "eid": dados.empresa_id,
+                "vid": auth["usuario_id"],
+                "t": (dados.titulo or "").strip() or "Orçamento",
+                "o": dados.observacoes,
+            },
+        ).fetchone()
+        oid = str(row.orcamento_id)
+        _regravar_itens(conn, oid, dados.itens or [])
+        orc = _orcamento_do_usuario(conn, oid, auth)
+        orc["itens"] = _carregar_itens(conn, oid)
+        return orc
+
+
+@app.put("/orcamentos/{orcamento_id}")
+def atualizar_orcamento(orcamento_id: str, dados: OrcamentoUpdate, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        atual = _orcamento_do_usuario(conn, orcamento_id, auth)
+        if atual["status"] in ("aprovado", "recusado"):
+            raise HTTPException(400, "Orçamento já decidido não pode ser editado")
+        campos = {}
+        if dados.titulo is not None:
+            campos["titulo"] = dados.titulo
+        if dados.observacoes is not None:
+            campos["observacoes"] = dados.observacoes
+        if campos:
+            sets = ", ".join(f"{k} = :{k}" for k in campos)
+            conn.execute(
+                text(f"UPDATE orcamentos SET {sets}, atualizado_em = NOW() WHERE orcamento_id = :oid"),
+                {**campos, "oid": orcamento_id},
+            )
+        if dados.itens is not None:
+            _regravar_itens(conn, orcamento_id, dados.itens)
+        orc = _orcamento_do_usuario(conn, orcamento_id, auth)
+        orc["itens"] = _carregar_itens(conn, orcamento_id)
+        return orc
+
+
+@app.delete("/orcamentos/{orcamento_id}")
+def excluir_orcamento(orcamento_id: str, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        _orcamento_do_usuario(conn, orcamento_id, auth)
+        conn.execute(text("DELETE FROM orcamentos WHERE orcamento_id = :oid"), {"oid": orcamento_id})
+        return {"msg": "Orçamento excluído"}
+
+
+def _brl(v) -> str:
+    """Formata em Real: 1234.5 -> 'R$ 1.234,50'."""
+    return f"R$ {float(v or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _html_orcamento(empresa_nome: str, orc: dict, itens: list) -> str:
+    """Corpo do email do orçamento."""
+    linhas = "".join(
+        "<tr>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #eee'>{i['descricao']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #eee;text-align:center'>{i['quantidade']}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #eee;text-align:right'>{_brl(i['preco_unitario'])}</td>"
+        f"<td style='padding:6px 10px;border-bottom:1px solid #eee;text-align:right'>"
+        f"{_brl(int(i['quantidade'] or 1) * float(i['preco_unitario'] or 0))}</td>"
+        "</tr>"
+        for i in itens
+    )
+    obs = f"<p style='color:#555'>{orc.get('observacoes')}</p>" if orc.get("observacoes") else ""
+    titulo = orc.get("titulo") or "Orçamento"
+    return (
+        "<div style=\"font-family:Arial,sans-serif;max-width:640px\">"
+        f"<h2 style=\"color:#0f2133\">{titulo}</h2>"
+        f"<p style=\"color:#555\">Olá, {empresa_nome}!</p>"
+        "<p style=\"color:#555\">Segue o orçamento solicitado:</p>"
+        "<table style=\"width:100%;border-collapse:collapse;font-size:14px\">"
+        "<thead><tr style=\"background:#f4f7fa\">"
+        "<th style=\"padding:8px 10px;text-align:left\">Item</th>"
+        "<th style=\"padding:8px 10px;text-align:center\">Qtd</th>"
+        "<th style=\"padding:8px 10px;text-align:right\">Unit.</th>"
+        "<th style=\"padding:8px 10px;text-align:right\">Total</th>"
+        "</tr></thead>"
+        f"<tbody>{linhas}</tbody></table>"
+        "<p style=\"font-size:16px;font-weight:bold;text-align:right;color:#0f2133\">"
+        f"Total: {_brl(orc.get('total'))}</p>"
+        f"{obs}</div>"
+    )
+
+
+@app.post("/orcamentos/{orcamento_id}/enviar")
+def enviar_orcamento(orcamento_id: str, request: Request, auth: dict = Depends(get_auth)):
+    """Envia o orçamento por email ao contato da empresa e marca como enviado."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        orc = _orcamento_do_usuario(conn, orcamento_id, auth)
+        itens = _carregar_itens(conn, orcamento_id)
+        if not itens:
+            raise HTTPException(400, "Orçamento sem itens não pode ser enviado")
+        emp = conn.execute(
+            text(
+                """SELECT e.nome, c.email
+                   FROM empresas e
+                   LEFT JOIN LATERAL (
+                       SELECT email FROM contatos
+                       WHERE empresa_id = e.empresa_id AND email IS NOT NULL
+                       ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
+                   ) c ON TRUE
+                   WHERE e.empresa_id = :eid"""
+            ),
+            {"eid": orc["empresa_id"]},
+        ).fetchone()
+        if not emp or not emp.email:
+            raise HTTPException(400, "A empresa não tem contato com email cadastrado")
+        try:
+            resend.Emails.send(
+                {
+                    "from": "onboarding@resend.dev",
+                    "to": emp.email,
+                    "subject": orc.get("titulo") or "Orçamento",
+                    "html": _html_orcamento(emp.nome, orc, itens),
+                }
+            )
+        except Exception as e:
+            print(f"❌ Falha ao enviar orçamento {orcamento_id}: {e}")
+            raise HTTPException(502, "Não foi possível enviar o email do orçamento")
+        conn.execute(
+            text(
+                """UPDATE orcamentos
+                   SET status = CASE WHEN status = 'rascunho' THEN 'enviado' ELSE status END,
+                       data_envio = NOW(), atualizado_em = NOW()
+                   WHERE orcamento_id = :oid"""
+            ),
+            {"oid": orcamento_id},
+        )
+        registrar_auditoria(usuario=auth, acao="ORCAMENTO_ENVIADO", recurso="orcamentos",
+                            recurso_id=orcamento_id, request=request, conn=conn)
+        atualizado = _orcamento_do_usuario(conn, orcamento_id, auth)
+        atualizado["itens"] = itens
+        return atualizado
+
+
+@app.put("/orcamentos/{orcamento_id}/status")
+def atualizar_status_orcamento(orcamento_id: str, dados: OrcamentoStatusUpdate,
+                               auth: dict = Depends(get_auth)):
+    """Move o orçamento no fluxo: enviado -> em_negociacao -> aprovado/recusado."""
+    if dados.status not in ORCAMENTO_STATUS:
+        raise HTTPException(400, f"Status inválido. Use um de: {', '.join(ORCAMENTO_STATUS)}")
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        _orcamento_do_usuario(conn, orcamento_id, auth)
+        decidido = dados.status in ("aprovado", "recusado")
+        conn.execute(
+            text(
+                """UPDATE orcamentos
+                   SET status = :st,
+                       motivo_recusa = :mr,
+                       data_decisao = CASE WHEN :dec THEN NOW() ELSE data_decisao END,
+                       atualizado_em = NOW()
+                   WHERE orcamento_id = :oid"""
+            ),
+            {
+                "st": dados.status,
+                "mr": dados.motivo_recusa if dados.status == "recusado" else None,
+                "dec": decidido,
+                "oid": orcamento_id,
+            },
+        )
+        orc = _orcamento_do_usuario(conn, orcamento_id, auth)
+        orc["itens"] = _carregar_itens(conn, orcamento_id)
+        return orc
+
+
+@app.get("/vendas/insights")
+def insights_vendas(auth: dict = Depends(get_auth)):
+    """Números do dashboard de vendas: funil por status, valores e ranking de equipamentos."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        escopo, params = _escopo_vendas(auth)
+        por_status = conn.execute(
+            text(
+                f"""SELECT status, COUNT(*) AS total, COALESCE(SUM(total),0) AS valor
+                    FROM orcamentos o WHERE {escopo} GROUP BY status"""
+            ),
+            params,
+        )
+        status_map = {r.status: {"total": r.total, "valor": float(r.valor or 0)} for r in por_status}
+        resumo = {s: status_map.get(s, {"total": 0, "valor": 0.0}) for s in ORCAMENTO_STATUS}
+
+        ranking = conn.execute(
+            text(
+                f"""SELECT COALESCE(eq.nome, i.descricao) AS nome,
+                           SUM(i.quantidade) AS quantidade,
+                           COALESCE(SUM(i.quantidade * i.preco_unitario),0) AS valor
+                    FROM orcamento_itens i
+                    JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
+                    LEFT JOIN equipamentos eq ON eq.equipamento_id = i.equipamento_id
+                    WHERE {escopo}
+                    GROUP BY COALESCE(eq.nome, i.descricao)
+                    ORDER BY quantidade DESC
+                    LIMIT 10"""
+            ),
+            params,
+        )
+        aprovados = resumo["aprovado"]["total"]
+        decididos = aprovados + resumo["recusado"]["total"]
+        return {
+            "por_status": resumo,
+            "total_orcamentos": sum(v["total"] for v in resumo.values()),
+            "valor_em_aberto": resumo["enviado"]["valor"] + resumo["em_negociacao"]["valor"],
+            "valor_aprovado": resumo["aprovado"]["valor"],
+            "taxa_conversao": round(aprovados / decididos * 100, 1) if decididos else 0.0,
+            "equipamentos_mais_orcados": [
+                {"nome": r.nome, "quantidade": int(r.quantidade or 0), "valor": float(r.valor or 0)}
+                for r in ranking
+            ],
+        }
