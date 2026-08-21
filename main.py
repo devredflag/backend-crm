@@ -3774,19 +3774,19 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         numero = ""
         for comp in address_components:
             types = comp.get("types", [])
-            text = comp.get("longText", "")
+            valor = comp.get("longText", "")
             if "locality" in types and not cidade:
-                cidade = text
+                cidade = valor
             elif "administrative_area_level_2" in types and not cidade:
-                cidade = text
+                cidade = valor
             elif ("sublocality_level_1" in types or "sublocality" in types) and not bairro:
-                bairro = text
+                bairro = valor
             elif "postal_code" in types:
-                cep = text.replace("-", "").replace(" ", "")
+                cep = valor.replace("-", "").replace(" ", "")
             elif "route" in types:
-                rua = text
+                rua = valor
             elif "street_number" in types:
-                numero = text
+                numero = valor
         endereco_rua = f"{rua}, {numero}".strip(", ") if rua else ""
         result.append({
             "place_id": p.get("id"),
