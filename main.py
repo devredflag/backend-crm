@@ -623,18 +623,40 @@ def checar_acesso_empresa(conn, empresa_id: str, auth: dict):
 # =========================
 # EMAIL (Resend)
 # =========================
-# Remetente do convite. O padrão `onboarding@resend.dev` é o endereço de SANDBOX
+# Remetente de TODO email que o sistema manda (convite de usuário, ativação de
+# conta e orçamento). O padrão `onboarding@resend.dev` é o endereço de SANDBOX
 # do Resend: com ele a API só entrega para o email dono da conta Resend — mandar
 # convite para qualquer outro destinatário volta 403
 # ("You can only send testing emails to your own email address").
-# Para convidar a equipe de verdade é preciso verificar um domínio no Resend
+# Para mandar email para a equipe ou para clientes é preciso verificar um domínio no Resend
 # (Domains → Add Domain, publicar os registros DNS) e apontar RESEND_FROM para
 # um endereço desse domínio, ex.: "ProspectaGeo <nao-responda@seudominio.com.br>".
-REMETENTE_CONVITE = os.getenv("RESEND_FROM") or "onboarding@resend.dev"
+REMETENTE_EMAIL = os.getenv("RESEND_FROM") or "onboarding@resend.dev"
 
 
 def link_ativacao(token: str) -> str:
     return f"{FRONTEND_ORIGINS[0]}/ativar?token={token}"
+
+
+def motivo_falha_email(erro: Exception) -> str:
+    """Transforma o erro cru do Resend em algo que o usuário consiga agir.
+
+    O 403 do remetente de sandbox é o caso comum e o mais enganoso: a mensagem
+    original fala de "testing emails" e não deixa claro que o problema é o
+    remetente, não o destinatário."""
+    motivo = str(erro)
+    if "own email address" in motivo or "testing emails" in motivo:
+        return (
+            f"O remetente {REMETENTE_EMAIL} é o endereço de teste do Resend e só entrega "
+            "para o email dono da conta Resend. Verifique um domínio no Resend e defina a "
+            "variável RESEND_FROM para liberar o envio a outros destinatários."
+        )
+    if "domain is not verified" in motivo or "not verified" in motivo:
+        return (
+            f"O domínio do remetente {REMETENTE_EMAIL} não está verificado no Resend. "
+            "Conclua a verificação em Domains → Add Domain."
+        )
+    return motivo
 
 
 async def enviar_email(destino: str, token: str) -> tuple[bool, Optional[str]]:
@@ -651,7 +673,7 @@ async def enviar_email(destino: str, token: str) -> tuple[bool, Optional[str]]:
     try:
         resend.Emails.send(
             {
-                "from": REMETENTE_CONVITE,
+                "from": REMETENTE_EMAIL,
                 "to": destino,
                 "subject": "Ative sua conta 🚀",
                 "html": f"<p>Olá!</p><p>Clique no link abaixo para criar sua senha:</p><p><a href='{link}'>{link}</a></p>",
@@ -659,15 +681,8 @@ async def enviar_email(destino: str, token: str) -> tuple[bool, Optional[str]]:
         )
         return True, None
     except Exception as e:
-        motivo = str(e)
-        print(f"❌ Falha ao enviar convite para {destino} (from={REMETENTE_CONVITE}): {motivo}")
-        if "own email address" in motivo or "testing emails" in motivo:
-            motivo = (
-                f"O remetente {REMETENTE_CONVITE} é o endereço de teste do Resend e só "
-                "entrega para o email dono da conta Resend. Verifique um domínio no Resend "
-                "e defina a variável RESEND_FROM para liberar convites a outros endereços."
-            )
-        return False, motivo
+        print(f"❌ Falha ao enviar convite para {destino} (from={REMETENTE_EMAIL}): {e}")
+        return False, motivo_falha_email(e)
 
 
 # =========================
@@ -5764,6 +5779,64 @@ def _html_orcamento(empresa_nome: str, orc: dict, itens: list) -> str:
     )
 
 
+def _texto_orcamento(empresa_nome: str, orc: dict, itens: list) -> str:
+    """Versão em texto puro do orçamento — para o corpo de um mailto ou do
+    WhatsApp, onde HTML não funciona."""
+    linhas = "\n".join(
+        f"- {i['descricao']} | {i['quantidade']} x {_brl(i['preco_unitario'])} = "
+        f"{_brl(int(i['quantidade'] or 1) * float(i['preco_unitario'] or 0))}"
+        for i in itens
+    )
+    partes = [
+        f"Olá, {empresa_nome}!",
+        "",
+        "Segue o orçamento solicitado:",
+        "",
+        linhas,
+        "",
+        f"Total: {_brl(orc.get('total'))}",
+    ]
+    if orc.get("observacoes"):
+        partes += ["", str(orc["observacoes"])]
+    return "\n".join(partes)
+
+
+@app.get("/orcamentos/{orcamento_id}/previa-email")
+def previa_email_orcamento(orcamento_id: str, auth: dict = Depends(get_auth)):
+    """Conteúdo do orçamento pronto para o vendedor enviar por conta própria.
+
+    Existe para o envio automático não ser um beco sem saída: quando o Resend
+    recusa, o vendedor abre o próprio email/WhatsApp com tudo preenchido. Não
+    altera o status — quem enviou por fora marca em PUT /orcamentos/{id}/status."""
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        orc = _orcamento_do_usuario(conn, orcamento_id, auth)
+        itens = _carregar_itens(conn, orcamento_id)
+        emp = conn.execute(
+            text(
+                """SELECT e.nome, c.email, c.celular, c.whatsapp
+                   FROM empresas e
+                   LEFT JOIN LATERAL (
+                       SELECT email, celular, whatsapp FROM contatos
+                       WHERE empresa_id = e.empresa_id
+                       ORDER BY decisor DESC NULLS LAST, data_criacao ASC NULLS LAST LIMIT 1
+                   ) c ON TRUE
+                   WHERE e.empresa_id = :eid"""
+            ),
+            {"eid": orc["empresa_id"]},
+        ).fetchone()
+    if not emp:
+        raise HTTPException(404, "Empresa do orçamento não encontrada")
+    return {
+        "destino": emp.email,
+        "telefone": emp.whatsapp or emp.celular,
+        "empresa_nome": emp.nome,
+        "assunto": orc.get("titulo") or "Orçamento",
+        "texto": _texto_orcamento(emp.nome, orc, itens),
+        "html": _html_orcamento(emp.nome, orc, itens),
+    }
+
+
 @app.post("/orcamentos/{orcamento_id}/enviar")
 def enviar_orcamento(orcamento_id: str, request: Request, auth: dict = Depends(get_auth)):
     """Envia o orçamento por email ao contato da empresa e marca como enviado."""
@@ -5791,15 +5864,20 @@ def enviar_orcamento(orcamento_id: str, request: Request, auth: dict = Depends(g
         try:
             resend.Emails.send(
                 {
-                    "from": "onboarding@resend.dev",
+                    "from": REMETENTE_EMAIL,
                     "to": emp.email,
                     "subject": orc.get("titulo") or "Orçamento",
                     "html": _html_orcamento(emp.nome, orc, itens),
                 }
             )
         except Exception as e:
-            print(f"❌ Falha ao enviar orçamento {orcamento_id}: {e}")
-            raise HTTPException(502, "Não foi possível enviar o email do orçamento")
+            # Diferente do convite: aqui o 502 é proposital, para a transação
+            # inteira dar rollback. Marcar o orçamento como "enviado" quando o
+            # email não saiu seria mentira — o cliente não recebeu nada. O que
+            # muda é a mensagem: agora diz POR QUE falhou, e o vendedor tem
+            # GET /orcamentos/{id}/previa-email para mandar por conta própria.
+            print(f"❌ Falha ao enviar orçamento {orcamento_id} (from={REMETENTE_EMAIL}): {e}")
+            raise HTTPException(502, motivo_falha_email(e))
         conn.execute(
             text(
                 """UPDATE orcamentos
@@ -5832,6 +5910,10 @@ def atualizar_status_orcamento(orcamento_id: str, dados: OrcamentoStatusUpdate,
                    SET status = :st,
                        motivo_recusa = :mr,
                        data_decisao = CASE WHEN :dec THEN NOW() ELSE data_decisao END,
+                       -- Quem enviou o orçamento por fora (email próprio, WhatsApp) marca
+                       -- 'enviado' na mão; sem isto a data de envio ficaria vazia.
+                       data_envio = CASE WHEN :st = 'enviado' AND data_envio IS NULL
+                                         THEN NOW() ELSE data_envio END,
                        atualizado_em = NOW()
                    WHERE orcamento_id = :oid"""
             ),
