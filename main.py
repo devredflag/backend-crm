@@ -623,16 +623,51 @@ def checar_acesso_empresa(conn, empresa_id: str, auth: dict):
 # =========================
 # EMAIL (Resend)
 # =========================
-async def enviar_email(destino: str, token: str):
-    link = f"https://frontend-crm-xi-plum.vercel.app/ativar?token={token}"
-    resend.Emails.send(
-        {
-            "from": "onboarding@resend.dev",
-            "to": destino,
-            "subject": "Ative sua conta 🚀",
-            "html": f"<p>Olá!</p><p>Clique no link abaixo para criar sua senha:</p><p><a href='{link}'>{link}</a></p>",
-        }
-    )
+# Remetente do convite. O padrão `onboarding@resend.dev` é o endereço de SANDBOX
+# do Resend: com ele a API só entrega para o email dono da conta Resend — mandar
+# convite para qualquer outro destinatário volta 403
+# ("You can only send testing emails to your own email address").
+# Para convidar a equipe de verdade é preciso verificar um domínio no Resend
+# (Domains → Add Domain, publicar os registros DNS) e apontar RESEND_FROM para
+# um endereço desse domínio, ex.: "ProspectaGeo <nao-responda@seudominio.com.br>".
+REMETENTE_CONVITE = os.getenv("RESEND_FROM") or "onboarding@resend.dev"
+
+
+def link_ativacao(token: str) -> str:
+    return f"{FRONTEND_ORIGINS[0]}/ativar?token={token}"
+
+
+async def enviar_email(destino: str, token: str) -> tuple[bool, Optional[str]]:
+    """Envia o convite de ativação.
+
+    Devolve (enviado, motivo_da_falha) em vez de levantar exceção: o usuário já
+    foi gravado quando esta função roda, e deixar o erro subir devolvia 500 para
+    uma operação que, do ponto de vista do banco, deu certo — o gerente via
+    "não foi possível criar o usuário", tentava de novo e batia em
+    "Email já cadastrado". Quem chama decide o que fazer com a falha."""
+    link = link_ativacao(token)
+    if not resend.api_key:
+        return False, "RESEND_API_KEY não está configurada no servidor."
+    try:
+        resend.Emails.send(
+            {
+                "from": REMETENTE_CONVITE,
+                "to": destino,
+                "subject": "Ative sua conta 🚀",
+                "html": f"<p>Olá!</p><p>Clique no link abaixo para criar sua senha:</p><p><a href='{link}'>{link}</a></p>",
+            }
+        )
+        return True, None
+    except Exception as e:
+        motivo = str(e)
+        print(f"❌ Falha ao enviar convite para {destino} (from={REMETENTE_CONVITE}): {motivo}")
+        if "own email address" in motivo or "testing emails" in motivo:
+            motivo = (
+                f"O remetente {REMETENTE_CONVITE} é o endereço de teste do Resend e só "
+                "entrega para o email dono da conta Resend. Verifique um domínio no Resend "
+                "e defina a variável RESEND_FROM para liberar convites a outros endereços."
+            )
+        return False, motivo
 
 
 # =========================
@@ -4501,10 +4536,57 @@ async def criar_usuario(usuario: UsuarioCreate, auth: dict = Depends(exigir_gere
                     "supervisor_id": supervisor_id,
                 },
             )
-        await enviar_email(usuario.email, token_ativacao)
-        return {"msg": "Usuário criado. Verifique seu email 📩"}
     except IntegrityError:
         raise HTTPException(400, "Email já cadastrado")
+
+    # O usuário já está gravado. Se o convite não sair, dizemos isso na cara e
+    # devolvemos o link de ativação para o gerente repassar por outro canal —
+    # em vez de fingir sucesso ou estourar 500 sobre um cadastro que existe.
+    enviado, motivo = await enviar_email(usuario.email, token_ativacao)
+    if enviado:
+        return {"msg": "Usuário criado. O convite foi enviado por email 📩", "email_enviado": True}
+    return {
+        "msg": "Usuário criado, mas o convite por email não pôde ser enviado.",
+        "email_enviado": False,
+        "motivo": motivo,
+        "link_ativacao": link_ativacao(token_ativacao),
+    }
+
+
+@app.post("/usuarios/{usuario_id}/reenviar-convite")
+async def reenviar_convite(usuario_id: str, auth: dict = Depends(exigir_gerente)):
+    """Gera um token de ativação novo e reenvia o convite.
+
+    Serve para o caso em que o usuário foi criado mas o email não saiu: em vez
+    de apagar e recadastrar (que esbarra em "Email já cadastrado"), o gerente
+    reenvia. Só vale para quem ainda não ativou a conta — quem já tem senha não
+    precisa de convite."""
+    with engine.begin() as conn:
+        alvo = conn.execute(
+            text("SELECT usuario_id, nome, email, conta_id, ativo FROM usuarios WHERE usuario_id = :id"),
+            {"id": usuario_id},
+        ).fetchone()
+        if not alvo or str(alvo.conta_id) != auth["conta_id"]:
+            raise HTTPException(404, "Usuário não encontrado")
+        if alvo.ativo:
+            raise HTTPException(400, "Este usuário já ativou a conta e não precisa de convite")
+        token_novo = str(uuid.uuid4())
+        conn.execute(
+            text("UPDATE usuarios SET token_ativacao = :t WHERE usuario_id = :id"),
+            {"t": token_novo, "id": usuario_id},
+        )
+        registrar_auditoria(usuario=auth, acao="CONVITE_REENVIADO", recurso="usuarios",
+                            recurso_id=usuario_id, conn=conn)
+
+    enviado, motivo = await enviar_email(alvo.email, token_novo)
+    if enviado:
+        return {"msg": f"Convite reenviado para {alvo.email} 📩", "email_enviado": True}
+    return {
+        "msg": "Não foi possível enviar o email. Use o link abaixo para ativar a conta.",
+        "email_enviado": False,
+        "motivo": motivo,
+        "link_ativacao": link_ativacao(token_novo),
+    }
 
 
 @app.patch("/usuarios/{usuario_id}")
@@ -4708,10 +4790,23 @@ async def signup_conta(dados: ContaSignup, request: Request):
                     "empnome": dados.empresa_nome.strip() or None,
                 },
             )
-        await enviar_email(dados.email, token_ativacao)
-        return {"msg": "Conta criada! Verifique seu email para ativar. 📩", "conta_id": conta_id}
     except IntegrityError:
         raise HTTPException(400, "Email já cadastrado")
+
+    # Mesma regra do convite: a conta já existe, então falha de email não pode
+    # virar 500. O link vai na resposta para quem acabou de se cadastrar não
+    # ficar preso sem nenhuma forma de ativar.
+    enviado, motivo = await enviar_email(dados.email, token_ativacao)
+    if enviado:
+        return {"msg": "Conta criada! Verifique seu email para ativar. 📩", "conta_id": conta_id,
+                "email_enviado": True}
+    return {
+        "msg": "Conta criada, mas o email de ativação não pôde ser enviado.",
+        "conta_id": conta_id,
+        "email_enviado": False,
+        "motivo": motivo,
+        "link_ativacao": link_ativacao(token_ativacao),
+    }
 
 
 @app.post("/ativar-conta")
