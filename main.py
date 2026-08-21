@@ -1,7 +1,7 @@
 # =========================
 # IMPORTAÇÕES
 # =========================
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -24,6 +24,7 @@ import hashlib
 import secrets as _secrets
 import threading
 import unicodedata
+import io
 import httpx
 import resend
 import base64
@@ -495,10 +496,24 @@ def garantir_seguranca(conn):
 _schema_multiusuario_pronto = False
 
 
+ROLES_VALIDAS = ("vendedor", "supervisor", "gerente")
+# Como cada função aparece para o usuário final ("Função", não "Papel").
+ROTULO_FUNCAO = {"vendedor": "Vendedor", "supervisor": "Supervisor", "gerente": "Gerente"}
+
+
+def normalizar_role(valor: str | None, padrao: str = "vendedor") -> str:
+    """Aceita só as três funções conhecidas; qualquer outra coisa vira o padrão.
+    Mantém o formato já usado no banco (string minúscula), sem enum novo."""
+    r = (valor or "").strip().lower()
+    return r if r in ROLES_VALIDAS else padrao
+
+
 def get_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """Identidade completa do usuário autenticado: além do email, traz a conta
-    (assinatura) e o papel (gerente/vendedor). É a base do controle de acesso:
+    (assinatura) e a função (gerente/supervisor/vendedor). É a base do controle
+    de acesso:
     - vendedor: enxerga apenas a própria carteira;
+    - supervisor: a própria carteira + a dos vendedores atribuídos a ele;
     - gerente: enxerga tudo da conta dele."""
     global _schema_multiusuario_pronto
     email = get_current_user(credentials)
@@ -508,31 +523,89 @@ def get_auth(credentials: HTTPAuthorizationCredentials = Depends(security)) -> d
             garantir_seguranca(conn)
             _schema_multiusuario_pronto = True
         row = conn.execute(
-            text("SELECT usuario_id, email, conta_id, role FROM usuarios WHERE email = :e"),
+            text("SELECT usuario_id, email, conta_id, role, supervisor_id FROM usuarios WHERE email = :e"),
             {"e": email},
         ).fetchone()
     if not row:
         raise HTTPException(401, "Usuário não encontrado")
-    role = (row.role or "vendedor")
+    role = normalizar_role(row.role)
     return {
         "email": row.email,
         "usuario_id": str(row.usuario_id),
         "conta_id": str(row.conta_id) if row.conta_id else None,
         "role": role,
         "is_gerente": role == "gerente",
+        "is_supervisor": role == "supervisor",
+        "supervisor_id": str(row.supervisor_id) if row.supervisor_id else None,
     }
 
 
 def exigir_gerente(auth: dict = Depends(get_auth)) -> dict:
-    """Dependência para rotas restritas ao gerente (ADM da assinatura)."""
+    """Dependência para rotas restritas ao gerente (ADM da assinatura).
+    Supervisor NÃO herda estas permissões — ele acompanha, não administra."""
     if not auth["is_gerente"]:
         raise HTTPException(403, "Acesso restrito ao gerente da conta")
     return auth
 
 
+def exigir_gestor(auth: dict = Depends(get_auth)) -> dict:
+    """Rotas de acompanhamento de equipe: gerente vê a conta inteira, supervisor
+    vê só o próprio ramo. O escopo dos dados é aplicado dentro de cada rota."""
+    if not (auth["is_gerente"] or auth["is_supervisor"]):
+        raise HTTPException(403, "Acesso restrito a gerentes e supervisores")
+    return auth
+
+
+def escopo_vendedores(conn, auth: dict):
+    """IDs de usuário cujos dados o autenticado pode enxergar.
+
+    ESCOLHA DE MODELO: a camada "Equipe" do organograma é representada pelo
+    próprio vínculo `usuarios.supervisor_id` — a equipe de um supervisor é o
+    conjunto de vendedores que apontam para ele. Não foi criada tabela
+    `equipes` porque o projeto não tinha esse conceito e cada vendedor pertence
+    a um único supervisor; uma tabela extra só duplicaria a mesma relação.
+
+    Devolve None quando não há restrição por dono (gerente vê a conta inteira).
+    """
+    if auth["is_gerente"]:
+        return None
+    if auth["is_supervisor"]:
+        subordinados = conn.execute(
+            text("SELECT usuario_id FROM usuarios WHERE conta_id = :cid AND supervisor_id = :sid"),
+            {"cid": auth["conta_id"], "sid": auth["usuario_id"]},
+        ).fetchall()
+        return [auth["usuario_id"]] + [str(r.usuario_id) for r in subordinados]
+    return [auth["usuario_id"]]
+
+
+def filtro_escopo(conn, auth: dict, coluna: str = "vendedor_id", prefixo: str = ""):
+    """Monta o par (trecho SQL, params) que aplica o escopo de carteira.
+
+    Uso: `where = f"WHERE conta_id = :cid {trecho}"`. Para gerente o trecho é
+    vazio; para supervisor/vendedor vira um `AND ... = ANY(:vids)`."""
+    ids = escopo_vendedores(conn, auth)
+    if ids is None:
+        return "", {"cid": auth["conta_id"]}
+    col = f"{prefixo}{coluna}" if prefixo else coluna
+    return f"AND {col} = ANY(CAST(:vids AS uuid[]))", {"cid": auth["conta_id"], "vids": ids}
+
+
+def escopo_emails(conn, auth: dict):
+    """Mesma ideia de escopo_vendedores, mas em emails — usado pelas tabelas que
+    identificam o dono por `usuario_email` (eventos/atividades)."""
+    ids = escopo_vendedores(conn, auth)
+    if ids is None:
+        return None
+    rows = conn.execute(
+        text("SELECT email FROM usuarios WHERE usuario_id = ANY(CAST(:ids AS uuid[]))"), {"ids": ids}
+    ).fetchall()
+    return [r.email for r in rows] or [auth["email"]]
+
+
 def checar_acesso_empresa(conn, empresa_id: str, auth: dict):
-    """Garante que a empresa pertence à conta do usuário e, para vendedores,
-    que ele é o dono. Levanta 404 (não revela existência fora do escopo)."""
+    """Garante que a empresa pertence à conta do usuário e, para vendedores e
+    supervisores, que ela está no escopo dele. Levanta 404 (não revela
+    existência fora do escopo)."""
     row = conn.execute(
         text("SELECT conta_id, vendedor_id FROM empresas WHERE empresa_id = :id"),
         {"id": empresa_id},
@@ -541,7 +614,8 @@ def checar_acesso_empresa(conn, empresa_id: str, auth: dict):
         raise HTTPException(404, "Empresa não encontrada")
     if auth["conta_id"] and str(row.conta_id) != auth["conta_id"]:
         raise HTTPException(404, "Empresa não encontrada")
-    if not auth["is_gerente"] and str(row.vendedor_id) != auth["usuario_id"]:
+    ids = escopo_vendedores(conn, auth)
+    if ids is not None and str(row.vendedor_id) not in ids:
         raise HTTPException(404, "Empresa não encontrada")
     return row
 
@@ -568,12 +642,18 @@ class UsuarioCreate(BaseModel):
     nome: str
     email: EmailStr
     telefone: str | None = None
-    role: str | None = None  # 'vendedor' (padrão) ou 'gerente'
+    role: str | None = None           # 'vendedor' (padrão) | 'supervisor' | 'gerente'
+    supervisor_id: str | None = None  # só faz sentido quando role = 'vendedor'
 
 
 class UsuarioGerenciar(BaseModel):
     ativo: bool | None = None
-    role: str | None = None  # 'vendedor' | 'gerente'
+    role: str | None = None           # 'vendedor' | 'supervisor' | 'gerente'
+    # Chega como string (atribuir) ou None. Para DESVINCULAR sem excluir o
+    # usuário, o cliente manda `limpar_supervisor: true` — necessário porque
+    # None é indistinguível de "campo não enviado".
+    supervisor_id: str | None = None
+    limpar_supervisor: bool = False
 
 
 class ContaSignup(BaseModel):
@@ -759,14 +839,18 @@ class ReuniaoGoogle(BaseModel):
 
 class EquipamentoCreate(BaseModel):
     nome: str
+    codigo: Optional[str] = None      # SKU — identificador único do item na conta
     descricao: Optional[str] = None
     preco_base: float = 0
+    quantidade: Optional[int] = 0
 
 
 class EquipamentoUpdate(BaseModel):
     nome: Optional[str] = None
+    codigo: Optional[str] = None
     descricao: Optional[str] = None
     preco_base: Optional[float] = None
+    quantidade: Optional[int] = None
     ativo: Optional[bool] = None
 
 
@@ -958,6 +1042,12 @@ def garantir_multiusuario(conn):
     )
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS conta_id uuid"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS role text DEFAULT 'vendedor'"))
+    # Hierarquia Gerente → Supervisor → Vendedor. O vínculo é uma auto-referência
+    # em `usuarios`: cada vendedor aponta para no máximo um supervisor. Não há
+    # tabela `equipes` — a "equipe" é o conjunto de vendedores de um supervisor
+    # (ver ESCOLHA DE MODELO no topo de escopo_vendedores).
+    conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS supervisor_id uuid"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_usuarios_supervisor ON usuarios(supervisor_id)"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS conta_id uuid"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS vendedor_id uuid"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS conta_id uuid"))
@@ -1128,6 +1218,17 @@ def garantir_vendas(conn):
             preco_unitario NUMERIC(12,2) NOT NULL DEFAULT 0
         )
     """
+        )
+    )
+    # Campos de estoque/catálogo usados pela importação de Excel. `codigo` é o
+    # SKU: quando presente, é ele (e não o nome) que define se a linha importada
+    # cria um item novo ou atualiza um existente.
+    conn.execute(text("ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS codigo TEXT"))
+    conn.execute(text("ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS quantidade INTEGER DEFAULT 0"))
+    conn.execute(
+        text(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_equipamentos_codigo
+               ON equipamentos(conta_id, lower(codigo)) WHERE codigo IS NOT NULL"""
         )
     )
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orcamentos_conta ON orcamentos(conta_id)"))
@@ -2927,10 +3028,12 @@ def get_me(auth: dict = Depends(get_auth)):
             text(
                 """
                 SELECT u.usuario_id, u.nome, u.email, u.telefone, u.cargo, u.empresa_nome, u.bio,
-                       u.data_criacao, u.role, u.conta_id, ct.nome AS conta_nome,
+                       u.data_criacao, u.role, u.conta_id, u.supervisor_id, ct.nome AS conta_nome,
+                       s.nome AS supervisor_nome,
                        COALESCE(u.mfa_ativado, FALSE) AS mfa_ativado
                 FROM usuarios u
                 LEFT JOIN contas ct ON ct.conta_id = u.conta_id
+                LEFT JOIN usuarios s ON s.usuario_id = u.supervisor_id
                 WHERE u.email = :email
             """
             ),
@@ -2939,7 +3042,12 @@ def get_me(auth: dict = Depends(get_auth)):
     if not usuario:
         raise HTTPException(404, "Usuário não encontrado")
     dados = dict(usuario._mapping)
-    dados["is_gerente"] = (dados.get("role") or "vendedor") == "gerente"
+    role = normalizar_role(dados.get("role"))
+    dados["role"] = role
+    dados["is_gerente"] = role == "gerente"
+    dados["is_supervisor"] = role == "supervisor"
+    # Rótulo pronto para a interface — o card do usuário mostra a função, não o cargo.
+    dados["funcao"] = ROTULO_FUNCAO[role]
     return dados
 
 
@@ -3323,16 +3431,18 @@ async def agendar_reuniao_google(evento_id: str, reuniao: ReuniaoGoogle, email: 
 @app.get("/eventos")
 def listar_eventos(auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
-        # Gerente enxerga a agenda de toda a conta; vendedor, só a sua.
-        if auth["is_gerente"]:
+        # Gerente enxerga a agenda de toda a conta; supervisor, a da equipe dele;
+        # vendedor, só a sua.
+        emails = escopo_emails(conn, auth)
+        if emails is None:
             result = conn.execute(
                 text("SELECT * FROM eventos WHERE conta_id = :cid ORDER BY data, hora_inicio"),
                 {"cid": auth["conta_id"]},
             )
         else:
             result = conn.execute(
-                text("SELECT * FROM eventos WHERE usuario_email = :email ORDER BY data, hora_inicio"),
-                {"email": auth["email"]},
+                text("SELECT * FROM eventos WHERE usuario_email = ANY(:emails) ORDER BY data, hora_inicio"),
+                {"emails": emails},
             )
         return [dict(row._mapping) for row in result]
 
@@ -3422,13 +3532,15 @@ def deletar_evento(evento_id: str, email: str = Depends(get_current_user)):
 def listar_atividades_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
         checar_acesso_empresa(conn, empresa_id, auth)
-        # Gerente vê todas as atividades da empresa; vendedor, só as suas.
-        if auth["is_gerente"]:
+        # Gerente vê todas as atividades da empresa; supervisor, as da equipe;
+        # vendedor, só as suas.
+        emails = escopo_emails(conn, auth)
+        if emails is None:
             escopo = ""
             params = {"empresa_id": empresa_id}
         else:
-            escopo = "AND usuario_email = :email"
-            params = {"empresa_id": empresa_id, "email": auth["email"]}
+            escopo = "AND usuario_email = ANY(:emails)"
+            params = {"empresa_id": empresa_id, "emails": emails}
         result = conn.execute(
             text(f"""
                 SELECT evento_id, titulo, tipo, data, hora_inicio, hora_fim,
@@ -3687,13 +3799,9 @@ def top10_places(usuario_email: str = Depends(get_current_user)):
 def listar_rascunhos(auth: dict = Depends(get_auth)):
     with engine.connect() as conn:
         garantir_colunas_places(conn)
-        # Vendedor: só os seus rascunhos. Gerente: todos da conta.
-        if auth["is_gerente"]:
-            escopo = "AND conta_id = :cid"
-            params = {"cid": auth["conta_id"]}
-        else:
-            escopo = "AND conta_id = :cid AND vendedor_id = :vid"
-            params = {"cid": auth["conta_id"], "vid": auth["usuario_id"]}
+        # Vendedor: só os seus. Supervisor: os da equipe dele. Gerente: a conta toda.
+        trecho, params = filtro_escopo(conn, auth)
+        escopo = f"AND conta_id = :cid {trecho}"
         rows = conn.execute(
             text(
                 "SELECT * FROM empresas WHERE status_cadastro = 'rascunho'"
@@ -3758,13 +3866,9 @@ ALERTA_EXPORTACAO_MASSA = int(os.getenv("ALERTA_EXPORTACAO_MASSA", "100"))
 def listar_empresas(request: Request, auth: dict = Depends(get_auth)):
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
-        # Vendedor: só a própria carteira. Gerente: tudo da conta.
-        if auth["is_gerente"]:
-            escopo = "WHERE e.conta_id = :cid"
-            params = {"cid": auth["conta_id"]}
-        else:
-            escopo = "WHERE e.conta_id = :cid AND e.vendedor_id = :vid"
-            params = {"cid": auth["conta_id"], "vid": auth["usuario_id"]}
+        # Vendedor: só a própria carteira. Supervisor: a da equipe. Gerente: tudo da conta.
+        trecho, params = filtro_escopo(conn, auth, prefixo="e.")
+        escopo = f"WHERE e.conta_id = :cid {trecho}"
         result = conn.execute(
             text(
                 f"""
@@ -4254,53 +4358,147 @@ def deletar_contato(contato_id: str, auth: dict = Depends(get_auth)):
 # =========================
 # USUÁRIOS
 # =========================
+def _validar_supervisor(conn, supervisor_id: str, alvo_id: str | None, conta_id: str) -> str:
+    """Regras de integridade do vínculo Vendedor → Supervisor, todas checadas
+    aqui no servidor (o frontend só esconde botão, não autoriza nada):
+    - o supervisor precisa existir e ser da MESMA conta;
+    - precisa realmente ter a função 'supervisor';
+    - ninguém pode ser supervisor de si mesmo."""
+    if alvo_id and str(supervisor_id) == str(alvo_id):
+        raise HTTPException(400, "Um usuário não pode ser supervisor de si mesmo")
+    sup = conn.execute(
+        text("SELECT usuario_id, conta_id, role FROM usuarios WHERE usuario_id = :id"),
+        {"id": supervisor_id},
+    ).fetchone()
+    if not sup or str(sup.conta_id) != str(conta_id):
+        raise HTTPException(404, "Supervisor não encontrado nesta conta")
+    if normalizar_role(sup.role) != "supervisor":
+        raise HTTPException(400, "O usuário escolhido não tem a função de Supervisor")
+    return str(sup.usuario_id)
+
+
 @app.get("/usuarios")
-def listar_usuarios(auth: dict = Depends(exigir_gerente)):
-    """Tela de gerenciamento de usuários (somente gerente): lista os usuários
-    da conta com papel, status e um resumo da carteira de cada vendedor."""
+def listar_usuarios(auth: dict = Depends(exigir_gestor)):
+    """Lista de usuários com função, status, supervisor e resumo da carteira.
+
+    Gerente vê a conta inteira. Supervisor vê apenas ele mesmo e os vendedores
+    atribuídos a ele — nunca os vendedores de outro supervisor."""
     with engine.connect() as conn:
+        ids = escopo_vendedores(conn, auth)
+        filtro = "" if ids is None else "AND u.usuario_id = ANY(CAST(:ids AS uuid[]))"
+        params = {"cid": auth["conta_id"]}
+        if ids is not None:
+            params["ids"] = ids
         rows = conn.execute(
             text(
-                """
+                f"""
                 SELECT u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo, u.data_criacao,
+                       u.supervisor_id, s.nome AS supervisor_nome,
                        COUNT(e.empresa_id) AS total_empresas
                 FROM usuarios u
+                LEFT JOIN usuarios s ON s.usuario_id = u.supervisor_id
                 LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id
-                WHERE u.conta_id = :cid
-                GROUP BY u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo, u.data_criacao
+                WHERE u.conta_id = :cid {filtro}
+                GROUP BY u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo,
+                         u.data_criacao, u.supervisor_id, s.nome
                 ORDER BY u.role DESC, u.nome ASC
             """
             ),
-            {"cid": auth["conta_id"]},
+            params,
         )
         return [dict(r._mapping) for r in rows]
+
+
+@app.get("/equipe/estrutura")
+def estrutura_equipe(auth: dict = Depends(exigir_gestor)):
+    """Organograma da conta: gerentes, supervisores com seus vendedores e os
+    vendedores ainda sem supervisor.
+
+    O gerente recebe a estrutura inteira; o supervisor, só o próprio ramo."""
+    with engine.connect() as conn:
+        ids = escopo_vendedores(conn, auth)
+        filtro = "" if ids is None else "AND u.usuario_id = ANY(CAST(:ids AS uuid[]))"
+        params = {"cid": auth["conta_id"]}
+        if ids is not None:
+            params["ids"] = ids
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT u.usuario_id, u.nome, u.email, u.role, u.ativo, u.supervisor_id,
+                       COUNT(e.empresa_id) AS total_empresas
+                FROM usuarios u
+                LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id
+                WHERE u.conta_id = :cid {filtro}
+                GROUP BY u.usuario_id, u.nome, u.email, u.role, u.ativo, u.supervisor_id
+                ORDER BY u.nome ASC
+            """
+            ),
+            params,
+        ).fetchall()
+
+    def pessoa(r):
+        return {
+            "usuario_id": str(r.usuario_id),
+            "nome": r.nome,
+            "email": r.email,
+            "role": normalizar_role(r.role),
+            "funcao": ROTULO_FUNCAO[normalizar_role(r.role)],
+            "ativo": bool(r.ativo),
+            "supervisor_id": str(r.supervisor_id) if r.supervisor_id else None,
+            "total_empresas": int(r.total_empresas or 0),
+        }
+
+    pessoas = [pessoa(r) for r in rows]
+    supervisores = [p for p in pessoas if p["role"] == "supervisor"]
+    vendedores = [p for p in pessoas if p["role"] == "vendedor"]
+    return {
+        "gerentes": [p for p in pessoas if p["role"] == "gerente"],
+        "supervisores": [
+            {**s, "vendedores": [v for v in vendedores if v["supervisor_id"] == s["usuario_id"]]}
+            for s in supervisores
+        ],
+        # Vendedores órfãos: existem de propósito (remover vínculo não apaga usuário).
+        "sem_supervisor": [
+            v for v in vendedores
+            if not v["supervisor_id"]
+            or v["supervisor_id"] not in {s["usuario_id"] for s in supervisores}
+        ],
+    }
 
 
 @app.post("/usuarios", status_code=201)
 async def criar_usuario(usuario: UsuarioCreate, auth: dict = Depends(exigir_gerente)):
     """Gerente adiciona um novo usuário (vendedor por padrão) já vinculado à sua
-    conta. O usuário recebe email de ativação para criar a senha e então loga."""
+    conta, opcionalmente já atribuído a um supervisor. O usuário recebe email de
+    ativação para criar a senha e então loga."""
     token_ativacao = str(uuid.uuid4())
-    role = "gerente" if (usuario.role or "").lower() == "gerente" else "vendedor"
+    role = normalizar_role(usuario.role)
+    novo_id = str(uuid.uuid4())
     try:
         with engine.begin() as conn:
+            supervisor_id = None
+            if usuario.supervisor_id:
+                if role != "vendedor":
+                    raise HTTPException(400, "Só vendedores podem ser atribuídos a um supervisor")
+                supervisor_id = _validar_supervisor(conn, usuario.supervisor_id, novo_id, auth["conta_id"])
             conn.execute(
                 text(
                     """
                 INSERT INTO usuarios (usuario_id, nome, email, telefone, ativo, token_ativacao,
-                    conta_id, role, data_criacao)
+                    conta_id, role, supervisor_id, data_criacao)
                 VALUES (:usuario_id, :nome, :email, :telefone, FALSE, :token,
-                    :conta_id, :role, NOW())
+                    :conta_id, :role, :supervisor_id, NOW())
             """
                 ),
                 {
-                    "usuario_id": str(uuid.uuid4()),
+                    "usuario_id": novo_id,
                     "nome": usuario.nome,
                     "email": usuario.email,
                     "telefone": usuario.telefone,
                     "token": token_ativacao,
                     "conta_id": auth["conta_id"],
                     "role": role,
+                    "supervisor_id": supervisor_id,
                 },
             )
         await enviar_email(usuario.email, token_ativacao)
@@ -4311,8 +4509,11 @@ async def criar_usuario(usuario: UsuarioCreate, auth: dict = Depends(exigir_gere
 
 @app.patch("/usuarios/{usuario_id}")
 def gerenciar_usuario(usuario_id: str, dados: UsuarioGerenciar, auth: dict = Depends(exigir_gerente)):
-    """Gerente ativa/desativa um usuário ou altera o papel (vendedor/gerente),
-    sempre dentro da própria conta. Não pode rebaixar a si mesmo."""
+    """Gerente ativa/desativa um usuário, altera a função (vendedor/supervisor/
+    gerente) e atribui ou remove o vínculo com um supervisor — sempre dentro da
+    própria conta. Não pode rebaixar a si mesmo.
+
+    Remover o vínculo NUNCA apaga o usuário: só zera `supervisor_id`."""
     with engine.begin() as conn:
         alvo = conn.execute(
             text("SELECT usuario_id, conta_id, role FROM usuarios WHERE usuario_id = :id"),
@@ -4320,58 +4521,109 @@ def gerenciar_usuario(usuario_id: str, dados: UsuarioGerenciar, auth: dict = Dep
         ).fetchone()
         if not alvo or str(alvo.conta_id) != auth["conta_id"]:
             raise HTTPException(404, "Usuário não encontrado")
-        if usuario_id == auth["usuario_id"] and dados.role and dados.role != "gerente":
+
+        role_atual = normalizar_role(alvo.role)
+        nova_role = normalizar_role(dados.role, role_atual) if dados.role is not None else None
+        if usuario_id == auth["usuario_id"] and nova_role and nova_role != "gerente":
             raise HTTPException(400, "Você não pode rebaixar a si mesmo")
-        nova_role = None
-        if dados.role is not None:
-            nova_role = "gerente" if dados.role.lower() == "gerente" else "vendedor"
+
+        role_final = nova_role or role_atual
+
+        # Vínculo com supervisor
+        if dados.limpar_supervisor:
+            novo_supervisor = None
+            mexeu_no_vinculo = True
+        elif dados.supervisor_id:
+            if role_final != "vendedor":
+                raise HTTPException(400, "Só vendedores podem ser atribuídos a um supervisor")
+            novo_supervisor = _validar_supervisor(conn, dados.supervisor_id, usuario_id, auth["conta_id"])
+            mexeu_no_vinculo = True
+        else:
+            novo_supervisor = None
+            mexeu_no_vinculo = False
+
+        # Quem deixa de ser vendedor não pode continuar pendurado num supervisor.
+        if nova_role and nova_role != "vendedor":
+            novo_supervisor = None
+            mexeu_no_vinculo = True
+
         conn.execute(
             text(
-                """
+                f"""
                 UPDATE usuarios SET
                     ativo = COALESCE(:ativo, ativo),
                     role  = COALESCE(:role, role)
+                    {", supervisor_id = :supervisor_id" if mexeu_no_vinculo else ""}
                 WHERE usuario_id = :id
             """
             ),
-            {"ativo": dados.ativo, "role": nova_role, "id": usuario_id},
+            {
+                "ativo": dados.ativo,
+                "role": nova_role,
+                "id": usuario_id,
+                **({"supervisor_id": novo_supervisor} if mexeu_no_vinculo else {}),
+            },
         )
-    return {"msg": "Usuário atualizado com sucesso"}
+
+        # Supervisor que perde a função deixaria vendedores apontando para alguém
+        # que não é mais supervisor — desvincula em vez de deixar inconsistente.
+        soltos = 0
+        if role_atual == "supervisor" and nova_role and nova_role != "supervisor":
+            soltos = conn.execute(
+                text("UPDATE usuarios SET supervisor_id = NULL WHERE supervisor_id = :id"),
+                {"id": usuario_id},
+            ).rowcount or 0
+
+    msg = "Usuário atualizado com sucesso"
+    if soltos:
+        msg += f". {soltos} vendedor(es) ficaram sem supervisor."
+    return {"msg": msg, "vendedores_desvinculados": soltos}
 
 
 @app.get("/gerencia/dashboard")
-def dashboard_gerente(auth: dict = Depends(exigir_gerente)):
-    """Visão geral da conta para o gerente: totais e desempenho por vendedor
-    (empresas, distribuição por status e ticket estimado)."""
+def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
+    """Visão geral para gerente e supervisor: totais e desempenho por vendedor
+    (empresas, distribuição por status e ticket estimado).
+
+    O gerente vê a conta inteira; o supervisor, apenas os vendedores atribuídos
+    a ele — o recorte é feito aqui, não no frontend."""
     cid = auth["conta_id"]
     with engine.begin() as conn:
         garantir_campos_pipeline(conn)
 
+        # Mesmo escopo usado em /empresas: gerente = conta toda, supervisor = equipe.
+        trecho, params = filtro_escopo(conn, auth)
+        ids = escopo_vendedores(conn, auth)
+        filtro_usuarios = "" if ids is None else "AND u.usuario_id = ANY(CAST(:vids AS uuid[]))"
+
         totais = conn.execute(
             text(
-                """
+                f"""
                 SELECT
                     COUNT(*) AS total_empresas,
                     COUNT(*) FILTER (WHERE status = 'Ganho') AS ganhos,
                     COUNT(*) FILTER (WHERE status = 'Perdido') AS perdidos,
                     COUNT(*) FILTER (WHERE status_cadastro = 'rascunho') AS rascunhos,
                     COALESCE(SUM(ticket_medio_estimado), 0) AS ticket_total
-                FROM empresas WHERE conta_id = :cid
+                FROM empresas WHERE conta_id = :cid {trecho}
             """
             ),
-            {"cid": cid},
+            params,
         ).fetchone()
 
         total_vendedores = conn.execute(
-            text("SELECT COUNT(*) FROM usuarios WHERE conta_id = :cid AND role = 'vendedor'"),
-            {"cid": cid},
+            text(
+                f"""SELECT COUNT(*) FROM usuarios u
+                    WHERE u.conta_id = :cid AND u.role = 'vendedor' {filtro_usuarios}"""
+            ),
+            params,
         ).scalar()
 
         # Desempenho por vendedor
         por_vendedor = conn.execute(
             text(
-                """
-                SELECT u.usuario_id, u.nome, u.email, u.ativo,
+                f"""
+                SELECT u.usuario_id, u.nome, u.email, u.ativo, u.supervisor_id,
                        COUNT(e.empresa_id) AS total_empresas,
                        COUNT(e.empresa_id) FILTER (WHERE e.status = 'Ganho') AS ganhos,
                        COUNT(e.empresa_id) FILTER (WHERE e.status = 'Perdido') AS perdidos,
@@ -4380,25 +4632,25 @@ def dashboard_gerente(auth: dict = Depends(exigir_gerente)):
                        MAX(e.status_atualizado_em) AS ultima_atividade
                 FROM usuarios u
                 LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id AND e.conta_id = :cid
-                WHERE u.conta_id = :cid AND u.role = 'vendedor'
-                GROUP BY u.usuario_id, u.nome, u.email, u.ativo
+                WHERE u.conta_id = :cid AND u.role = 'vendedor' {filtro_usuarios}
+                GROUP BY u.usuario_id, u.nome, u.email, u.ativo, u.supervisor_id
                 ORDER BY total_empresas DESC, u.nome ASC
             """
             ),
-            {"cid": cid},
+            params,
         )
         vendedores = [dict(r._mapping) for r in por_vendedor]
 
-        # Distribuição por status (conta inteira)
+        # Distribuição por status (dentro do escopo do solicitante)
         por_status = conn.execute(
             text(
-                """
+                f"""
                 SELECT COALESCE(status, 'Sem status') AS status, COUNT(*) AS total
-                FROM empresas WHERE conta_id = :cid
+                FROM empresas WHERE conta_id = :cid {trecho}
                 GROUP BY status ORDER BY total DESC
             """
             ),
-            {"cid": cid},
+            params,
         )
         distribuicao_status = [dict(r._mapping) for r in por_status]
 
@@ -4750,14 +5002,11 @@ def listar_auditoria(auth: dict = Depends(exigir_gerente), limite: int = 200):
 # =========================
 # VENDAS: EQUIPAMENTOS
 # =========================
-def _escopo_vendas(auth: dict, alias: str = "o"):
-    """Vendedor enxerga só o que é dele; gerente enxerga tudo da conta."""
-    if auth["is_gerente"]:
-        return f"{alias}.conta_id = :cid", {"cid": auth["conta_id"]}
-    return (
-        f"{alias}.conta_id = :cid AND {alias}.vendedor_id = :vid",
-        {"cid": auth["conta_id"], "vid": auth["usuario_id"]},
-    )
+def _escopo_vendas(conn, auth: dict, alias: str = "o"):
+    """Vendedor enxerga só o que é dele; supervisor, o da própria equipe;
+    gerente, tudo da conta."""
+    trecho, params = filtro_escopo(conn, auth, prefixo=f"{alias}.")
+    return f"{alias}.conta_id = :cid {trecho}", params
 
 
 @app.get("/equipamentos")
@@ -4768,7 +5017,8 @@ def listar_equipamentos(auth: dict = Depends(get_auth), incluir_inativos: bool =
         filtro = "" if incluir_inativos else " AND ativo = TRUE"
         rows = conn.execute(
             text(
-                f"""SELECT equipamento_id, nome, descricao, preco_base, ativo, criado_em
+                f"""SELECT equipamento_id, codigo, nome, descricao, preco_base,
+                           COALESCE(quantidade, 0) AS quantidade, ativo, criado_em
                     FROM equipamentos WHERE conta_id = :cid{filtro} ORDER BY nome ASC"""
             ),
             {"cid": auth["conta_id"]},
@@ -4783,13 +5033,25 @@ def criar_equipamento(dados: EquipamentoCreate, auth: dict = Depends(get_auth)):
         raise HTTPException(400, "Nome do equipamento é obrigatório")
     with engine.begin() as conn:
         garantir_vendas(conn)
+        codigo = (dados.codigo or "").strip() or None
+        if codigo:
+            ja_existe = conn.execute(
+                text("SELECT 1 FROM equipamentos WHERE conta_id = :cid AND lower(codigo) = lower(:c)"),
+                {"cid": auth["conta_id"], "c": codigo},
+            ).fetchone()
+            if ja_existe:
+                raise HTTPException(400, f"Já existe um item com o código '{codigo}'")
         row = conn.execute(
             text(
-                """INSERT INTO equipamentos (conta_id, nome, descricao, preco_base)
-                   VALUES (:cid, :n, :d, :p)
-                   RETURNING equipamento_id, nome, descricao, preco_base, ativo, criado_em"""
+                """INSERT INTO equipamentos (conta_id, codigo, nome, descricao, preco_base, quantidade)
+                   VALUES (:cid, :c, :n, :d, :p, :q)
+                   RETURNING equipamento_id, codigo, nome, descricao, preco_base,
+                             COALESCE(quantidade, 0) AS quantidade, ativo, criado_em"""
             ),
-            {"cid": auth["conta_id"], "n": nome, "d": dados.descricao, "p": dados.preco_base or 0},
+            {
+                "cid": auth["conta_id"], "c": codigo, "n": nome, "d": dados.descricao,
+                "p": dados.preco_base or 0, "q": dados.quantidade or 0,
+            },
         ).fetchone()
         return dict(row._mapping)
 
@@ -4807,7 +5069,8 @@ def atualizar_equipamento(equipamento_id: str, dados: EquipamentoUpdate, auth: d
             text(
                 f"""UPDATE equipamentos SET {sets}
                     WHERE equipamento_id = :eid AND conta_id = :cid
-                    RETURNING equipamento_id, nome, descricao, preco_base, ativo, criado_em"""
+                    RETURNING equipamento_id, codigo, nome, descricao, preco_base,
+                              COALESCE(quantidade, 0) AS quantidade, ativo, criado_em"""
             ),
             params,
         ).fetchone()
@@ -4831,6 +5094,387 @@ def desativar_equipamento(equipamento_id: str, auth: dict = Depends(get_auth)):
         if not row:
             raise HTTPException(404, "Equipamento não encontrado")
         return {"msg": "Equipamento desativado"}
+
+
+# =========================
+# VENDAS: IMPORTAÇÃO DE CATÁLOGO/ESTOQUE (EXCEL)
+# =========================
+# O mapeamento é SEMPRE por nome de cabeçalho, nunca por posição da coluna:
+# se o usuário reorganizar as colunas no Excel, o preço continua indo para
+# preço e a quantidade para quantidade.
+CAMPOS_IMPORTACAO = [
+    # (campo, obrigatório, rótulo no modelo, sinônimos aceitos no cabeçalho)
+    ("codigo",     False, "Código",            ["codigo", "code", "sku", "referencia", "ref", "id", "identificador"]),
+    ("nome",       True,  "Nome",              ["nome", "item", "produto", "equipamento", "titulo"]),
+    ("descricao",  False, "Descrição",         ["descricao", "detalhe", "detalhes", "observacao", "observacoes"]),
+    ("quantidade", False, "Quantidade",        ["quantidade", "qtd", "qtde", "estoque", "saldo"]),
+    ("preco_base", True,  "Preço unitário",    ["preco unitario", "preco", "valor unitario", "valor",
+                                                "preco base", "preco de venda", "unitario"]),
+]
+CAMPOS_OBRIGATORIOS = [c for c, obrig, _, _ in CAMPOS_IMPORTACAO if obrig]
+ROTULOS_IMPORTACAO = {c: r for c, _, r, _ in CAMPOS_IMPORTACAO}
+LIMITE_LINHAS_IMPORTACAO = 5000
+
+
+def _normalizar_cabecalho(valor) -> str:
+    """'Preço Unitário (R$)' → 'preco unitario'. Tira acento, caixa, pontuação
+    e o que estiver entre parênteses, para casar cabeçalhos escritos à mão."""
+    txt = str(valor or "").strip()
+    txt = re.sub(r"\(.*?\)", " ", txt)
+    txt = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode()
+    txt = re.sub(r"[^a-zA-Z0-9]+", " ", txt).strip().lower()
+    return re.sub(r"\s+", " ", txt)
+
+
+# Palavras de enfeite que aparecem no cabeçalho sem mudar o significado:
+# "Nome do item" é a mesma coluna que "Nome".
+_RUIDO_CABECALHO = {"do", "da", "de", "dos", "das", "o", "a", "em", "por",
+                    "item", "itens", "produto", "produtos", "equipamento", "equipamentos"}
+
+
+def _cabecalho_sem_ruido(titulo: str) -> str:
+    restante = [t for t in titulo.split() if t not in _RUIDO_CABECALHO]
+    return " ".join(restante)
+
+
+def _mapear_colunas(cabecalho: list) -> tuple[dict, list]:
+    """Descobre em que índice cada campo está, pelo NOME do cabeçalho.
+
+    Duas passadas: primeiro casamento exato com os sinônimos, depois o mesmo
+    casamento ignorando palavras de enfeite ("Nome do item" → "nome"). Nunca é
+    aproximado por prefixo: "Valor total" não vira "Valor unitário por engano.
+    Devolve ({campo: indice}, faltando)."""
+    normalizados = [_normalizar_cabecalho(c) for c in cabecalho]
+    mapa: dict = {}
+    for chave in ("exato", "sem_ruido"):
+        for campo, _obrig, _rotulo, sinonimos in CAMPOS_IMPORTACAO:
+            if campo in mapa:
+                continue
+            for idx, titulo in enumerate(normalizados):
+                if not titulo or idx in mapa.values():
+                    continue
+                candidato = titulo if chave == "exato" else _cabecalho_sem_ruido(titulo)
+                if candidato in sinonimos:
+                    mapa[campo] = idx
+                    break
+    faltando = [ROTULOS_IMPORTACAO[c] for c in CAMPOS_OBRIGATORIOS if c not in mapa]
+    return mapa, faltando
+
+
+def _num_br(valor):
+    """Aceita 1.234,56 (pt-BR), 1234.56 (en) e números vindos do próprio Excel."""
+    if valor is None or (isinstance(valor, str) and not valor.strip()):
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    txt = str(valor).strip()
+    txt = re.sub(r"[R$\s ]", "", txt, flags=re.IGNORECASE)
+    if "," in txt and "." in txt:            # 1.234,56 → 1234.56
+        txt = txt.replace(".", "").replace(",", ".")
+    elif "," in txt:                          # 12,50 → 12.50
+        txt = txt.replace(",", ".")
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+def _ler_planilha(conteudo: bytes) -> list:
+    try:
+        import openpyxl
+    except ImportError:
+        raise HTTPException(503, "Leitura de Excel indisponível no servidor (openpyxl ausente)")
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(conteudo), data_only=True, read_only=True)
+    except Exception:
+        raise HTTPException(400, "Arquivo inválido: envie uma planilha .xlsx")
+    linhas = [list(l) for l in wb[wb.sheetnames[0]].iter_rows(values_only=True)]
+    wb.close()
+    return linhas
+
+
+def _analisar_planilha(conteudo: bytes, existentes: dict) -> dict:
+    """Valida a planilha inteira ANTES de qualquer escrita e devolve a prévia.
+
+    `existentes` mapeia a chave de duplicidade (código, ou nome quando não há
+    código) para o item já cadastrado — é o que decide criar x atualizar."""
+    linhas = _ler_planilha(conteudo)
+    if not linhas:
+        raise HTTPException(400, "A planilha está vazia")
+
+    # A primeira linha não-vazia é o cabeçalho (tolera título/logo acima dela).
+    idx_cab, cabecalho = None, None
+    for i, linha in enumerate(linhas[:10]):
+        mapa_teste, _ = _mapear_colunas(linha)
+        if "nome" in mapa_teste:
+            idx_cab, cabecalho = i, linha
+            break
+    if cabecalho is None:
+        idx_cab, cabecalho = 0, linhas[0]
+
+    mapa, faltando = _mapear_colunas(cabecalho)
+    if faltando:
+        encontradas = [str(c).strip() for c in cabecalho if c is not None and str(c).strip()]
+        raise HTTPException(
+            400,
+            "Coluna obrigatória ausente: " + ", ".join(faltando)
+            + ". Cabeçalhos encontrados: " + (", ".join(encontradas) or "nenhum")
+            + ". Baixe o modelo de importação para conferir os nomes esperados.",
+        )
+
+    def celula(linha, campo):
+        idx = mapa.get(campo)
+        if idx is None or idx >= len(linha):
+            return None
+        v = linha[idx]
+        return v.strip() if isinstance(v, str) else v
+
+    validos, erros, vistos = [], [], {}
+    corpo = linhas[idx_cab + 1:]
+    if len(corpo) > LIMITE_LINHAS_IMPORTACAO:
+        raise HTTPException(400, f"A planilha tem mais de {LIMITE_LINHAS_IMPORTACAO} linhas. Divida o arquivo.")
+
+    for offset, linha in enumerate(corpo):
+        num = idx_cab + 2 + offset  # número da linha como o usuário vê no Excel
+        if not any(str(c).strip() for c in linha if c is not None):
+            continue  # linha em branco: ignora em silêncio
+
+        problemas = []
+        nome = celula(linha, "nome")
+        nome = str(nome).strip() if nome is not None else ""
+        if not nome:
+            problemas.append(f"Linha {num} - {ROTULOS_IMPORTACAO['nome']}: obrigatório e está vazio.")
+
+        bruto_preco = celula(linha, "preco_base")
+        preco = _num_br(bruto_preco)
+        if preco is None:
+            problemas.append(
+                f"Linha {num} - {ROTULOS_IMPORTACAO['preco_base']}: valor \"{bruto_preco}\" não é numérico."
+            )
+        elif preco < 0:
+            problemas.append(f"Linha {num} - {ROTULOS_IMPORTACAO['preco_base']}: não pode ser negativo.")
+
+        bruto_qtd = celula(linha, "quantidade")
+        if bruto_qtd is None or (isinstance(bruto_qtd, str) and not bruto_qtd.strip()):
+            quantidade = 0
+        else:
+            n = _num_br(bruto_qtd)
+            if n is None:
+                problemas.append(
+                    f"Linha {num} - {ROTULOS_IMPORTACAO['quantidade']}: valor \"{bruto_qtd}\" não é numérico."
+                )
+                quantidade = 0
+            elif n < 0:
+                problemas.append(f"Linha {num} - {ROTULOS_IMPORTACAO['quantidade']}: não pode ser negativa.")
+                quantidade = 0
+            else:
+                quantidade = int(round(n))
+
+        codigo = celula(linha, "codigo")
+        codigo = str(codigo).strip() if codigo not in (None, "") else None
+        if isinstance(codigo, str) and codigo.endswith(".0") and codigo[:-2].isdigit():
+            codigo = codigo[:-2]  # Excel devolve código numérico como 1234.0
+
+        descricao = celula(linha, "descricao")
+        descricao = str(descricao).strip() if descricao not in (None, "") else None
+
+        chave = f"cod:{codigo.lower()}" if codigo else f"nome:{nome.lower()}"
+        if chave in vistos:
+            problemas.append(
+                f"Linha {num} - {ROTULOS_IMPORTACAO['codigo'] if codigo else ROTULOS_IMPORTACAO['nome']}: "
+                f"repetido na linha {vistos[chave]} do próprio arquivo."
+            )
+
+        if problemas:
+            erros.extend(problemas)
+            continue
+
+        vistos[chave] = num
+        ja_existe = existentes.get(chave)
+        validos.append({
+            "linha": num,
+            "codigo": codigo,
+            "nome": nome,
+            "descricao": descricao,
+            "quantidade": quantidade,
+            "preco_base": round(preco, 2),
+            "acao": "atualizar" if ja_existe else "criar",
+            "equipamento_id": ja_existe,
+        })
+
+    return {
+        "colunas_reconhecidas": {ROTULOS_IMPORTACAO[c]: int(i) for c, i in mapa.items()},
+        "linha_cabecalho": idx_cab + 1,
+        "total_linhas": len([l for l in corpo if any(str(c).strip() for c in l if c is not None)]),
+        "validos": validos,
+        "erros": erros,
+        "resumo": {
+            "validos": len(validos),
+            "com_erro": len(erros),
+            "criar": sum(1 for v in validos if v["acao"] == "criar"),
+            "atualizar": sum(1 for v in validos if v["acao"] == "atualizar"),
+        },
+    }
+
+
+def _catalogo_existente(conn, conta_id: str) -> dict:
+    """Chaves de duplicidade do catálogo atual → equipamento_id.
+    Prioriza o código (SKU); só cai no nome quando o item não tem código."""
+    rows = conn.execute(
+        text("SELECT equipamento_id, codigo, nome FROM equipamentos WHERE conta_id = :cid"),
+        {"cid": conta_id},
+    ).fetchall()
+    mapa = {}
+    for r in rows:
+        if r.codigo:
+            mapa[f"cod:{str(r.codigo).strip().lower()}"] = str(r.equipamento_id)
+        else:
+            mapa.setdefault(f"nome:{(r.nome or '').strip().lower()}", str(r.equipamento_id))
+    return mapa
+
+
+@app.get("/equipamentos/modelo-importacao")
+def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
+    """Modelo .xlsx gerado a partir dos campos reais do catálogo, com uma linha
+    de exemplo. É o arquivo que o usuário preenche e devolve na importação."""
+    try:
+        import openpyxl
+    except ImportError:
+        raise HTTPException(503, "Geração de Excel indisponível no servidor (openpyxl ausente)")
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Catálogo"
+    cabecalhos = [ROTULOS_IMPORTACAO[c] for c, _, _, _ in CAMPOS_IMPORTACAO]
+    ws.append(cabecalhos)
+    for i, _ in enumerate(cabecalhos, start=1):
+        cel = ws.cell(row=1, column=i)
+        cel.font = Font(bold=True, color="FFFFFF")
+        cel.fill = PatternFill("solid", fgColor="2980B9")
+        cel.alignment = Alignment(horizontal="center")
+        ws.column_dimensions[cel.column_letter].width = 26
+    ws.append(["EQ-001", "Gerador 15 kVA", "Gerador a diesel silenciado", 3, 1250.00])
+    ws.freeze_panes = "A2"
+
+    ajuda = wb.create_sheet("Instruções")
+    for linha in [
+        ["Como importar"],
+        [""],
+        ["1. Preencha uma linha por item, a partir da linha 2 da aba 'Catálogo'."],
+        ["2. As colunas são reconhecidas PELO NOME do cabeçalho, não pela posição."],
+        ["   Você pode reordenar as colunas à vontade — não deixe de renomear o cabeçalho."],
+        ["3. Colunas obrigatórias: " + ", ".join(ROTULOS_IMPORTACAO[c] for c in CAMPOS_OBRIGATORIOS) + "."],
+        ["4. Código (SKU) é opcional, mas é ele que identifica o item numa reimportação:"],
+        ["   mesmo código = atualiza o item existente; código novo = cria."],
+        ["   Sem código, a identificação cai para o Nome do item."],
+        ["5. Preço aceita 1.234,56 ou 1234.56. Quantidade deve ser um número inteiro."],
+        ["6. Linhas em branco são ignoradas."],
+    ]:
+        ajuda.append(linha)
+    ajuda["A1"].font = Font(bold=True, size=13)
+    ajuda.column_dimensions["A"].width = 95
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="modelo-catalogo-prospectageo.xlsx"'},
+    )
+
+
+@app.post("/equipamentos/importar")
+async def importar_equipamentos(
+    arquivo: UploadFile = File(...),
+    confirmar: bool = False,
+    auth: dict = Depends(get_auth),
+):
+    """Importa catálogo/estoque de um .xlsx.
+
+    Dois passos, com o MESMO arquivo:
+    - `confirmar=false` (padrão): só valida e devolve a prévia. Nada é gravado.
+    - `confirmar=true`: grava tudo dentro de uma única transação. Se qualquer
+      linha falhar, nada é salvo — não existe meia-importação silenciosa.
+
+    Com erros de validação e `confirmar=true`, a gravação é recusada (400) e o
+    usuário recebe a lista de problemas por linha/coluna."""
+    nome_arq = (arquivo.filename or "").lower()
+    if not nome_arq.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(400, "Formato não suportado. Envie um arquivo .xlsx (Excel).")
+    conteudo = await arquivo.read()
+    if not conteudo:
+        raise HTTPException(400, "Arquivo vazio")
+    if len(conteudo) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Arquivo muito grande (máximo 5 MB)")
+
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        analise = _analisar_planilha(conteudo, _catalogo_existente(conn, auth["conta_id"]))
+
+        if not confirmar:
+            analise["gravado"] = False
+            # Na prévia devolvemos no máximo 50 linhas — o resumo tem os números completos.
+            analise["validos"] = analise["validos"][:50]
+            analise["erros"] = analise["erros"][:50]
+            return analise
+
+        if analise["erros"]:
+            raise HTTPException(
+                400,
+                "A planilha tem linhas inválidas. Corrija antes de importar: "
+                + " | ".join(analise["erros"][:5])
+                + (" ..." if len(analise["erros"]) > 5 else ""),
+            )
+        if not analise["validos"]:
+            raise HTTPException(400, "Nenhuma linha válida para importar.")
+
+        criados = atualizados = 0
+        for item in analise["validos"]:
+            if item["equipamento_id"]:
+                conn.execute(
+                    text(
+                        """UPDATE equipamentos SET
+                               nome = :n,
+                               codigo = COALESCE(:c, codigo),
+                               descricao = COALESCE(:d, descricao),
+                               preco_base = :p,
+                               quantidade = :q,
+                               ativo = TRUE
+                           WHERE equipamento_id = :eid AND conta_id = :cid"""
+                    ),
+                    {
+                        "n": item["nome"], "c": item["codigo"], "d": item["descricao"],
+                        "p": item["preco_base"], "q": item["quantidade"],
+                        "eid": item["equipamento_id"], "cid": auth["conta_id"],
+                    },
+                )
+                atualizados += 1
+            else:
+                conn.execute(
+                    text(
+                        """INSERT INTO equipamentos (conta_id, codigo, nome, descricao, preco_base, quantidade)
+                           VALUES (:cid, :c, :n, :d, :p, :q)"""
+                    ),
+                    {
+                        "cid": auth["conta_id"], "c": item["codigo"], "n": item["nome"],
+                        "d": item["descricao"], "p": item["preco_base"], "q": item["quantidade"],
+                    },
+                )
+                criados += 1
+
+        registrar_auditoria(
+            usuario=auth, acao="CATALOGO_IMPORTADO", recurso="equipamentos",
+            quantidade=criados + atualizados, conn=conn,
+        )
+
+    return {
+        "gravado": True,
+        "criados": criados,
+        "atualizados": atualizados,
+        "total": criados + atualizados,
+        "resumo": analise["resumo"],
+    }
 
 
 # =========================
@@ -4878,7 +5522,7 @@ def _regravar_itens(conn, orcamento_id: str, itens: list) -> float:
 
 def _orcamento_do_usuario(conn, orcamento_id: str, auth: dict):
     """Carrega o orçamento respeitando a carteira. 404 se não for visível."""
-    escopo, params = _escopo_vendas(auth)
+    escopo, params = _escopo_vendas(conn, auth)
     row = conn.execute(
         text(f"SELECT * FROM orcamentos o WHERE o.orcamento_id = :oid AND {escopo}"),
         {**params, "oid": orcamento_id},
@@ -4894,7 +5538,7 @@ def listar_orcamentos(auth: dict = Depends(get_auth), status: Optional[str] = No
     """Lista orçamentos da carteira, com o nome da empresa já resolvido."""
     with engine.begin() as conn:
         garantir_vendas(conn)
-        escopo, params = _escopo_vendas(auth)
+        escopo, params = _escopo_vendas(conn, auth)
         if status:
             escopo += " AND o.status = :st"
             params["st"] = status
@@ -5113,7 +5757,7 @@ def insights_vendas(auth: dict = Depends(get_auth)):
     """Números do dashboard de vendas: funil por status, valores e ranking de equipamentos."""
     with engine.begin() as conn:
         garantir_vendas(conn)
-        escopo, params = _escopo_vendas(auth)
+        escopo, params = _escopo_vendas(conn, auth)
         por_status = conn.execute(
             text(
                 f"""SELECT status, COUNT(*) AS total, COALESCE(SUM(total),0) AS valor

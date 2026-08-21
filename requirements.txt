@@ -14,3 +14,5 @@ slowapi
 pyotp
 qrcode[pil]
 requests
+openpyxl
+python-multipart
