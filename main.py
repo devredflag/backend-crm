@@ -32,8 +32,27 @@ import json
 import asyncio
 import pyotp
 import requests as http_requests
+from urllib.parse import urlparse
 
-print("🔥 ENV DATABASE_URL:", os.getenv("DATABASE_URL"))
+
+def _url_sem_credencial(url: str | None) -> str:
+    """Host e banco da URL de conexão, sem usuário nem senha.
+
+    O boot loga a URL para dar uma pista rápida de "apontei pro banco certo?",
+    mas o log do serviço fica visível para todo mundo com acesso ao projeto no
+    Railway — e a senha do Postgres ia inteira para lá a cada deploy.
+    """
+    if not url:
+        return "(não definida)"
+    try:
+        partes = urlparse(url)
+        porta = f":{partes.port}" if partes.port else ""
+        return f"{partes.scheme}://{partes.hostname or '?'}{porta}{partes.path}"
+    except ValueError:
+        return "(formato inválido)"
+
+
+print("🔥 ENV DATABASE_URL:", _url_sem_credencial(os.getenv("DATABASE_URL")))
 
 # =========================
 # CONFIG
@@ -743,6 +762,7 @@ class EmpresaCreate(BaseModel):
     data_proxima_acao: date | None = None
     motivo_perdido: str | None = None
     temperatura: str | None = None
+    logo_url: str | None = None
     # snapshot do Google Places (vindos da tela de busca/prefill)
     google_place_id: str | None = None
     latitude: float | None = None
@@ -755,6 +775,7 @@ class EmpresaCreate(BaseModel):
 
 class EmpresaUpdate(BaseModel):
     nome: str | None = None
+    logo_url: str | None = None
     segmento: str | None = None
     porte: str | None = None
     cidade: str | None = None
@@ -1007,6 +1028,32 @@ def garantir_campos_pipeline(conn):
         )
     )
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS motivo_perdido text"))
+    # Logo da empresa. Guardada como data URL (o form reduz a imagem para 256px
+    # antes de enviar) porque o projeto nao tem bucket de arquivos.
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS logo_url text"))
+    # Data de entrada da empresa na base. Sem ela nao da para dizer quantos
+    # clientes existiam num mes passado -- status_atualizado_em so conta a
+    # ultima mudanca de status, e o historico so tem quem chegou a mudar.
+    # Sem DEFAULT de proposito: preencher as linhas antigas com a data da
+    # migration diria que todas nasceram hoje.
+    conn.execute(
+        text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS criado_em timestamp without time zone")
+    )
+    # Backfill unico: para quem ja mudou de status alguma vez, a primeira
+    # entrada do historico e a melhor aproximacao que existe. Quem nunca mudou
+    # fica NULL, e o grafico simplesmente nao conta essa empresa no passado.
+    conn.execute(
+        text(
+            """
+        UPDATE empresas e SET criado_em = h.primeiro
+        FROM (
+            SELECT empresa_id, MIN(alterado_em) AS primeiro
+            FROM empresa_status_historico GROUP BY empresa_id
+        ) h
+        WHERE h.empresa_id = e.empresa_id AND e.criado_em IS NULL
+    """
+        )
+    )
     conn.execute(
         text(
             """
@@ -4161,12 +4208,12 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
             INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
                 observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
                 status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
-                motivo_perdido, temperatura, conta_id, vendedor_id,
+                motivo_perdido, temperatura, logo_url, criado_em, conta_id, vendedor_id,
                 google_place_id, latitude, longitude, google_rating, google_rating_count, business_status, google_synced_at)
             VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
                 :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
                 :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
-                :motivo_perdido, :temperatura, :conta_id, :vendedor_id,
+                :motivo_perdido, :temperatura, :logo_url, NOW(), :conta_id, :vendedor_id,
                 :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status, :google_synced_at)
         """
             ),
@@ -4195,6 +4242,7 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
                 "data_proxima_acao": empresa.data_proxima_acao,
                 "motivo_perdido": empresa.motivo_perdido,
                 "temperatura": empresa.temperatura,
+                "logo_url": empresa.logo_url,
                 "google_place_id": empresa.google_place_id,
                 "latitude": empresa.latitude,
                 "longitude": empresa.longitude,
@@ -4247,7 +4295,8 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 proxima_acao=COALESCE(:proxima_acao,proxima_acao), data_proxima_acao=:data_proxima_acao,
                 status_atualizado_em=CASE WHEN :status IS NOT NULL AND :status<>status THEN NOW() ELSE status_atualizado_em END,
                 motivo_perdido=CASE WHEN :status IS NOT NULL AND :status<>'Perdido' THEN NULL ELSE COALESCE(:motivo_perdido,motivo_perdido) END,
-                temperatura=COALESCE(:temperatura,temperatura)
+                temperatura=COALESCE(:temperatura,temperatura),
+                logo_url=COALESCE(:logo_url,logo_url)
             WHERE empresa_id=:id
         """
             ),
@@ -4275,6 +4324,7 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 "data_proxima_acao": empresa.data_proxima_acao,
                 "motivo_perdido": empresa.motivo_perdido,
                 "temperatura": empresa.temperatura,
+                "logo_url": empresa.logo_url,
             },
         )
         if status_mudou:
