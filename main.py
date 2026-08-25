@@ -746,6 +746,7 @@ class EmpresaCreate(BaseModel):
     porte: str | None = None
     cidade: str | None = None
     endereco: str | None = None
+    numero: str | None = None
     cep: str | None = None
     bairro: str | None = None
     regiao: str | None = None
@@ -780,6 +781,7 @@ class EmpresaUpdate(BaseModel):
     porte: str | None = None
     cidade: str | None = None
     endereco: str | None = None
+    numero: str | None = None
     cep: str | None = None
     bairro: str | None = None
     regiao: str | None = None
@@ -1031,6 +1033,9 @@ def garantir_campos_pipeline(conn):
     # Logo da empresa. Guardada como data URL (o form reduz a imagem para 256px
     # antes de enviar) porque o projeto nao tem bucket de arquivos.
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS logo_url text"))
+    # Numero do imovel separado da rua. Juntos no mesmo campo, o Nominatim nao
+    # resolve o endereco; separados, da para montar o "212 Rua X" que ele espera.
+    conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS numero text"))
     # Data de entrada da empresa na base. Sem ela nao da para dizer quantos
     # clientes existiam num mes passado -- status_atualizado_em so conta a
     # ultima mudanca de status, e o historico so tem quem chegou a mudar.
@@ -4064,19 +4069,24 @@ def _tentativas_nominatim(r) -> list[dict]:
     """
     rua = (r.endereco or "").strip()
     cidade = (r.cidade or "").strip()
+    numero = (getattr(r, "numero", None) or "").strip()
+
+    # Cadastro antigo guardava tudo junto ("Rua X, 212"). Com a coluna `numero`
+    # vazia, ainda vale tentar separar do proprio texto da rua.
+    if not numero:
+        m = _NUMERO_NO_FIM.search(rua)
+        if m:
+            numero = m.group(1)
+            rua = rua[: m.start()].strip()
+
     tentativas: list[dict] = []
 
     if rua and cidade:
-        # "Rua X, 212" -> "212 Rua X": o Nominatim espera o numero na frente.
-        m = _NUMERO_NO_FIM.search(rua)
-        if m:
-            street = f"{m.group(1)} {rua[: m.start()].strip()}"
-        else:
-            street = rua
-        tentativas.append({"street": street, "city": cidade, "country": "Brasil"})
-        if m:
-            # sem o numero: se o predio nao existe no OSM, a rua costuma existir
-            tentativas.append({"street": rua[: m.start()].strip(), "city": cidade, "country": "Brasil"})
+        if numero:
+            # O Nominatim espera o numero na frente: "212 Rua X".
+            tentativas.append({"street": f"{numero} {rua}", "city": cidade, "country": "Brasil"})
+        # sem o numero: se o predio nao existe no OSM, a rua costuma existir
+        tentativas.append({"street": rua, "city": cidade, "country": "Brasil"})
 
     if cidade:
         tentativas.append({"city": cidade, "country": "Brasil"})
@@ -4095,7 +4105,7 @@ async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(g
         rows = conn.execute(
             text(
                 f"""
-                SELECT empresa_id, endereco, bairro, cidade, cep
+                SELECT empresa_id, endereco, numero, bairro, cidade, cep
                 FROM empresas
                 WHERE {_SQL_SEM_COORD}
                 ORDER BY status_atualizado_em DESC NULLS LAST
@@ -4244,12 +4254,12 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
         conn.execute(
             text(
                 """
-            INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, cep, bairro, regiao,
+            INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, numero, cep, bairro, regiao,
                 observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
                 status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
                 motivo_perdido, temperatura, logo_url, criado_em, conta_id, vendedor_id,
                 google_place_id, latitude, longitude, google_rating, google_rating_count, business_status, google_synced_at)
-            VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :cep, :bairro, :regiao,
+            VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :numero, :cep, :bairro, :regiao,
                 :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
                 :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
                 :motivo_perdido, :temperatura, :logo_url, NOW(), :conta_id, :vendedor_id,
@@ -4263,6 +4273,7 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
                 "porte": empresa.porte,
                 "cidade": empresa.cidade,
                 "endereco": empresa.endereco,
+                "numero": empresa.numero,
                 "cep": empresa.cep,
                 "bairro": empresa.bairro,
                 "regiao": empresa.regiao,
@@ -4323,6 +4334,7 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 """
             UPDATE empresas SET nome=COALESCE(:nome,nome), segmento=COALESCE(:segmento,segmento),
                 porte=COALESCE(:porte,porte), cidade=COALESCE(:cidade,cidade), endereco=COALESCE(:endereco,endereco),
+                numero=COALESCE(:numero,numero),
                 cep=COALESCE(:cep,cep), bairro=COALESCE(:bairro,bairro), regiao=COALESCE(:regiao,regiao),
                 observacoes=COALESCE(:observacoes,observacoes), cnpj=COALESCE(:cnpj,cnpj), site=COALESCE(:site,site),
                 linkedin_empresa=COALESCE(:linkedin_empresa,linkedin_empresa),
@@ -4346,6 +4358,7 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 "porte": empresa.porte,
                 "cidade": empresa.cidade,
                 "endereco": empresa.endereco,
+                "numero": empresa.numero,
                 "cep": empresa.cep,
                 "bairro": empresa.bairro,
                 "regiao": empresa.regiao,
