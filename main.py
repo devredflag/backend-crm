@@ -4044,6 +4044,46 @@ _SQL_SEM_COORD = """
 """
 
 
+_NUMERO_NO_FIM = re.compile(r",\s*(\d+[A-Za-z]?)\s*$")
+
+
+def _tentativas_nominatim(r) -> list[dict]:
+    """Consultas do mais preciso ao mais generico, para tentar em cascata.
+
+    A consulta livre (`q=rua, numero, bairro, cidade, cep, Brasil`) nao resolve
+    endereco brasileiro: o Nominatim devolve vazio ate para uma rua que ele tem
+    cadastrada. Medido com "Rua Benedito Gomes do Nascimento, 212, Nova Morada,
+    Almirante Tamandare, 83504-680" -- sem resultado na consulta livre, ponto
+    exato na estruturada.
+
+    O `postalcode` fica de fora de proposito: sozinho nao acha CEP brasileiro e,
+    somado aos outros campos, zera o resultado.
+
+    A cidade sozinha e o ultimo recurso. Para "empresas num raio de X km" o
+    centro da cidade ja e util -- melhor que a empresa sumir do mapa.
+    """
+    rua = (r.endereco or "").strip()
+    cidade = (r.cidade or "").strip()
+    tentativas: list[dict] = []
+
+    if rua and cidade:
+        # "Rua X, 212" -> "212 Rua X": o Nominatim espera o numero na frente.
+        m = _NUMERO_NO_FIM.search(rua)
+        if m:
+            street = f"{m.group(1)} {rua[: m.start()].strip()}"
+        else:
+            street = rua
+        tentativas.append({"street": street, "city": cidade, "country": "Brasil"})
+        if m:
+            # sem o numero: se o predio nao existe no OSM, a rua costuma existir
+            tentativas.append({"street": rua[: m.start()].strip(), "city": cidade, "country": "Brasil"})
+
+    if cidade:
+        tentativas.append({"city": cidade, "country": "Brasil"})
+
+    return tentativas
+
+
 @app.post("/empresas/geocodificar")
 async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(get_current_user)):
     """Backfill de coordenadas (custo zero) via Nominatim/OpenStreetMap a partir do
@@ -4069,37 +4109,36 @@ async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(g
     falharam = 0
     headers = {"User-Agent": "CRM-Prospeccao/1.0 (https://frontend-crm-xi-plum.vercel.app)"}
     async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-        for i, r in enumerate(rows):
-            if i > 0:
-                await asyncio.sleep(1.1)  # política do Nominatim
-            partes = [r.endereco, r.bairro, r.cidade, r.cep]
-            q = ", ".join([p.strip() for p in partes if p and p.strip()])
-            if not q:
+        primeira = True
+        for r in rows:
+            coord = None
+            for params in _tentativas_nominatim(r):
+                if not primeira:
+                    await asyncio.sleep(1.1)  # política do Nominatim: <=1 req/seg
+                primeira = False
+                try:
+                    resp = await client.get(
+                        "https://nominatim.openstreetmap.org/search",
+                        params={"format": "json", "limit": 1, "countrycodes": "br", **params},
+                    )
+                    data = resp.json() if resp.status_code == 200 else []
+                except Exception:
+                    data = []
+                if data:
+                    try:
+                        coord = (float(data[0]["lat"]), float(data[0]["lon"]))
+                        break
+                    except (KeyError, ValueError, TypeError):
+                        continue
+            if coord is None:
                 falharam += 1
                 continue
-            try:
-                resp = await client.get(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"format": "json", "limit": 1, "countrycodes": "br", "q": f"{q}, Brasil"},
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE empresas SET latitude = :lat, longitude = :lng WHERE empresa_id = :id"),
+                    {"lat": coord[0], "lng": coord[1], "id": r.empresa_id},
                 )
-                data = resp.json() if resp.status_code == 200 else []
-            except Exception:
-                data = []
-            if data:
-                try:
-                    lat = float(data[0]["lat"])
-                    lng = float(data[0]["lon"])
-                except (KeyError, ValueError, TypeError):
-                    falharam += 1
-                    continue
-                with engine.begin() as conn:
-                    conn.execute(
-                        text("UPDATE empresas SET latitude = :lat, longitude = :lng WHERE empresa_id = :id"),
-                        {"lat": lat, "lng": lng, "id": r.empresa_id},
-                    )
-                geocodificadas += 1
-            else:
-                falharam += 1
+            geocodificadas += 1
 
     with engine.connect() as conn:
         restantes = conn.execute(text(f"SELECT COUNT(*) FROM empresas WHERE {_SQL_SEM_COORD}")).scalar()
