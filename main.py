@@ -3529,6 +3529,55 @@ def status_google_calendar_watch(email: str = Depends(get_current_user)):
     }
 
 
+@app.get("/admin/integracoes-equipe")
+def status_integracoes_equipe(auth: dict = Depends(exigir_gerente)):
+    """Estado dos canais de cada pessoa da conta.
+
+    O painel individual so responde pela propria caixa. Um vendedor cujo watch
+    morreu fica semanas sem receber notificacao e ninguem descobre -- foi
+    exatamente esse o modo de falha desta rodada, so que na caixa do dono.
+
+    Restrito ao gerente: e a unica visao que atravessa usuarios.
+    """
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        linhas = conn.execute(
+            text("""
+                SELECT u.nome, u.email, u.role,
+                       (u.google_access_token IS NOT NULL) AS google_conectado,
+                       s.provider, s.subscription_id, s.email_address,
+                       s.expires_at, s.atualizado_em
+                FROM usuarios u
+                LEFT JOIN email_subscriptions s ON s.usuario_email = u.email
+                WHERE u.conta_id = :cid
+                ORDER BY u.nome
+            """),
+            {"cid": auth["conta_id"]},
+        ).fetchall()
+
+    pessoas: dict = {}
+    for r in linhas:
+        pessoa = pessoas.setdefault(
+            r.email,
+            {
+                "nome": r.nome,
+                "email": r.email,
+                "funcao": ROTULO_FUNCAO[normalizar_role(r.role)],
+                "google_conectado": bool(r.google_conectado),
+                "canais": {},
+            },
+        )
+        if r.provider:
+            pessoa["canais"][r.provider] = {
+                "ativo": bool(r.subscription_id),
+                "caixa": r.email_address,
+                "expira_em": r.expires_at.isoformat() if r.expires_at else None,
+                "atualizado_em": r.atualizado_em.isoformat() if r.atualizado_em else None,
+            }
+
+    return {"pessoas": list(pessoas.values())}
+
+
 @app.get("/admin/integracoes-status")
 def status_integracoes(email: str = Depends(get_current_user)):
     """Estado dos canais que alimentam as notificacoes deste usuario.
