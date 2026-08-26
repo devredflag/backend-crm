@@ -3161,6 +3161,16 @@ def trigger_verificar_rascunhos():
     return {"msg": "Verificação executada"}
 
 
+@app.post("/admin/verificar-respostas-google")
+def trigger_verificar_respostas_google(email: str = Depends(get_current_user)):
+    """Roda agora a checagem que o scheduler faz de 10 em 10 min.
+
+    Serve para conferir uma resposta recém-enviada sem esperar o próximo ciclo.
+    Diferente de /admin/verificar-rascunhos, exige autenticação."""
+    verificar_respostas_google()
+    return {"msg": "Verificação executada"}
+
+
 # =========================
 # NOTIFICAÇÕES
 # =========================
