@@ -678,6 +678,28 @@ def motivo_falha_email(erro: Exception) -> str:
     return motivo
 
 
+def endereco_de_resposta(conn, usuario_email: str) -> str:
+    """Para onde a resposta do cliente deve voltar.
+
+    Tem de ser a caixa que esta sendo observada pelo watch do Gmail/Outlook --
+    e o e-mail de login nao e necessariamente essa. Sem reply_to, a resposta
+    volta para REMETENTE_EMAIL (o remetente do Resend), que ninguem le: a
+    notificacao de resposta fica impossivel, nao apenas quebrada.
+    """
+    row = conn.execute(
+        text("""
+            SELECT email_address FROM email_subscriptions
+            WHERE usuario_email = :email
+              AND provider IN ('gmail', 'outlook')
+              AND email_address IS NOT NULL
+            ORDER BY atualizado_em DESC
+            LIMIT 1
+        """),
+        {"email": usuario_email},
+    ).fetchone()
+    return row.email_address if row and row.email_address else usuario_email
+
+
 async def enviar_email(destino: str, token: str) -> tuple[bool, Optional[str]]:
     """Envia o convite de ativação.
 
@@ -3383,6 +3405,47 @@ def status_google_calendar_watch(email: str = Depends(get_current_user)):
         "canal": True,
         "expira_em": row.expires_at.isoformat() if row.expires_at else None,
         "atualizado_em": row.atualizado_em.isoformat() if row.atualizado_em else None,
+    }
+
+
+@app.get("/admin/integracoes-status")
+def status_integracoes(email: str = Depends(get_current_user)):
+    """Estado dos canais que alimentam as notificacoes deste usuario.
+
+    Existe pela mesma razao do endpoint acima: watch que falha nao aparece em
+    lugar nenhum da aplicacao -- so no log. Sem isso, "a notificacao nao chega"
+    e indistinguivel de "o canal nunca subiu".
+    """
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        rows = conn.execute(
+            text("""
+                SELECT provider, subscription_id, email_address,
+                       expires_at, atualizado_em
+                FROM email_subscriptions
+                WHERE usuario_email = :email
+            """),
+            {"email": email},
+        ).fetchall()
+
+    canais = {
+        r.provider: {
+            "ativo": bool(r.subscription_id),
+            "caixa": r.email_address,
+            "expira_em": r.expires_at.isoformat() if r.expires_at else None,
+            "atualizado_em": r.atualizado_em.isoformat() if r.atualizado_em else None,
+        }
+        for r in rows
+    }
+    for provedor in ("gmail", "outlook", "google_calendar"):
+        canais.setdefault(provedor, {"ativo": False})
+
+    return {
+        "canais": canais,
+        # O default de GMAIL_PUBSUB_TOPIC e um placeholder. Se ele sobreviveu,
+        # o watch do Gmail falha e resposta de cliente nunca vira notificacao.
+        "gmail_pubsub_configurado": "SEU_PROJECT_ID" not in GMAIL_PUBSUB_TOPIC,
+        "remetente_sandbox": REMETENTE_EMAIL == "onboarding@resend.dev",
     }
 
 
@@ -6332,6 +6395,7 @@ def enviar_orcamento(orcamento_id: str, request: Request, auth: dict = Depends(g
                 {
                     "from": REMETENTE_EMAIL,
                     "to": emp.email,
+                    "reply_to": endereco_de_resposta(conn, auth["email"]),
                     "subject": orc.get("titulo") or "Orçamento",
                     "html": _html_orcamento(emp.nome, orc, itens),
                 }
