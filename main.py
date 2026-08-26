@@ -1883,8 +1883,73 @@ def setup_outlook_calendar_subscription(usuario_email: str, access_token: str, r
 # WEBHOOKS
 # =========================
 
+# Conta de servico que assina o push autenticado do Pub/Sub, e a audience
+# configurada na assinatura. Enquanto GMAIL_PUSH_SA estiver vazio a verificacao
+# fica desligada -- ligar e um passo de configuracao, nao um deploy que derruba
+# um webhook que ja esta funcionando.
+GMAIL_PUSH_SA = os.getenv("GMAIL_PUSH_SA", "")
+GMAIL_PUSH_AUDIENCE = os.getenv("GMAIL_PUSH_AUDIENCE", "")
+
+_google_jwks = None
+
+
+def _jwks_google():
+    """Cliente das chaves publicas do Google, criado no primeiro uso.
+
+    Construir no import faria a API inteira nao subir por causa de um recurso
+    que so o webhook usa -- caro demais para o risco.
+    """
+    global _google_jwks
+    if _google_jwks is None:
+        _google_jwks = jwt.PyJWKClient("https://www.googleapis.com/oauth2/v3/certs")
+    return _google_jwks
+
+
+def push_autenticado(request: Request) -> bool:
+    """Confere o JWT que o Pub/Sub assina quando a assinatura usa autenticacao.
+
+    Sem isso o webhook aceita qualquer POST de quem souber a URL, e o corpo da
+    mensagem manda em qual caixa o codigo vai mexer. Com a verificacao ligada,
+    so passa requisicao assinada pela conta de servico esperada.
+    """
+    if not GMAIL_PUSH_SA:
+        return True
+
+    cabecalho = request.headers.get("authorization", "")
+    if not cabecalho.lower().startswith("bearer "):
+        print("[PUBSUB] recusado: push sem Authorization")
+        return False
+
+    token = cabecalho.split(" ", 1)[1]
+    try:
+        chave = _jwks_google().get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token,
+            chave,
+            algorithms=["RS256"],
+            audience=GMAIL_PUSH_AUDIENCE or None,
+            options={"verify_aud": bool(GMAIL_PUSH_AUDIENCE)},
+        )
+    except Exception as e:
+        print(f"[PUBSUB] recusado: JWT invalido ({e})")
+        return False
+
+    if claims.get("email") != GMAIL_PUSH_SA:
+        print(f"[PUBSUB] recusado: conta de servico inesperada ({claims.get('email')})")
+        return False
+    if not claims.get("email_verified", False):
+        print("[PUBSUB] recusado: email da conta de servico nao verificado")
+        return False
+    return True
+
+
 @app.post("/webhooks/gmail", include_in_schema=False)
 async def gmail_webhook(request: Request):
+    # 401 de proposito: o Pub/Sub reentrega o que foi recusado, entao uma
+    # rejeicao indevida se corrige sozinha quando a config for arrumada.
+    if not push_autenticado(request):
+        raise HTTPException(401, "Push nao autenticado")
+
     try:
         body = await request.json()
     except Exception:
@@ -3418,7 +3483,12 @@ def home():
 
 
 @app.post("/admin/verificar-rascunhos")
-def trigger_verificar_rascunhos():
+def trigger_verificar_rascunhos(email: str = Depends(get_current_user)):
+    """Dispara a verificação de rascunhos expirados.
+
+    Passou a exigir token: estava aberta para a internet inteira e nada no
+    frontend a chamava.
+    """
     verificar_rascunhos_expirados()
     return {"msg": "Verificação executada"}
 
