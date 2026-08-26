@@ -3032,7 +3032,7 @@ def verificar_respostas_google():
             WHERE e.google_event_id IS NOT NULL
               AND COALESCE(e.status_resposta, 'pendente') = 'pendente'
               AND u.google_access_token IS NOT NULL
-              AND e.criado_em >= NOW() - INTERVAL '60 days'
+              AND e.data >= CURRENT_DATE - INTERVAL '1 day'
         """)
         ).fetchall()
 
@@ -3140,7 +3140,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
-scheduler.add_job(verificar_respostas_google, "interval", minutes=10, id="rsvp_google")
+scheduler.add_job(verificar_respostas_google, "interval", minutes=2, id="rsvp_google")
 scheduler.add_job(gerar_ranking_mensal, "cron", day="last", hour=23, minute=30)
 scheduler.add_job(retencao_lgpd, "cron", hour=4, minute=0, id="retencao_lgpd")
 scheduler.start()
@@ -3163,7 +3163,7 @@ def trigger_verificar_rascunhos():
 
 @app.post("/admin/verificar-respostas-google")
 def trigger_verificar_respostas_google(email: str = Depends(get_current_user)):
-    """Roda agora a checagem que o scheduler faz de 10 em 10 min.
+    """Roda agora a checagem que o scheduler faz a cada 2 min.
 
     Serve para conferir uma resposta recém-enviada sem esperar o próximo ciclo.
     Diferente de /admin/verificar-rascunhos, exige autenticação."""
