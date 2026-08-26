@@ -1621,16 +1621,52 @@ def create_interaction_notification(
 # =========================
 # GMAIL WATCH
 # =========================
-def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str, gmail_address: str):
+def google_com_retry(usuario_email: str, access_token: str, refresh_token: str, fazer):
+    """Executa fazer(token); se o Google devolver 401, renova e repete uma vez.
+
+    Access token do Google dura 1 hora. Todo job que reusa um token guardado no
+    banco falha depois disso -- e falhar aqui e silencioso, porque o job so
+    imprime e volta. Era exatamente assim que o watch do Gmail morria: durava os
+    7 dias do watch inicial e nenhuma renovacao depois disso conseguia passar.
+    """
+    resp = fazer(access_token)
+    if resp.status_code == 401 and refresh_token:
+        novo = asyncio.run(_refresh_google_token(refresh_token, usuario_email))
+        if novo:
+            return novo, fazer(novo)
+    return access_token, resp
+
+
+def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str, gmail_address: str = ""):
     try:
-        res = http_requests.post(
-            f"https://gmail.googleapis.com/gmail/v1/users/{gmail_address}/watch",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={"topicName": GMAIL_PUBSUB_TOPIC, "labelIds": ["INBOX"]},
-            timeout=15,
+        # Sem o endereco da caixa nao da para montar a URL do watch nem para o
+        # webhook achar a assinatura depois. Quem chama nem sempre o tem.
+        if not gmail_address:
+            access_token, prof = google_com_retry(
+                usuario_email, access_token, refresh_token,
+                lambda t: http_requests.get(
+                    "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+                    headers={"Authorization": f"Bearer {t}"},
+                    timeout=15,
+                ),
+            )
+            if prof.ok:
+                gmail_address = prof.json().get("emailAddress", "")
+            if not gmail_address:
+                print(f"[Gmail Watch] endereco da caixa desconhecido para {usuario_email}: {prof.text}")
+                return
+
+        access_token, res = google_com_retry(
+            usuario_email, access_token, refresh_token,
+            lambda t: http_requests.post(
+                f"https://gmail.googleapis.com/gmail/v1/users/{gmail_address}/watch",
+                headers={"Authorization": f"Bearer {t}", "Content-Type": "application/json"},
+                json={"topicName": GMAIL_PUBSUB_TOPIC, "labelIds": ["INBOX"]},
+                timeout=15,
+            ),
         )
         if not res.ok:
-            print(f"[Gmail Watch] Erro: {res.text}")
+            print(f"[Gmail Watch] Erro ({res.status_code}) para {usuario_email}: {res.text}")
             return
         data = res.json()
         history_id = int(data.get("historyId", 0))
@@ -2864,14 +2900,32 @@ async def outlook_calendar_webhook(request: Request):
 # RENOVAÇÃO DE SUBSCRIPTIONS
 # =========================
 def renovar_gmail_watches():
+    """Renova o watch do Gmail antes de expirar, e abre para quem ainda nao tem.
+
+    Dois detalhes que a versao anterior errava:
+
+    - O token vinha da propria assinatura, gravado quando o watch foi criado.
+      Como dura 1 hora, toda renovacao posterior batia em 401. Agora vem de
+      usuarios, que e onde o refresh mantem o token atual.
+    - O SELECT so via quem ja tinha assinatura, entao quem conectou o Google
+      antes de o watch existir -- ou perdeu a assinatura por qualquer motivo --
+      nunca mais ganhava uma. O LEFT JOIN cobre esse caso.
+    """
     with engine.begin() as conn:
         garantir_tabela_notificacoes(conn)
         subs = conn.execute(
             text(
                 """
-            SELECT * FROM email_subscriptions
-            WHERE provider='gmail'
-              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '36 hours')
+            SELECT u.email AS usuario_email,
+                   u.google_access_token, u.google_refresh_token,
+                   s.email_address
+            FROM usuarios u
+            LEFT JOIN email_subscriptions s
+              ON s.usuario_email = u.email AND s.provider = 'gmail'
+            WHERE u.google_access_token IS NOT NULL
+              AND (s.sub_id IS NULL
+                   OR s.expires_at IS NULL
+                   OR s.expires_at <= NOW() + INTERVAL '36 hours')
         """
             )
         ).fetchall()
@@ -2879,9 +2933,9 @@ def renovar_gmail_watches():
         s = dict(sub._mapping)
         setup_gmail_watch(
             s["usuario_email"],
-            s.get("access_token", ""),
-            s.get("refresh_token", ""),
-            s.get("email_address", ""),
+            s.get("google_access_token") or "",
+            s.get("google_refresh_token") or "",
+            s.get("email_address") or "",
         )
 
 
@@ -3198,13 +3252,7 @@ def setup_google_calendar_watch(usuario_email: str, access_token: str, refresh_t
         ).fetchone()
 
     def _com_token(token, fn):
-        """Executa fn(token); se o token venceu, renova uma vez e repete."""
-        r = fn(token)
-        if r.status_code == 401 and refresh_token:
-            novo_token = asyncio.run(_refresh_google_token(refresh_token, usuario_email))
-            if novo_token:
-                return novo_token, fn(novo_token)
-        return token, r
+        return google_com_retry(usuario_email, token, refresh_token, fn)
 
     # Encerra o canal anterior: sem isso os dois ficam vivos durante a
     # sobreposicao e o webhook recebe a mesma mudanca duas vezes.
@@ -3343,7 +3391,10 @@ def google_calendar_webhook(request: Request):
 # =========================
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
-scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
+scheduler.add_job(
+    renovar_gmail_watches, "interval", hours=6, id="renew_gmail",
+    next_run_time=datetime.now() + timedelta(minutes=2),
+)
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
 scheduler.add_job(verificar_respostas_google, "interval", minutes=5, id="rsvp_google")
 # Rede de seguranca do push: abre canal para quem ainda nao tem e renova os
