@@ -3001,12 +3001,146 @@ def retencao_lgpd():
 
 
 # =========================
+# RESPOSTAS DE CONVITE — GOOGLE
+# =========================
+def verificar_respostas_google():
+    """Lê a resposta do convidado direto do Google Calendar.
+
+    O caminho antigo era indireto: esperava o e-mail "Aceito: ..." que o Google
+    manda ao organizador e deduzia a resposta pelo assunto (ver o webhook do
+    Gmail, mais acima). Esse e-mail só é enviado se a conta tiver "Respostas a
+    eventos" ligado nas notificações do Calendar — o padrão é não enviar, e sem
+    ele a resposta nunca chegava ao CRM.
+
+    O responseStatus do próprio evento é autoritativo e está sempre lá. É o
+    mesmo caminho que o Outlook já usa via Graph em outlook_calendar_webhook.
+    """
+    status_map = {
+        "accepted":  ("calendar_accepted",  "aceitou",           "aceito"),
+        "declined":  ("calendar_declined",  "recusou",           "negado"),
+        "tentative": ("calendar_tentative", "disse talvez para", "talvez"),
+    }
+
+    with engine.connect() as conn:
+        pendentes = conn.execute(
+            text("""
+            SELECT e.evento_id, e.usuario_email, e.empresa_id, e.empresa_nome,
+                   e.titulo, e.google_event_id,
+                   u.google_access_token, u.google_refresh_token
+            FROM eventos e
+            JOIN usuarios u ON u.email = e.usuario_email
+            WHERE e.google_event_id IS NOT NULL
+              AND COALESCE(e.status_resposta, 'pendente') = 'pendente'
+              AND u.google_access_token IS NOT NULL
+              AND e.criado_em >= NOW() - INTERVAL '60 days'
+        """)
+        ).fetchall()
+
+    for row in pendentes:
+        ev = dict(row._mapping)
+        access_token = ev.get("google_access_token")
+
+        def _buscar(token):
+            return http_requests.get(
+                "https://www.googleapis.com/calendar/v3/calendars/primary/events/"
+                f"{ev['google_event_id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15,
+            )
+
+        try:
+            resp = _buscar(access_token)
+            # 401 aqui é token vencido, não evento inexistente: renova e repete.
+            if resp.status_code == 401 and ev.get("google_refresh_token"):
+                access_token = asyncio.run(
+                    _refresh_google_token(ev["google_refresh_token"], ev["usuario_email"])
+                )
+                if not access_token:
+                    continue
+                resp = _buscar(access_token)
+            if resp.status_code != 200:
+                print(f"[GOOGLE RSVP] evento {ev['google_event_id']}: {resp.status_code}")
+                continue
+            attendees = resp.json().get("attendees", []) or []
+        except Exception as e:
+            print(f"[GOOGLE RSVP] erro ao consultar evento: {e}")
+            continue
+
+        for att in attendees:
+            # O organizador aparece na lista como convidado de si mesmo.
+            if att.get("self") or att.get("organizer"):
+                continue
+            mapped = status_map.get(att.get("responseStatus", ""))
+            if not mapped:
+                continue  # needsAction: ainda não respondeu
+            notif_tipo, verbo, novo_status = mapped
+
+            email_conv = att.get("email", "")
+            nome_conv  = att.get("displayName") or email_conv
+            titulo_evento = ev.get("titulo") or "reunião"
+
+            with engine.begin() as conn:
+                existe = conn.execute(
+                    text("""
+                        SELECT 1 FROM notificacoes
+                        WHERE usuario_email = :uemail
+                          AND tipo = :tipo
+                          AND meta->>'google_event_id' = :gid
+                          AND meta->>'attendee_email' = :aemail
+                    """),
+                    {
+                        "uemail": ev["usuario_email"],
+                        "tipo":   notif_tipo,
+                        "gid":    ev["google_event_id"],
+                        "aemail": email_conv,
+                    },
+                ).fetchone()
+
+                if not existe and ev.get("empresa_id") and ev.get("empresa_nome"):
+                    conn.execute(
+                        text("""
+                            INSERT INTO notificacoes
+                                (notificacao_id, usuario_email, tipo, titulo, mensagem,
+                                 empresa_id, empresa_nome, platform, meta, lida, criado_em)
+                            VALUES
+                                (:id, :uemail, :tipo, :titulo, :mensagem,
+                                 :eid, :enome, 'google', CAST(:meta AS JSONB), FALSE, NOW())
+                        """),
+                        {
+                            "id":      str(uuid.uuid4()),
+                            "uemail":  ev["usuario_email"],
+                            "tipo":    notif_tipo,
+                            "titulo":  f"{ev['empresa_nome']} {verbo} a call",
+                            "mensagem": f"{nome_conv} {verbo} o convite para '{titulo_evento}'.",
+                            "eid":     str(ev["empresa_id"]),
+                            "enome":   ev["empresa_nome"],
+                            "meta":    json.dumps({
+                                "sender_email":    email_conv,
+                                "sender_name":     nome_conv,
+                                "attendee_email":  email_conv,
+                                "attendee_name":   nome_conv,
+                                "google_event_id": ev["google_event_id"],
+                                "event_subject":   titulo_evento,
+                            }),
+                        },
+                    )
+
+                conn.execute(
+                    text("UPDATE eventos SET status_resposta = :status WHERE evento_id = :eid"),
+                    {"status": novo_status, "eid": str(ev["evento_id"])},
+                )
+                print(f"[GOOGLE RSVP] {email_conv} -> {novo_status} (evento {ev['evento_id']})")
+            break  # o convite do CRM tem um convidado; o primeiro que respondeu decide
+
+
+# =========================
 # SCHEDULER
 # =========================
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
+scheduler.add_job(verificar_respostas_google, "interval", minutes=10, id="rsvp_google")
 scheduler.add_job(gerar_ranking_mensal, "cron", day="last", hour=23, minute=30)
 scheduler.add_job(retencao_lgpd, "cron", hour=4, minute=0, id="retencao_lgpd")
 scheduler.start()
