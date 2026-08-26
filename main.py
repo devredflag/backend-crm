@@ -3161,7 +3161,12 @@ def setup_google_calendar_watch(usuario_email: str, access_token: str, refresh_t
     O endereco so precisa ser HTTPS com certificado valido; nao exige dominio
     verificado.
     """
-    with engine.connect() as conn:
+    # engine.begin(), nao connect(): a coluna resource_id nasce aqui, num ALTER
+    # dentro de garantir_tabela_notificacoes, e DDL precisa de commit. Ler a
+    # coluna antes de garantir que ela existe quebrava o job inteiro em banco
+    # que ainda nao tinha passado por essa migracao.
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
         antigo = conn.execute(
             text("""
                 SELECT subscription_id, resource_id FROM email_subscriptions
@@ -3318,7 +3323,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
-scheduler.add_job(verificar_respostas_google, "interval", minutes=15, id="rsvp_google")
+scheduler.add_job(verificar_respostas_google, "interval", minutes=5, id="rsvp_google")
 # Rede de seguranca do push: abre canal para quem ainda nao tem e renova os
 # que vao expirar. O next_run_time cobre quem ja estava com o Google conectado.
 scheduler.add_job(
@@ -3353,6 +3358,32 @@ def trigger_verificar_respostas_google(email: str = Depends(get_current_user)):
     Diferente de /admin/verificar-rascunhos, exige autenticação."""
     verificar_respostas_google()
     return {"msg": "Verificação executada"}
+
+
+@app.get("/admin/google-calendar-watch")
+def status_google_calendar_watch(email: str = Depends(get_current_user)):
+    """Diz se o canal de push existe e até quando vale.
+
+    Sem isso, só o log do Railway responde essa pergunta — e foi essa cegueira
+    que deixou passar o job quebrando em silêncio. Não devolve o id do canal.
+    """
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        row = conn.execute(
+            text("""
+                SELECT subscription_id, resource_id, expires_at, atualizado_em
+                FROM email_subscriptions
+                WHERE usuario_email = :email AND provider = 'google_calendar'
+            """),
+            {"email": email},
+        ).fetchone()
+    if not row or not row.subscription_id:
+        return {"canal": False, "msg": "Nenhum canal de push registrado."}
+    return {
+        "canal": True,
+        "expira_em": row.expires_at.isoformat() if row.expires_at else None,
+        "atualizado_em": row.atualizado_em.isoformat() if row.atualizado_em else None,
+    }
 
 
 # =========================
