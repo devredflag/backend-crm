@@ -1261,6 +1261,9 @@ def garantir_tabela_notificacoes(conn):
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS google_event_id TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS email_convidado TEXT"))
     conn.execute(text("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS status_resposta TEXT DEFAULT 'pendente'"))
+    # resourceId do canal de push do Google Calendar — precisa ser devolvido
+    # junto do channel id para encerrar o canal antigo em channels/stop.
+    conn.execute(text("ALTER TABLE email_subscriptions ADD COLUMN IF NOT EXISTS resource_id TEXT"))
 
 
 # Status possíveis de um orçamento, na ordem do fluxo.
@@ -3003,8 +3006,11 @@ def retencao_lgpd():
 # =========================
 # RESPOSTAS DE CONVITE — GOOGLE
 # =========================
-def verificar_respostas_google():
+def verificar_respostas_google(usuario_email: Optional[str] = None):
     """Lê a resposta do convidado direto do Google Calendar.
+
+    Com `usuario_email`, checa só os eventos daquele usuário — é assim que o
+    webhook de push responde a uma mudança sem varrer a base inteira.
 
     O caminho antigo era indireto: esperava o e-mail "Aceito: ..." que o Google
     manda ao organizador e deduzia a resposta pelo assunto (ver o webhook do
@@ -3033,7 +3039,9 @@ def verificar_respostas_google():
               AND COALESCE(e.status_resposta, 'pendente') = 'pendente'
               AND u.google_access_token IS NOT NULL
               AND e.data >= CURRENT_DATE - INTERVAL '1 day'
-        """)
+              AND (CAST(:uemail AS TEXT) IS NULL OR e.usuario_email = :uemail)
+        """),
+            {"uemail": usuario_email},
         ).fetchall()
 
     for row in pendentes:
@@ -3134,13 +3142,189 @@ def verificar_respostas_google():
 
 
 # =========================
+# PUSH DO GOOGLE CALENDAR
+# =========================
+GOOGLE_CAL_WATCH_URL = (
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events/watch"
+)
+GOOGLE_CAL_STOP_URL = "https://www.googleapis.com/calendar/v3/channels/stop"
+
+
+def setup_google_calendar_watch(usuario_email: str, access_token: str, refresh_token: str):
+    """Registra um canal de push do Google Calendar para o usuario.
+
+    O Google avisa o webhook a cada mudanca na agenda -- inclusive quando um
+    convidado responde ao convite. Sem isso a resposta so aparecia no ciclo
+    seguinte do poller. O canal expira sozinho (a data vem em `expiration`),
+    e renovar_google_calendar_watches o recria antes do prazo.
+
+    O endereco so precisa ser HTTPS com certificado valido; nao exige dominio
+    verificado.
+    """
+    with engine.connect() as conn:
+        antigo = conn.execute(
+            text("""
+                SELECT subscription_id, resource_id FROM email_subscriptions
+                WHERE usuario_email = :email AND provider = 'google_calendar'
+            """),
+            {"email": usuario_email},
+        ).fetchone()
+
+    def _com_token(token, fn):
+        """Executa fn(token); se o token venceu, renova uma vez e repete."""
+        r = fn(token)
+        if r.status_code == 401 and refresh_token:
+            novo_token = asyncio.run(_refresh_google_token(refresh_token, usuario_email))
+            if novo_token:
+                return novo_token, fn(novo_token)
+        return token, r
+
+    # Encerra o canal anterior: sem isso os dois ficam vivos durante a
+    # sobreposicao e o webhook recebe a mesma mudanca duas vezes.
+    if antigo and antigo.subscription_id and antigo.resource_id:
+        try:
+            _com_token(access_token, lambda t: http_requests.post(
+                GOOGLE_CAL_STOP_URL,
+                json={"id": antigo.subscription_id, "resourceId": antigo.resource_id},
+                headers={"Authorization": f"Bearer {t}"},
+                timeout=15,
+            ))
+        except Exception as e:
+            print(f"[GOOGLE CALENDAR] falha ao encerrar canal antigo: {e}")
+
+    canal_id = str(uuid.uuid4())
+    try:
+        access_token, res = _com_token(access_token, lambda t: http_requests.post(
+            GOOGLE_CAL_WATCH_URL,
+            json={
+                "id": canal_id,
+                "type": "web_hook",
+                "address": f"{BACKEND_URL}/webhooks/google-calendar",
+            },
+            headers={"Authorization": f"Bearer {t}"},
+            timeout=20,
+        ))
+    except Exception as e:
+        print(f"[GOOGLE CALENDAR] erro ao abrir canal: {e}")
+        return
+
+    if res.status_code not in (200, 201):
+        print(f"[GOOGLE CALENDAR] watch falhou ({res.status_code}): {res.text}")
+        return
+
+    data = res.json()
+    exp_ms = data.get("expiration")
+    expires_at = datetime.utcfromtimestamp(int(exp_ms) / 1000) if exp_ms else None
+
+    with engine.begin() as conn:
+        garantir_tabela_notificacoes(conn)
+        if antigo:
+            conn.execute(
+                text("""
+                    UPDATE email_subscriptions
+                    SET subscription_id = :cid, resource_id = :rid, expires_at = :exp,
+                        access_token = :at, refresh_token = :rt, atualizado_em = NOW()
+                    WHERE usuario_email = :email AND provider = 'google_calendar'
+                """),
+                {"cid": canal_id, "rid": data.get("resourceId"), "exp": expires_at,
+                 "at": access_token, "rt": refresh_token, "email": usuario_email},
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO email_subscriptions
+                        (sub_id, usuario_email, provider, subscription_id, resource_id,
+                         email_address, expires_at, access_token, refresh_token)
+                    VALUES
+                        (:sid, :email, 'google_calendar', :cid, :rid,
+                         :email, :exp, :at, :rt)
+                """),
+                {"sid": str(uuid.uuid4()), "email": usuario_email, "cid": canal_id,
+                 "rid": data.get("resourceId"), "exp": expires_at,
+                 "at": access_token, "rt": refresh_token},
+            )
+    print(f"[GOOGLE CALENDAR] canal OK para {usuario_email}, expira {expires_at}")
+
+
+def renovar_google_calendar_watches():
+    """Abre canal para quem ainda nao tem e renova os que estao perto de expirar.
+
+    O LEFT JOIN cobre quem conectou o Google antes de o push existir: essa
+    turma nunca passaria pelo callback do OAuth de novo.
+    """
+    with engine.connect() as conn:
+        pendentes = conn.execute(
+            text("""
+            SELECT u.email AS usuario_email, u.google_access_token, u.google_refresh_token
+            FROM usuarios u
+            LEFT JOIN email_subscriptions s
+              ON s.usuario_email = u.email AND s.provider = 'google_calendar'
+            WHERE u.google_access_token IS NOT NULL
+              AND (s.sub_id IS NULL
+                   OR s.expires_at IS NULL
+                   OR s.expires_at <= NOW() + INTERVAL '24 hours')
+        """)
+        ).fetchall()
+    for row in pendentes:
+        u = dict(row._mapping)
+        setup_google_calendar_watch(
+            u["usuario_email"],
+            u.get("google_access_token") or "",
+            u.get("google_refresh_token") or "",
+        )
+
+
+@app.post("/webhooks/google-calendar", include_in_schema=False)
+def google_calendar_webhook(request: Request):
+    """Ping do Google avisando que a agenda mudou.
+
+    O corpo vem vazio de proposito -- a notificacao nao diz o que mudou, so que
+    mudou. Quem le a mudanca e verificar_respostas_google, recortado para o
+    usuario do canal. Rota sincrona porque essa checagem e bloqueante: assim o
+    FastAPI a joga no threadpool em vez de travar o event loop.
+    """
+    canal_id       = request.headers.get("x-goog-channel-id", "")
+    resource_id    = request.headers.get("x-goog-resource-id", "")
+    resource_state = request.headers.get("x-goog-resource-state", "")
+
+    # A primeira mensagem de todo canal e so o handshake.
+    if resource_state == "sync":
+        print(f"[GOOGLE CALENDAR] handshake do canal {canal_id}")
+        return {"ok": True}
+
+    with engine.connect() as conn:
+        sub = conn.execute(
+            text("""
+                SELECT usuario_email FROM email_subscriptions
+                WHERE provider = 'google_calendar'
+                  AND subscription_id = :cid
+                  AND (resource_id IS NULL OR resource_id = :rid)
+            """),
+            {"cid": canal_id, "rid": resource_id},
+        ).fetchone()
+
+    if not sub:
+        print(f"[GOOGLE CALENDAR] canal desconhecido: {canal_id}")
+        return {"ok": True}
+
+    verificar_respostas_google(usuario_email=sub.usuario_email)
+    return {"ok": True}
+
+
+# =========================
 # SCHEDULER
 # =========================
 scheduler = BackgroundScheduler()
 scheduler.add_job(verificar_rascunhos_expirados, "cron", hour=8, minute=0)
 scheduler.add_job(renovar_gmail_watches, "interval", hours=6, id="renew_gmail")
 scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
-scheduler.add_job(verificar_respostas_google, "interval", minutes=2, id="rsvp_google")
+scheduler.add_job(verificar_respostas_google, "interval", minutes=15, id="rsvp_google")
+# Rede de seguranca do push: abre canal para quem ainda nao tem e renova os
+# que vao expirar. O next_run_time cobre quem ja estava com o Google conectado.
+scheduler.add_job(
+    renovar_google_calendar_watches, "interval", hours=6, id="renew_gcal",
+    next_run_time=datetime.now() + timedelta(minutes=1),
+)
 scheduler.add_job(gerar_ranking_mensal, "cron", day="last", hour=23, minute=30)
 scheduler.add_job(retencao_lgpd, "cron", hour=4, minute=0, id="retencao_lgpd")
 scheduler.start()
@@ -3449,6 +3633,11 @@ async def google_callback(code: str, email: str = Depends(get_current_user)):
     threading.Thread(
         target=setup_gmail_watch,
         args=(email, tokens.get("access_token"), tokens.get("refresh_token", ""), gmail_address),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=setup_google_calendar_watch,
+        args=(email, tokens.get("access_token"), tokens.get("refresh_token", "")),
         daemon=True,
     ).start()
     return {"msg": "Google conectado com sucesso 🚀"}
