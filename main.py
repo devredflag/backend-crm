@@ -1730,23 +1730,40 @@ def setup_gmail_watch(usuario_email: str, access_token: str, refresh_token: str,
 # =========================
 # OUTLOOK EMAIL SUBSCRIPTION
 # =========================
+def outlook_com_retry(usuario_email: str, access_token: str, refresh_token: str, fazer):
+    """Executa fazer(token); se o Graph devolver 401, renova e repete uma vez.
+
+    Mesmo motivo do google_com_retry: token da Microsoft dura cerca de 1 hora,
+    e todo job que reusa um token guardado no banco falha depois disso.
+    """
+    resp = fazer(access_token)
+    if resp.status_code == 401 and refresh_token:
+        novo = asyncio.run(_refresh_outlook_token(refresh_token, usuario_email))
+        if novo:
+            return novo, fazer(novo)
+    return access_token, resp
+
+
 def setup_outlook_subscription(usuario_email: str, access_token: str, refresh_token: str):
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=4000)
-        res = http_requests.post(
-            "https://graph.microsoft.com/v1.0/subscriptions",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={
-                "changeType": "created",
-                "notificationUrl": f"{BACKEND_URL}/webhooks/outlook",
-                "resource": "me/mailFolders('Inbox')/messages",
-                "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
-                "clientState": OUTLOOK_WEBHOOK_SECRET,
-            },
-            timeout=15,
+        access_token, res = outlook_com_retry(
+            usuario_email, access_token, refresh_token,
+            lambda t: http_requests.post(
+                "https://graph.microsoft.com/v1.0/subscriptions",
+                headers={"Authorization": f"Bearer {t}", "Content-Type": "application/json"},
+                json={
+                    "changeType": "created",
+                    "notificationUrl": f"{BACKEND_URL}/webhooks/outlook",
+                    "resource": "me/mailFolders('Inbox')/messages",
+                    "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
+                    "clientState": OUTLOOK_WEBHOOK_SECRET,
+                },
+                timeout=15,
+            ),
         )
         if not res.ok:
-            print(f"[Outlook Sub] Erro: {res.text}")
+            print(f"[Outlook Sub] Erro ({res.status_code}) para {usuario_email}: {res.text}")
             return
         sub_id = res.json().get("id")
         me_res = http_requests.get(
@@ -1816,20 +1833,23 @@ def setup_outlook_subscription(usuario_email: str, access_token: str, refresh_to
 def setup_outlook_calendar_subscription(usuario_email: str, access_token: str, refresh_token: str):
     try:
         expires_at = datetime.utcnow() + timedelta(minutes=4000)
-        res = http_requests.post(
-            "https://graph.microsoft.com/v1.0/subscriptions",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json={
-                "changeType": "updated",
-                "notificationUrl": f"{BACKEND_URL}/webhooks/outlook-calendar",
-                "resource": "me/events",
-                "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
-                "clientState": OUTLOOK_WEBHOOK_SECRET,
-            },
-            timeout=15,
+        access_token, res = outlook_com_retry(
+            usuario_email, access_token, refresh_token,
+            lambda t: http_requests.post(
+                "https://graph.microsoft.com/v1.0/subscriptions",
+                headers={"Authorization": f"Bearer {t}", "Content-Type": "application/json"},
+                json={
+                    "changeType": "updated",
+                    "notificationUrl": f"{BACKEND_URL}/webhooks/outlook-calendar",
+                    "resource": "me/events",
+                    "expirationDateTime": expires_at.strftime("%Y-%m-%dT%H:%M:%S.0000000Z"),
+                    "clientState": OUTLOOK_WEBHOOK_SECRET,
+                },
+                timeout=15,
+            ),
         )
         if not res.ok:
-            print(f"[Outlook Cal Sub] Erro: {res.text}")
+            print(f"[Outlook Cal Sub] Erro ({res.status_code}) para {usuario_email}: {res.text}")
             return
         sub_id = res.json().get("id")
         with engine.begin() as conn:
@@ -3005,41 +3025,102 @@ def renovar_gmail_watches():
 
 
 def renovar_outlook_subscriptions():
-    with engine.begin() as conn:
-        garantir_tabela_notificacoes(conn)
-        subs = conn.execute(
-            text(
-                """
-            SELECT * FROM email_subscriptions
-            WHERE provider IN ('outlook', 'outlook_calendar')
-              AND (expires_at IS NULL OR expires_at <= NOW() + INTERVAL '12 hours')
-        """
-            )
+    """Renova (ou recria) as assinaturas do Graph antes de expirarem.
+
+    Tres defeitos na versao anterior, e o terceiro era o pior:
+
+    - o token vinha da propria assinatura, gravado quando ela foi criada. Token
+      da Microsoft dura cerca de 1 hora, entao todo PATCH batia em 401;
+    - o resultado do PATCH nunca era conferido;
+    - e o expires_at era gravado **de qualquer jeito**. O banco passava a
+      afirmar que a assinatura valia por mais ~3 dias enquanto o Graph ja a
+      tinha deixado expirar. Mentira que se auto-renovava a cada ciclo e
+      escondia a falha para sempre -- inclusive do painel de integracoes.
+
+    Assinatura vencida o Graph nao ressuscita: quando o PATCH falha, cria outra.
+    """
+    with engine.connect() as conn:
+        usuarios = conn.execute(
+            text("""
+                SELECT email, outlook_access_token, outlook_refresh_token
+                FROM usuarios WHERE outlook_access_token IS NOT NULL
+            """)
         ).fetchall()
-    for sub in subs:
-        s = dict(sub._mapping)
-        if not s.get("subscription_id"):
-            continue
-        new_exp = datetime.utcnow() + timedelta(minutes=4000)
-        http_requests.patch(
-            f"https://graph.microsoft.com/v1.0/subscriptions/{s['subscription_id']}",
-            headers={
-                "Authorization": f"Bearer {s.get('access_token', '')}",
-                "Content-Type": "application/json",
-            },
-            json={"expirationDateTime": new_exp.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")},
-            timeout=10,
-        )
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    """
-                UPDATE email_subscriptions SET expires_at=:exp, atualizado_em=NOW()
-                WHERE subscription_id=:sid
-            """
-                ),
-                {"exp": new_exp, "sid": s["subscription_id"]},
-            )
+        existentes = conn.execute(
+            text("""
+                SELECT usuario_email, provider, subscription_id, expires_at
+                FROM email_subscriptions
+                WHERE provider IN ('outlook', 'outlook_calendar')
+            """)
+        ).fetchall()
+
+    por_usuario: dict = {}
+    for e in existentes:
+        por_usuario.setdefault(e.usuario_email, {})[e.provider] = e
+
+    limite = datetime.utcnow() + timedelta(hours=12)
+    criadores = {
+        "outlook": setup_outlook_subscription,
+        "outlook_calendar": setup_outlook_calendar_subscription,
+    }
+
+    for u in usuarios:
+        atuais = por_usuario.get(u.email, {})
+        token = u.outlook_access_token or ""
+        refresh = u.outlook_refresh_token or ""
+
+        for provider, criar in criadores.items():
+            atual = atuais.get(provider)
+
+            if atual and atual.subscription_id and atual.expires_at and atual.expires_at > limite:
+                # O banco pode estar mentindo: a versao antiga gravava validade
+                # nova mesmo quando o PATCH falhava. Uma linha dessas seria
+                # pulada aqui para sempre, entao confirma no Graph antes.
+                sid_atual = atual.subscription_id
+                token, resp = outlook_com_retry(
+                    u.email, token, refresh,
+                    lambda t: http_requests.get(
+                        f"https://graph.microsoft.com/v1.0/subscriptions/{sid_atual}",
+                        headers={"Authorization": f"Bearer {t}"},
+                        timeout=15,
+                    ),
+                )
+                if resp.ok:
+                    continue
+                print(f"[Outlook Sub] {provider} nao existe mais no Graph ({resp.status_code}) para {u.email}; recriando")
+                criar(u.email, token, refresh)
+                continue
+
+            renovada = False
+            if atual and atual.subscription_id:
+                nova_exp = datetime.utcnow() + timedelta(minutes=4000)
+                sid = atual.subscription_id
+                token, resp = outlook_com_retry(
+                    u.email, token, refresh,
+                    lambda t: http_requests.patch(
+                        f"https://graph.microsoft.com/v1.0/subscriptions/{sid}",
+                        headers={"Authorization": f"Bearer {t}", "Content-Type": "application/json"},
+                        json={"expirationDateTime": nova_exp.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")},
+                        timeout=15,
+                    ),
+                )
+                renovada = resp.ok
+                if renovada:
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text("""
+                                UPDATE email_subscriptions
+                                SET expires_at = :exp, atualizado_em = NOW()
+                                WHERE subscription_id = :sid
+                            """),
+                            {"exp": nova_exp, "sid": sid},
+                        )
+                    print(f"[Outlook Sub] {provider} renovada para {u.email}")
+                else:
+                    print(f"[Outlook Sub] PATCH {provider} falhou ({resp.status_code}) para {u.email}: {resp.text}")
+
+            if not renovada:
+                criar(u.email, token, refresh)
 
 
 # =========================
@@ -3460,7 +3541,10 @@ scheduler.add_job(
     renovar_gmail_watches, "interval", hours=6, id="renew_gmail",
     next_run_time=datetime.now() + timedelta(minutes=2),
 )
-scheduler.add_job(renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook")
+scheduler.add_job(
+    renovar_outlook_subscriptions, "interval", hours=6, id="renew_outlook",
+    next_run_time=datetime.now() + timedelta(minutes=3),
+)
 scheduler.add_job(verificar_respostas_google, "interval", minutes=5, id="rsvp_google")
 # Rede de seguranca do push: abre canal para quem ainda nao tem e renova os
 # que vao expirar. O next_run_time cobre quem ja estava com o Google conectado.
