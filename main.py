@@ -16,6 +16,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import uuid
 import jwt
+import functools
 import os
 import re
 import time
@@ -101,6 +102,42 @@ GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "projects/SEU_PROJECT_ID/to
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
 
 engine = create_engine(DATABASE_URL)
+
+# =========================================================================
+# MIGRACOES: uma vez por processo, nao por requisicao
+# =========================================================================
+# As funcoes garantir_* sao idempotentes, mas nao sao de graca. So a
+# garantir_campos_pipeline dispara 6 ALTER TABLE -- que pegam ACCESS EXCLUSIVE
+# em `empresas` mesmo quando nao tem nada a fazer -- mais um UPDATE de backfill.
+# Chamadas no inicio de cada rota, isso significava escrita e disputa de lock em
+# TODA leitura, e o front agora rele /empresas e /orcamentos de 5 em 5 segundos
+# por aba aberta.
+_MIGRACOES_FEITAS: set[str] = set()
+_TRAVA_MIGRACAO = threading.Lock()
+
+
+def uma_vez(fn):
+    """Executa a migracao so na primeira chamada bem-sucedida deste processo.
+
+    So marca como feita quando a funcao volta sem erro: se falhar, a proxima
+    requisicao tenta de novo, exatamente como era antes.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(conn, *args, **kwargs):
+        if fn.__name__ in _MIGRACOES_FEITAS:
+            return None
+        # A trava importa: rota sincrona no FastAPI roda em threadpool, entao
+        # duas requisicoes simultaneas entrariam aqui juntas.
+        with _TRAVA_MIGRACAO:
+            if fn.__name__ in _MIGRACOES_FEITAS:
+                return None
+            resultado = fn(conn, *args, **kwargs)
+            _MIGRACOES_FEITAS.add(fn.__name__)
+            return resultado
+
+    return wrapper
+
 security = HTTPBearer()
 
 # Rate limiting em nível de aplicação (in-memory; para múltiplas instâncias trocar
@@ -462,6 +499,7 @@ def mfa_verificar_totp(secret: str, code: str) -> bool:
 
 
 # --- Migration de segurança (lazy, roda junto do schema multiusuário) ---
+@uma_vez
 def garantir_seguranca(conn):
     conn.execute(
         text(
@@ -997,6 +1035,7 @@ def segmento_valido(nome: str) -> bool:
     return bool(palavras & PALAVRAS_CHAVE_SEGMENTO)
 
 
+@uma_vez
 def garantir_tabela_segmentos(conn):
     conn.execute(
         text(
@@ -1042,6 +1081,7 @@ def salvar_segmento(conn, nome: str) -> str:
     return nome_limpo
 
 
+@uma_vez
 def garantir_campos_pipeline(conn):
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS data_proxima_acao date"))
     conn.execute(
@@ -1095,6 +1135,7 @@ def garantir_campos_pipeline(conn):
     )
 
 
+@uma_vez
 def garantir_colunas_places(conn):
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS google_place_id TEXT"))
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION"))
@@ -1108,6 +1149,7 @@ def garantir_colunas_places(conn):
     conn.execute(text("ALTER TABLE empresas ADD COLUMN IF NOT EXISTS status_cadastro TEXT DEFAULT 'ativo'"))
 
 
+@uma_vez
 def garantir_tabelas_places_cache(conn):
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS places_cache (
@@ -1137,6 +1179,7 @@ def garantir_tabelas_places_cache(conn):
     """))
 
 
+@uma_vez
 def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_access_token text"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS outlook_refresh_token text"))
@@ -1144,6 +1187,7 @@ def garantir_colunas_oauth(conn):
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS google_refresh_token text"))
 
 
+@uma_vez
 def garantir_multiusuario(conn):
     """Schema do modelo multiusuário (assinatura → gerente + vendedores):
     - tabela `contas` (a assinatura, paga pelo ADM/gerente);
@@ -1236,6 +1280,7 @@ def garantir_multiusuario(conn):
     )
 
 
+@uma_vez
 def garantir_tabela_notificacoes(conn):
     conn.execute(
         text(
@@ -1290,6 +1335,7 @@ def garantir_tabela_notificacoes(conn):
 ORCAMENTO_STATUS = ["rascunho", "enviado", "em_negociacao", "aprovado", "recusado"]
 
 
+@uma_vez
 def garantir_vendas(conn):
     """Catálogo de equipamentos + orçamentos e seus itens.
 
@@ -1360,6 +1406,32 @@ def garantir_vendas(conn):
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orcamentos_empresa ON orcamentos(empresa_id)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_orc_itens_orcamento ON orcamento_itens(orcamento_id)"))
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_equipamentos_conta ON equipamentos(conta_id)"))
+
+
+def aplicar_migracoes():
+    """Roda as migracoes na subida, numa transacao propria.
+
+    Assim a primeira requisicao ja encontra o schema pronto e nenhuma rota paga
+    a conta. Falha aqui nao derruba o processo: nada e marcado como feito, e o
+    caminho antigo -- cada rota aplicando a sua -- volta a valer sozinho.
+    """
+    try:
+        with engine.begin() as conn:
+            garantir_seguranca(conn)
+            garantir_tabela_segmentos(conn)
+            garantir_campos_pipeline(conn)
+            garantir_colunas_places(conn)
+            garantir_tabelas_places_cache(conn)
+            garantir_colunas_oauth(conn)
+            garantir_multiusuario(conn)
+            garantir_tabela_notificacoes(conn)
+            garantir_vendas(conn)
+        print("✅ migracoes aplicadas na subida:", len(_MIGRACOES_FEITAS))
+    except Exception as e:  # noqa: BLE001 - qualquer falha cai no plano antigo
+        print("⚠️ migracoes na subida falharam, cada rota aplica a sua:", e)
+
+
+aplicar_migracoes()
 
 
 # =========================
