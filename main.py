@@ -5483,13 +5483,32 @@ def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
                     COUNT(*) AS total_empresas,
                     COUNT(*) FILTER (WHERE status = 'Ganho') AS ganhos,
                     COUNT(*) FILTER (WHERE status = 'Perdido') AS perdidos,
-                    COUNT(*) FILTER (WHERE status_cadastro = 'rascunho') AS rascunhos,
-                    COALESCE(SUM(ticket_medio_estimado), 0) AS ticket_total
+                    COUNT(*) FILTER (WHERE status_cadastro = 'rascunho') AS rascunhos
                 FROM empresas WHERE conta_id = :cid {trecho}
             """
             ),
             params,
         ).fetchone()
+
+        # Pipeline em dinheiro. Era SUM(ticket_medio_estimado) — um campo que o
+        # vendedor digitava no cadastro e ninguem revisava depois; o front parou
+        # de preencher esse campo. Agora e o valor dos orcamentos que ja foram
+        # para o cliente e continuam sem decisao. Rascunho fica de fora: enquanto
+        # nao sai daqui, nao e dinheiro em jogo.
+        trecho_emp, _ = filtro_escopo(conn, auth, prefixo="e.")
+        ticket_total = conn.execute(
+            text(
+                f"""
+                SELECT COALESCE(SUM(o.total), 0)
+                FROM orcamentos o
+                JOIN empresas e ON e.empresa_id = o.empresa_id
+                WHERE o.conta_id = :cid
+                  AND o.status IN ('enviado', 'em_negociacao')
+                  {trecho_emp}
+            """
+            ),
+            params,
+        ).scalar()
 
         total_vendedores = conn.execute(
             text(
@@ -5508,7 +5527,15 @@ def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
                        COUNT(e.empresa_id) FILTER (WHERE e.status = 'Ganho') AS ganhos,
                        COUNT(e.empresa_id) FILTER (WHERE e.status = 'Perdido') AS perdidos,
                        COUNT(e.empresa_id) FILTER (WHERE e.status_cadastro = 'rascunho') AS rascunhos,
-                       COALESCE(SUM(e.ticket_medio_estimado), 0) AS ticket_total,
+                       COALESCE((
+                           SELECT SUM(o.total) FROM orcamentos o
+                           WHERE o.conta_id = :cid
+                             AND o.status IN ('enviado', 'em_negociacao')
+                             AND o.empresa_id IN (
+                                 SELECT empresa_id FROM empresas
+                                 WHERE conta_id = :cid AND vendedor_id = u.usuario_id
+                             )
+                       ), 0) AS ticket_total,
                        MAX(e.status_atualizado_em) AS ultima_atividade
                 FROM usuarios u
                 LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id AND e.conta_id = :cid
@@ -5540,7 +5567,7 @@ def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
             "ganhos": totais.ganhos,
             "perdidos": totais.perdidos,
             "rascunhos": totais.rascunhos,
-            "ticket_total": float(totais.ticket_total or 0),
+            "ticket_total": float(ticket_total or 0),
             "total_vendedores": total_vendedores,
         },
         "distribuicao_status": distribuicao_status,
