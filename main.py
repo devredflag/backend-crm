@@ -777,7 +777,6 @@ class EmpresaCreate(BaseModel):
     site: str | None = None
     linkedin_empresa: str | None = None
     responsavel_principal: str | None = None
-    ticket_medio_estimado: float | None = None
     status: str | None = None
     origem_lead: str | None = None
     ultima_interacao: datetime | None = None
@@ -812,7 +811,6 @@ class EmpresaUpdate(BaseModel):
     site: str | None = None
     linkedin_empresa: str | None = None
     responsavel_principal: str | None = None
-    ticket_medio_estimado: float | None = None
     status: str | None = None
     status_cadastro: str | None = None
     origem_lead: str | None = None
@@ -4936,12 +4934,12 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
             text(
                 """
             INSERT INTO empresas (empresa_id, nome, segmento, porte, cidade, endereco, numero, cep, bairro, regiao,
-                observacoes, cnpj, site, linkedin_empresa, responsavel_principal, ticket_medio_estimado,
+                observacoes, cnpj, site, linkedin_empresa, responsavel_principal,
                 status, origem_lead, ultima_interacao, proxima_acao, data_proxima_acao, status_atualizado_em,
                 motivo_perdido, temperatura, logo_url, criado_em, conta_id, vendedor_id,
                 google_place_id, latitude, longitude, google_rating, google_rating_count, business_status, google_synced_at)
             VALUES (:id, :nome, :segmento, :porte, :cidade, :endereco, :numero, :cep, :bairro, :regiao,
-                :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal, :ticket_medio_estimado,
+                :observacoes, :cnpj, :site, :linkedin_empresa, :responsavel_principal,
                 :status, :origem_lead, :ultima_interacao, :proxima_acao, :data_proxima_acao, NOW(),
                 :motivo_perdido, :temperatura, :logo_url, NOW(), :conta_id, :vendedor_id,
                 :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status, :google_synced_at)
@@ -4963,7 +4961,6 @@ def criar_empresa(empresa: EmpresaCreate, auth: dict = Depends(get_auth)):
                 "site": empresa.site,
                 "linkedin_empresa": empresa.linkedin_empresa,
                 "responsavel_principal": empresa.responsavel_principal or auth["email"],
-                "ticket_medio_estimado": empresa.ticket_medio_estimado,
                 "conta_id": auth["conta_id"],
                 "vendedor_id": auth["usuario_id"],
                 "status": empresa.status or "Lead",
@@ -5020,7 +5017,6 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 observacoes=COALESCE(:observacoes,observacoes), cnpj=COALESCE(:cnpj,cnpj), site=COALESCE(:site,site),
                 linkedin_empresa=COALESCE(:linkedin_empresa,linkedin_empresa),
                 responsavel_principal=COALESCE(:responsavel_principal,responsavel_principal),
-                ticket_medio_estimado=COALESCE(:ticket_medio_estimado,ticket_medio_estimado),
                 status=COALESCE(:status,status), status_cadastro=COALESCE(:status_cadastro,status_cadastro),
                 origem_lead=COALESCE(:origem_lead,origem_lead),
                 ultima_interacao=COALESCE(:ultima_interacao,ultima_interacao),
@@ -5048,7 +5044,6 @@ def atualizar_empresa(empresa_id: str, empresa: EmpresaUpdate, auth: dict = Depe
                 "site": empresa.site,
                 "linkedin_empresa": empresa.linkedin_empresa,
                 "responsavel_principal": empresa.responsavel_principal,
-                "ticket_medio_estimado": empresa.ticket_medio_estimado,
                 "status": empresa.status,
                 "status_cadastro": empresa.status_cadastro,
                 "origem_lead": empresa.origem_lead,
