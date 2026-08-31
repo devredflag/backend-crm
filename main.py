@@ -1007,6 +1007,13 @@ class EquipamentoUpdate(BaseModel):
     ativo: Optional[bool] = None
 
 
+class ObservacaoCreate(BaseModel):
+    texto: str
+    # Marcador livre (Comercial, Financeiro, Logistica...) -- a lista fica no
+    # front de proposito: e vocabulario de equipe, muda sem migracao.
+    marcador: Optional[str] = None
+
+
 class OrcamentoItemIn(BaseModel):
     equipamento_id: Optional[str] = None
     descricao: str
@@ -1468,6 +1475,34 @@ def garantir_vendas(conn):
     conn.execute(text("CREATE INDEX IF NOT EXISTS idx_equipamentos_conta ON equipamentos(conta_id)"))
 
 
+@uma_vez
+def garantir_observacoes(conn):
+    """Feed de observacoes da empresa: uma linha por anotacao, com autor e data.
+
+    A coluna `empresas.observacoes` continua existindo e nao muda de dono -- ela
+    e o texto do cadastro, editado no formulario da empresa. Isto aqui e outra
+    coisa: o que a equipe foi anotando ao longo do relacionamento, que num campo
+    unico so daria para acumular apagando o que veio antes.
+    """
+    conn.execute(
+        text(
+            """
+        CREATE TABLE IF NOT EXISTS empresa_observacoes (
+            observacao_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            empresa_id UUID NOT NULL REFERENCES empresas(empresa_id) ON DELETE CASCADE,
+            autor_id UUID,
+            texto TEXT NOT NULL,
+            marcador TEXT,
+            criado_em TIMESTAMP DEFAULT NOW()
+        )
+    """
+        )
+    )
+    conn.execute(
+        text("CREATE INDEX IF NOT EXISTS idx_empresa_obs ON empresa_observacoes(empresa_id, criado_em DESC)")
+    )
+
+
 def aplicar_migracoes():
     """Roda as migracoes na subida, numa transacao propria.
 
@@ -1488,6 +1523,7 @@ def aplicar_migracoes():
             garantir_multiusuario(conn)
             garantir_tabela_notificacoes(conn)
             garantir_vendas(conn)
+            garantir_observacoes(conn)
         print("✅ migracoes aplicadas na subida:", len(_MIGRACOES_FEITAS))
     except Exception as e:  # noqa: BLE001 - qualquer falha cai no plano antigo
         print("⚠️ migracoes na subida falharam, cada rota aplica a sua:", e)
@@ -5053,6 +5089,102 @@ def listar_contatos_por_empresa(empresa_id: str, auth: dict = Depends(get_auth))
             {"id": empresa_id},
         )
         return [dict(row._mapping) for row in result]
+
+
+@app.get("/empresas/{empresa_id}/produtos")
+def produtos_da_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
+    """O que esta empresa ja comprou, consolidado por item.
+
+    Sai dos itens dos orcamentos APROVADOS -- e o mais perto de "venda
+    faturada" que o sistema tem, ja que nao existe tabela de pedidos. Rascunho,
+    enviado e recusado ficam de fora: intencao nao e compra.
+
+    Agrupa por `descricao` e nao por `equipamento_id` porque item avulso nao tem
+    equipamento: agrupar pelo id jogaria todo avulso num balde NULL so.
+    """
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
+        rows = conn.execute(
+            text(
+                """SELECT i.descricao AS nome,
+                          SUM(i.quantidade)::int AS quantidade,
+                          SUM(i.quantidade * i.preco_unitario) AS valor,
+                          COUNT(DISTINCT o.orcamento_id)::int AS compras,
+                          MAX(COALESCE(o.data_decisao, o.data_envio, o.criado_em)) AS ultima_compra
+                   FROM orcamento_itens i
+                   JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
+                   WHERE o.empresa_id = :eid AND o.status = 'aprovado'
+                   GROUP BY i.descricao
+                   ORDER BY valor DESC"""
+            ),
+            {"eid": empresa_id},
+        )
+        return [dict(r._mapping) for r in rows]
+
+
+@app.get("/empresas/{empresa_id}/observacoes")
+def listar_observacoes(empresa_id: str, auth: dict = Depends(get_auth)):
+    with engine.begin() as conn:
+        garantir_observacoes(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
+        rows = conn.execute(
+            text(
+                """SELECT ob.*, u.nome AS autor_nome
+                   FROM empresa_observacoes ob
+                   LEFT JOIN usuarios u ON u.usuario_id = ob.autor_id
+                   WHERE ob.empresa_id = :eid
+                   ORDER BY ob.criado_em DESC"""
+            ),
+            {"eid": empresa_id},
+        )
+        return [dict(r._mapping) for r in rows]
+
+
+@app.post("/empresas/{empresa_id}/observacoes")
+def criar_observacao(empresa_id: str, dados: ObservacaoCreate, auth: dict = Depends(get_auth)):
+    texto = (dados.texto or "").strip()
+    if not texto:
+        raise HTTPException(400, "A observação não pode ficar vazia.")
+    with engine.begin() as conn:
+        garantir_observacoes(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
+        row = conn.execute(
+            text(
+                """INSERT INTO empresa_observacoes (empresa_id, autor_id, texto, marcador)
+                   VALUES (:eid, :aid, :txt, :mkr)
+                   RETURNING observacao_id, empresa_id, autor_id, texto, marcador, criado_em"""
+            ),
+            {"eid": empresa_id, "aid": auth["usuario_id"], "txt": texto,
+             "mkr": (dados.marcador or None)},
+        ).fetchone()
+        criada = dict(row._mapping)
+        # Devolve ja com o nome do autor: a tela insere a nota na lista sem
+        # precisar rebuscar tudo so para descobrir quem escreveu.
+        criada["autor_nome"] = conn.execute(
+            text("SELECT nome FROM usuarios WHERE usuario_id = :id"), {"id": auth["usuario_id"]}
+        ).scalar()
+        return criada
+
+
+@app.delete("/empresas/{empresa_id}/observacoes/{observacao_id}")
+def excluir_observacao(empresa_id: str, observacao_id: str, auth: dict = Depends(get_auth)):
+    """Apaga uma anotacao. Autor apaga a sua; gerente apaga qualquer uma."""
+    with engine.begin() as conn:
+        garantir_observacoes(conn)
+        checar_acesso_empresa(conn, empresa_id, auth)
+        dono = conn.execute(
+            text("SELECT autor_id FROM empresa_observacoes WHERE observacao_id = :id AND empresa_id = :eid"),
+            {"id": observacao_id, "eid": empresa_id},
+        ).fetchone()
+        if not dono:
+            raise HTTPException(404, "Observação não encontrada")
+        if auth.get("role") != "gerente" and str(dono.autor_id) != str(auth["usuario_id"]):
+            raise HTTPException(403, "Só o autor ou um gerente pode excluir esta observação.")
+        conn.execute(
+            text("DELETE FROM empresa_observacoes WHERE observacao_id = :id"), {"id": observacao_id}
+        )
+        return {"ok": True}
 
 
 # Empresas sem coordenada mas com algum endereço aproveitável
