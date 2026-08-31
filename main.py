@@ -6796,7 +6796,14 @@ def _orcamento_do_usuario(conn, orcamento_id: str, auth: dict):
 @app.get("/orcamentos")
 def listar_orcamentos(auth: dict = Depends(get_auth), status: Optional[str] = None,
                       empresa_id: Optional[str] = None):
-    """Lista orçamentos da carteira, com o nome da empresa já resolvido."""
+    """Lista orçamentos da carteira, com empresa, vendedor e resumo dos itens
+    já resolvidos.
+
+    O vendedor e os itens vêm no mesmo SELECT de propósito: a ficha da empresa
+    mostra uma linha por orçamento com quem vendeu e do que se trata, e buscar
+    isso por linha seria N+1 num endpoint que o front relê de 5 em 5 segundos.
+    `item_principal` é o item de maior valor do orçamento — é ele que diz do que
+    a proposta trata, não o primeiro cadastrado."""
     with engine.begin() as conn:
         garantir_vendas(conn)
         escopo, params = _escopo_vendas(conn, auth)
@@ -6808,9 +6815,22 @@ def listar_orcamentos(auth: dict = Depends(get_auth), status: Optional[str] = No
             params["eid"] = empresa_id
         rows = conn.execute(
             text(
-                f"""SELECT o.*, e.nome AS empresa_nome
+                f"""SELECT o.*, e.nome AS empresa_nome, u.nome AS vendedor_nome,
+                           COALESCE(it.qtd_itens, 0) AS qtd_itens,
+                           COALESCE(it.qtd_pecas, 0) AS qtd_pecas,
+                           it.item_principal
                     FROM orcamentos o
                     LEFT JOIN empresas e ON e.empresa_id = o.empresa_id
+                    LEFT JOIN usuarios u ON u.usuario_id = o.vendedor_id
+                    LEFT JOIN LATERAL (
+                        SELECT COUNT(*)::int AS qtd_itens,
+                               COALESCE(SUM(i.quantidade), 0)::int AS qtd_pecas,
+                               (array_agg(i.descricao
+                                    ORDER BY i.quantidade * i.preco_unitario DESC))[1]
+                                    AS item_principal
+                        FROM orcamento_itens i
+                        WHERE i.orcamento_id = o.orcamento_id
+                    ) it ON TRUE
                     WHERE {escopo}
                     ORDER BY o.atualizado_em DESC NULLS LAST, o.criado_em DESC"""
             ),
