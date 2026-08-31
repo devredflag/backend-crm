@@ -8,7 +8,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -100,6 +100,24 @@ BACKEND_URL = os.getenv("BACKEND_URL", "https://backend-crm-production-157b.up.r
 OUTLOOK_WEBHOOK_SECRET = os.getenv("OUTLOOK_WEBHOOK_SECRET", "crm-webhook-secret")
 GMAIL_PUBSUB_TOPIC = os.getenv("GMAIL_PUBSUB_TOPIC", "projects/SEU_PROJECT_ID/topics/gmail-crm-push")
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY")
+
+# --- Teto de chamadas PAGAS ao Google Places -------------------------------
+# O cache absorve a repeticao de segmento/cidade, mas quem paga a conta e o
+# cache miss: cada um vira uma chamada de verdade ao Text Search. Ate aqui o
+# unico limite era o do proprio Google, ou seja, so descobriamos o estouro
+# depois de gastar. Este contador barra ANTES da chamada, por USUARIO e por MES:
+# o balde e individual, entao um vendedor sozinho nao consome a folga dos outros
+# -- e o gasto maximo da conta e este limite vezes o numero de vendedores.
+# Acerto de cache nao consome nada: so o cache miss vira chamada paga.
+#   PLACES_LIMITE_MENSAL=0 -> desliga a busca paga (a tela so responde do cache).
+PLACES_LIMITE_MENSAL = int(os.getenv("PLACES_LIMITE_MENSAL", "50"))
+# O mes da cota vira a meia-noite do dia 1 deste fuso, em offset fixo de horas.
+# -3 e o horario de Brasilia; o Brasil nao tem horario de verao desde 2019,
+# entao o offset fixo evita depender do tzdata dentro do container.
+PLACES_FUSO_HORAS = float(os.getenv("PLACES_FUSO_HORAS", "-3"))
+# Quando quem recusa e o Google, nao da para saber o reset -- pode ser limite
+# por minuto ou o teto da conta no Google Cloud. Seguramos a tela essa janela.
+PLACES_ESPERA_GOOGLE_MIN = int(os.getenv("PLACES_ESPERA_GOOGLE_MIN", "15"))
 
 engine = create_engine(DATABASE_URL)
 
@@ -943,6 +961,10 @@ class PlacesSearchRequest(BaseModel):
     radius: int = 15000
 
 
+class PlacesTetoUpdate(BaseModel):
+    ligado: bool
+
+
 class RascunhoCreate(BaseModel):
     google_place_id: str | None = None
     nome: str
@@ -1175,6 +1197,44 @@ def garantir_tabelas_places_cache(conn):
             rank_position INTEGER NOT NULL,
             month VARCHAR(7) NOT NULL,
             saved_date TIMESTAMP DEFAULT NOW()
+        )
+    """))
+
+
+@uma_vez
+def garantir_tabela_places_uso(conn):
+    """Contador de chamadas PAGAS ao Google Places, por usuario e por mes.
+
+    `chave` e o usuario_id de quem buscou: cada um tem o proprio balde, entao
+    ninguem gasta a cota do colega e da para ver quem consumiu o que. A coluna e
+    TEXT (nao UUID) porque usuario sem usuario_id cai no proprio e-mail.
+    `mes` e 'AAAA-MM', mesmo formato de places_ranking.month.
+    Nao confundir com places_cache.search_count, que e popularidade do termo
+    para o ranking e conta tambem os acertos de cache (que nao custam nada).
+    As linhas do mes anterior ficam: sao o historico de consumo por vendedor."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS places_uso_mensal (
+            chave TEXT NOT NULL,
+            mes VARCHAR(7) NOT NULL,
+            chamadas INTEGER NOT NULL DEFAULT 0,
+            atualizado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (chave, mes)
+        )
+    """))
+
+
+@uma_vez
+def garantir_tabela_places_teto(conn):
+    """Interruptor do teto mensal, por conta (assinatura).
+
+    Ausencia de linha = teto LIGADO. O default seguro e o limite valendo: se
+    esta tabela sumisse, a conta volta a ser protegida, nao o contrario."""
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS places_teto_conta (
+            conta_id TEXT PRIMARY KEY,
+            ligado BOOLEAN NOT NULL DEFAULT TRUE,
+            alterado_em TIMESTAMP NOT NULL DEFAULT NOW(),
+            alterado_por TEXT
         )
     """))
 
@@ -1422,6 +1482,8 @@ def aplicar_migracoes():
             garantir_campos_pipeline(conn)
             garantir_colunas_places(conn)
             garantir_tabelas_places_cache(conn)
+            garantir_tabela_places_uso(conn)
+            garantir_tabela_places_teto(conn)
             garantir_colunas_oauth(conn)
             garantir_multiusuario(conn)
             garantir_tabela_notificacoes(conn)
@@ -4474,8 +4536,186 @@ def _recalcular_cadastradas(results_list: list) -> list:
     return results_list
 
 
+# =========================================================================
+# TETO MENSAL DE CHAMADAS PAGAS AO GOOGLE PLACES
+# =========================================================================
+def _fuso_cota_places() -> timezone:
+    return timezone(timedelta(hours=PLACES_FUSO_HORAS))
+
+
+def _mes_cota_places() -> str:
+    """Competencia do balde, 'AAAA-MM', no fuso configurado."""
+    return datetime.now(_fuso_cota_places()).strftime("%Y-%m")
+
+
+def _reset_cota_places() -> datetime:
+    """Instante em UTC em que o balde zera: meia-noite do dia 1 do mes seguinte."""
+    agora = datetime.now(_fuso_cota_places())
+    # Dia 28 + 4 dias cai sempre no mes seguinte, em qualquer mes do calendario.
+    proximo = (agora.replace(day=28) + timedelta(days=4)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    return proximo.astimezone(timezone.utc)
+
+
+def _chave_cota_places(auth: dict) -> str:
+    """Balde individual: o teto e por usuario, nao por assinatura."""
+    return f"usuario:{auth['usuario_id']}" if auth.get("usuario_id") else f"email:{auth['email']}"
+
+
+def _chave_conta_places(auth: dict) -> str:
+    """O consumo e por usuario, mas o interruptor e da conta: quem decide
+    desligar o teto e o gerente, e a decisao vale para a assinatura inteira."""
+    return f"conta:{auth['conta_id']}" if auth.get("conta_id") else f"email:{auth['email']}"
+
+
+def _teto_ligado(conta_chave: str) -> bool:
+    with engine.begin() as conn:
+        garantir_tabela_places_teto(conn)
+        valor = conn.execute(
+            text("SELECT ligado FROM places_teto_conta WHERE conta_id = :c"),
+            {"c": conta_chave},
+        ).scalar()
+    return True if valor is None else bool(valor)
+
+
+def _detalhe_cota_places(usadas: int) -> dict:
+    """Corpo do 429 do NOSSO teto. O front desabilita o campo ate `reset_em` e
+    mostra `mensagem` -- por isso a mensagem tem de ser verdadeira: o contador
+    zera na virada do mes do fuso configurado, nao "amanha" por suposicao."""
+    if PLACES_LIMITE_MENSAL <= 0:
+        msg = ("Busca nova esta desativada (limite mensal configurado como 0). "
+               "O que ja esta em cache continua abrindo.")
+    else:
+        msg = (f"Voce atingiu seu limite de {PLACES_LIMITE_MENSAL} buscas novas no mes. "
+               "Buscas ja feitas antes continuam abrindo pelo cache, sem custo.")
+    return {
+        "erro": "limite_mensal_places",
+        "escopo": "usuario",
+        "usadas": usadas,
+        "limite": PLACES_LIMITE_MENSAL,
+        "reset_em": _reset_cota_places().isoformat(),
+        "mensagem": msg,
+    }
+
+
+def reservar_chamada_places(auth: dict) -> int:
+    """Reserva UMA chamada paga antes de chamar o Google. Levanta 429 no estouro.
+
+    Cobra primeiro e estorna se a chamada nao acontecer (`devolver_chamada_places`).
+    O caminho inverso -- contar depois -- deixaria duas requisicoes simultaneas
+    passarem pelo mesmo ultimo credito. Aqui o `ON CONFLICT ... WHERE` resolve a
+    corrida dentro do proprio UPDATE: quem perde nao recebe linha de volta.
+
+    Com o teto desligado pelo gerente, continua CONTANDO e para de BARRAR: o
+    numero de /places/cota segue valendo (e como se ve o consumo real durante o
+    teste), e o unico limite que resta e o do Google Cloud."""
+    chave = _chave_cota_places(auth)
+    if not _teto_ligado(_chave_conta_places(auth)):
+        with engine.begin() as conn:
+            garantir_tabela_places_uso(conn)
+            return conn.execute(
+                text("""
+                    INSERT INTO places_uso_mensal (chave, mes, chamadas, atualizado_em)
+                    VALUES (:chave, :mes, 1, NOW())
+                    ON CONFLICT (chave, mes) DO UPDATE
+                       SET chamadas = places_uso_mensal.chamadas + 1, atualizado_em = NOW()
+                    RETURNING chamadas
+                """),
+                {"chave": chave, "mes": _mes_cota_places()},
+            ).scalar()
+    if PLACES_LIMITE_MENSAL <= 0:
+        raise HTTPException(429, detail=_detalhe_cota_places(0))
+    with engine.begin() as conn:
+        garantir_tabela_places_uso(conn)
+        usadas = conn.execute(
+            text("""
+                INSERT INTO places_uso_mensal (chave, mes, chamadas, atualizado_em)
+                VALUES (:chave, :mes, 1, NOW())
+                ON CONFLICT (chave, mes) DO UPDATE
+                   SET chamadas = places_uso_mensal.chamadas + 1, atualizado_em = NOW()
+                 WHERE places_uso_mensal.chamadas < :limite
+                RETURNING chamadas
+            """),
+            {"chave": chave, "mes": _mes_cota_places(), "limite": PLACES_LIMITE_MENSAL},
+        ).scalar()
+    if usadas is None:
+        raise HTTPException(429, detail=_detalhe_cota_places(PLACES_LIMITE_MENSAL))
+    return usadas
+
+
+def devolver_chamada_places(chave: str) -> None:
+    """Estorna a reserva quando a chamada nao chegou a ser faturada.
+
+    O Google cobra a resposta 200; timeout, 5xx e recusa por cota nao geram
+    cobranca, entao tambem nao podem consumir o teto do mes."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE places_uso_mensal
+                       SET chamadas = GREATEST(chamadas - 1, 0), atualizado_em = NOW()
+                     WHERE chave = :chave AND mes = :mes
+                """),
+                {"chave": chave, "mes": _mes_cota_places()},
+            )
+    except Exception as e:  # noqa: BLE001 - estorno nunca derruba a requisicao
+        print("⚠️ falha ao estornar cota do places:", e)
+
+
+def ler_cota_places(auth: dict) -> dict:
+    ligado = _teto_ligado(_chave_conta_places(auth))
+    with engine.begin() as conn:
+        garantir_tabela_places_uso(conn)
+        usadas = conn.execute(
+            text("SELECT chamadas FROM places_uso_mensal WHERE chave = :c AND mes = :m"),
+            {"c": _chave_cota_places(auth), "m": _mes_cota_places()},
+        ).scalar() or 0
+    bloqueado = ligado and usadas >= PLACES_LIMITE_MENSAL
+    return {
+        "usadas": usadas,
+        "limite": PLACES_LIMITE_MENSAL,
+        "restantes": max(PLACES_LIMITE_MENSAL - usadas, 0) if ligado else None,
+        "bloqueado": bloqueado,
+        "teto_ligado": ligado,
+        # So o gerente alterna: o vendedor nao levanta o proprio teto.
+        "pode_alternar": auth.get("is_gerente", False),
+        "reset_em": _reset_cota_places().isoformat(),
+        "mensagem": _detalhe_cota_places(usadas)["mensagem"] if bloqueado else None,
+    }
+
+
+@app.get("/places/cota")
+def cota_places(auth: dict = Depends(get_auth)):
+    """Estado do teto do mes. O front le isto na montagem em vez de adivinhar
+    pelo localStorage -- a verdade sobre a cota mora no servidor."""
+    return ler_cota_places(auth)
+
+
+@app.post("/places/cota/teto")
+def alternar_teto_places(req: PlacesTetoUpdate, auth: dict = Depends(exigir_gerente)):
+    """Liga/desliga o teto mensal da conta (o botao de teste do gerente).
+
+    Desligado, nenhuma busca e barrada pelo nosso lado -- o unico limite que
+    sobra e o do Google Cloud. Por isso a rota e do gerente, guarda quem mexeu
+    e a hora, e o padrao continua sendo LIGADO."""
+    with engine.begin() as conn:
+        garantir_tabela_places_teto(conn)
+        conn.execute(
+            text("""
+                INSERT INTO places_teto_conta (conta_id, ligado, alterado_em, alterado_por)
+                VALUES (:c, :ligado, NOW(), :quem)
+                ON CONFLICT (conta_id) DO UPDATE
+                   SET ligado = :ligado, alterado_em = NOW(), alterado_por = :quem
+            """),
+            {"c": _chave_conta_places(auth), "ligado": req.ligado, "quem": auth["email"]},
+        )
+    return ler_cota_places(auth)
+
+
 @app.post("/places/search")
-async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(get_current_user)):
+async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)):
+    usuario_email = auth["email"]
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(503, "Google Places API não configurada")
 
@@ -4513,6 +4753,10 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
             results = cached.results if isinstance(cached.results, list) else json.loads(cached.results)
             return _recalcular_cadastradas(results)
 
+    # Cache miss: daqui para frente a chamada e paga. O teto entra ANTES dela.
+    chave_cota = _chave_cota_places(auth)
+    reservar_chamada_places(auth)
+
     # 3. Chama Google Places API
     payload = {
         "textQuery": req.query,
@@ -4531,8 +4775,16 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
         # (id/displayName/formattedAddress/location) não adicionam custo.
         "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.location,places.businessStatus,places.primaryTypeDisplayName",
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=api_headers)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post("https://places.googleapis.com/v1/places:searchText", json=payload, headers=api_headers)
+    except httpx.HTTPError as e:
+        devolver_chamada_places(chave_cota)
+        raise HTTPException(502, f"Google Places indisponivel: {e}")
+
+    # So resposta 200 e faturada; qualquer outra devolve o credito reservado.
+    if resp.status_code != 200:
+        devolver_chamada_places(chave_cota)
 
     if resp.status_code == 429 or (
         resp.status_code != 200 and
@@ -4547,9 +4799,19 @@ async def search_places(req: PlacesSearchRequest, usuario_email: str = Depends(g
             if not existe:
                 conn.execute(
                     text("INSERT INTO notificacoes (notificacao_id, usuario_email, tipo, titulo, mensagem, lida, criado_em) VALUES (:id, :e, 'quota_exceeded', :titulo, :msg, FALSE, NOW())"),
-                    {"id": str(uuid.uuid4()), "e": usuario_email, "titulo": "Limite do Google Places atingido", "msg": "O limite gratuito da API foi atingido. A busca voltará disponível amanhã."},
+                    {"id": str(uuid.uuid4()), "e": usuario_email, "titulo": "Google recusou a busca por cota", "msg": f"O Google recusou a busca por limite de cota. Pode ser o limite por minuto ou o teto da conta no Google Cloud — a tela libera nova tentativa em {PLACES_ESPERA_GOOGLE_MIN} min."},
                 )
-        raise HTTPException(429, "Cota da Google Places API esgotada. A busca voltará disponível amanhã.")
+        raise HTTPException(429, detail={
+            "erro": "cota_google",
+            "escopo": "google",
+            "usadas": None,
+            "limite": None,
+            "reset_em": (datetime.now(timezone.utc) + timedelta(minutes=PLACES_ESPERA_GOOGLE_MIN)).isoformat(),
+            # Aqui quem recusou foi o Google, e nao da para afirmar quando volta:
+            # o 429 dele cobre tanto limite por minuto quanto teto da conta.
+            "mensagem": ("O Google recusou a busca por cota — pode ser o limite por minuto ou o teto "
+                         f"da conta no Google Cloud. Nova tentativa liberada em {PLACES_ESPERA_GOOGLE_MIN} min."),
+        })
 
     if resp.status_code != 200:
         raise HTTPException(502, f"Google Places erro: {resp.text}")
@@ -4913,10 +5175,11 @@ async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(g
 
 
 @app.get("/empresas/{empresa_id}/google-refresh")
-async def refresh_google_empresa(empresa_id: str, usuario_email: str = Depends(get_current_user)):
+async def refresh_google_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
     """Re-busca o snapshot volátil do Google (rating/contagem/status) usando o
     google_place_id já persistido na empresa. Usa Place Details by ID com field
-    mask enxuto — mais barato que o text search e fora da quota da tela de busca."""
+    mask enxuto — mais barato que o text search, mas conta no mesmo teto mensal
+    do usuário (ver reservar_chamada_places)."""
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(503, "Google Places API não configurada")
 
@@ -4936,12 +5199,23 @@ async def refresh_google_empresa(empresa_id: str, usuario_email: str = Depends(g
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
         "X-Goog-FieldMask": "id,rating,userRatingCount,businessStatus",
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            f"https://places.googleapis.com/v1/places/{place_id}",
-            headers=api_headers,
-            params={"languageCode": "pt-BR", "regionCode": "BR"},
-        )
+    # Details by ID e mais barato que o text search, mas nao e de graca: entra
+    # no mesmo teto mensal do usuario, senao o limite da busca seria contornavel.
+    chave_cota = _chave_cota_places(auth)
+    reservar_chamada_places(auth)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://places.googleapis.com/v1/places/{place_id}",
+                headers=api_headers,
+                params={"languageCode": "pt-BR", "regionCode": "BR"},
+            )
+    except httpx.HTTPError as e:
+        devolver_chamada_places(chave_cota)
+        raise HTTPException(502, f"Google Places indisponivel: {e}")
+
+    if resp.status_code != 200:
+        devolver_chamada_places(chave_cota)
 
     if resp.status_code == 429 or (
         resp.status_code != 200 and
