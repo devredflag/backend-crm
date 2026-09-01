@@ -7354,6 +7354,12 @@ def insights_vendas(auth: dict = Depends(get_auth)):
         # esta responde "o que a gente mais GANHA", que e outra pergunta e a que
         # decide catalogo e desconto. Um item muito orcado e pouco aprovado e o
         # sinal mais barato de preco fora do mercado que este CRM consegue dar.
+        #
+        # O LIMIT e folgado de proposito: o front monta "mais vendidos" E "menos
+        # vendidos" a partir desta lista, e um limite apertado cortaria
+        # justamente a cauda que a segunda metade precisa. So itens que ja
+        # apareceram em algum orcamento entram (INNER JOIN) -- "nunca ofertado"
+        # e outra pergunta, e sai do catalogo, nao daqui.
         por_equipamento = conn.execute(
             text(
                 f"""SELECT COALESCE(eq.nome, i.descricao) AS nome,
@@ -7376,7 +7382,7 @@ def insights_vendas(auth: dict = Depends(get_auth)):
                     WHERE {escopo}
                     GROUP BY COALESCE(eq.nome, i.descricao), COALESCE(eq.tipo, 'equipamento')
                     ORDER BY valor_aprovado DESC, quantidade DESC
-                    LIMIT 40"""
+                    LIMIT 200"""
             ),
             params,
         )
