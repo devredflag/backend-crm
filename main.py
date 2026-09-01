@@ -4826,6 +4826,14 @@ def _bias_localizacao(lat: float, lng: float, raio_m: int) -> dict:
 
 @app.post("/places/search")
 async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)):
+    """Busca empresas no Google Places dentro de um raio.
+
+    `radius` vem em metros e faz parte da identidade do resultado: a mesma query
+    no mesmo ponto com raios diferentes sao buscas diferentes, e o cache
+    (30 dias) e chaveado tambem por ele. Ate 50 km a area e um circulo; acima
+    disso a Places API recusa o circulo e usamos um retangulo que o envolve,
+    entao entram tambem os cantos. O retorno e limitado a 20 empresas
+    independentemente do raio -- raio maior amplia a area, nao a quantidade."""
     usuario_email = auth["email"]
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(503, "Google Places API não configurada")
