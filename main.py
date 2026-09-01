@@ -7235,7 +7235,8 @@ def atualizar_status_orcamento(orcamento_id: str, dados: OrcamentoStatusUpdate,
 
 @app.get("/vendas/insights")
 def insights_vendas(auth: dict = Depends(get_auth)):
-    """Números do dashboard de vendas: funil por status, valores e ranking de equipamentos."""
+    """Números do dashboard de vendas: funil por status, valores, tempo de resposta
+    e desempenho por equipamento (ofertado x aprovado x recusado)."""
     with engine.begin() as conn:
         garantir_vendas(conn)
         escopo, params = _escopo_vendas(conn, auth)
@@ -7263,7 +7264,68 @@ def insights_vendas(auth: dict = Depends(get_auth)):
                     LIMIT 10"""
             ),
             params,
+        ).fetchall()
+        # Metricas POR EQUIPAMENTO com desfecho, nao so popularidade.
+        # `equipamentos_mais_orcados` acima responde "o que a gente mais oferta";
+        # esta responde "o que a gente mais GANHA", que e outra pergunta e a que
+        # decide catalogo e desconto. Um item muito orcado e pouco aprovado e o
+        # sinal mais barato de preco fora do mercado que este CRM consegue dar.
+        por_equipamento = conn.execute(
+            text(
+                f"""SELECT COALESCE(eq.nome, i.descricao) AS nome,
+                           SUM(i.quantidade) AS quantidade,
+                           COALESCE(SUM(i.quantidade * i.preco_unitario),0) AS valor,
+                           COALESCE(SUM(i.quantidade)
+                               FILTER (WHERE o.status = 'aprovado'),0) AS qtd_aprovada,
+                           COALESCE(SUM(i.quantidade * i.preco_unitario)
+                               FILTER (WHERE o.status = 'aprovado'),0) AS valor_aprovado,
+                           COALESCE(SUM(i.quantidade)
+                               FILTER (WHERE o.status = 'recusado'),0) AS qtd_recusada,
+                           COALESCE(SUM(i.quantidade)
+                               FILTER (WHERE o.status IN ('enviado','em_negociacao')),0) AS qtd_aberta,
+                           COALESCE(SUM(i.quantidade * i.preco_unitario)
+                               FILTER (WHERE o.status IN ('enviado','em_negociacao')),0) AS valor_aberto
+                    FROM orcamento_itens i
+                    JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
+                    LEFT JOIN equipamentos eq ON eq.equipamento_id = i.equipamento_id
+                    WHERE {escopo}
+                    GROUP BY COALESCE(eq.nome, i.descricao)
+                    ORDER BY valor_aprovado DESC, quantidade DESC
+                    LIMIT 20"""
+            ),
+            params,
         )
+        equipamentos = []
+        for r in por_equipamento:
+            ganhou, perdeu = int(r.qtd_aprovada or 0), int(r.qtd_recusada or 0)
+            decidido = ganhou + perdeu
+            equipamentos.append({
+                "nome": r.nome,
+                "quantidade": int(r.quantidade or 0),
+                "valor": float(r.valor or 0),
+                "qtd_aprovada": ganhou,
+                "valor_aprovado": float(r.valor_aprovado or 0),
+                "qtd_recusada": perdeu,
+                "qtd_aberta": int(r.qtd_aberta or 0),
+                "valor_aberto": float(r.valor_aberto or 0),
+                # None (nao 0) quando nada foi decidido: "0% de aprovacao" e
+                # "ninguem respondeu ainda" sao leituras opostas, e o front
+                # precisa distinguir para nao acusar item que so foi ofertado.
+                "taxa_aprovacao": round(ganhou / decidido * 100, 1) if decidido else None,
+            })
+
+        # Quanto tempo o cliente leva para responder uma proposta enviada. E o
+        # numero que diz quando cobrar: sem ele o vendedor chuta o follow-up.
+        resposta = conn.execute(
+            text(
+                f"""SELECT AVG(EXTRACT(EPOCH FROM (o.data_decisao - o.data_envio)) / 86400.0)
+                    FROM orcamentos o
+                    WHERE {escopo} AND o.data_envio IS NOT NULL
+                      AND o.data_decisao IS NOT NULL AND o.data_decisao >= o.data_envio"""
+            ),
+            params,
+        ).scalar()
+
         aprovados = resumo["aprovado"]["total"]
         decididos = aprovados + resumo["recusado"]["total"]
         return {
@@ -7272,6 +7334,9 @@ def insights_vendas(auth: dict = Depends(get_auth)):
             "valor_em_aberto": resumo["enviado"]["valor"] + resumo["em_negociacao"]["valor"],
             "valor_aprovado": resumo["aprovado"]["valor"],
             "taxa_conversao": round(aprovados / decididos * 100, 1) if decididos else 0.0,
+            "ticket_medio": round(resumo["aprovado"]["valor"] / aprovados, 2) if aprovados else None,
+            "tempo_medio_resposta_dias": round(float(resposta), 1) if resposta is not None else None,
+            "equipamentos": equipamentos,
             "equipamentos_mais_orcados": [
                 {"nome": r.nome, "quantidade": int(r.quantidade or 0), "valor": float(r.valor or 0)}
                 for r in ranking
