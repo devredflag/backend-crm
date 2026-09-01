@@ -25,6 +25,7 @@ import hashlib
 import secrets as _secrets
 import threading
 import unicodedata
+import math
 import io
 import httpx
 import resend
@@ -954,6 +955,14 @@ class ReuniaoOutlook(BaseModel):
     emails_convidados: Optional[list[str]] = None
 
 
+# Teto do circulo aceito pelo locationBias da Places API. Acima disso a busca
+# passa a usar retangulo (ver _bias_localizacao).
+RAIO_CIRCULO_MAX_M = 50_000
+# Teto nosso, so para barrar valor absurdo digitado no campo livre. 2.000 km
+# cobre o Brasil inteiro a partir de qualquer ponto dele.
+RAIO_MAX_M = 2_000_000
+
+
 class PlacesSearchRequest(BaseModel):
     query: str
     lat: float | None = None
@@ -1195,6 +1204,22 @@ def garantir_tabelas_places_cache(conn):
             UNIQUE(query, lat_grid, lng_grid)
         )
     """))
+    # O raio faz parte da identidade do resultado: a mesma query no mesmo ponto
+    # com 20 km e com 300 km sao buscas diferentes. Sem ele na chave, escolher
+    # um raio maior devolvia o resultado estreito gravado antes -- e em silencio,
+    # porque cache servido nao da erro.
+    conn.execute(text(
+        "ALTER TABLE places_cache ADD COLUMN IF NOT EXISTS raio_grid INTEGER DEFAULT 15"))
+    conn.execute(text(
+        "UPDATE places_cache SET raio_grid = 15 WHERE raio_grid IS NULL"))
+    # A UNIQUE antiga (sem raio) sai; entra um indice com as quatro colunas. O
+    # ON CONFLICT do INSERT depende dele existir. E seguro rodar sobre dados:
+    # a chave nova e mais especifica que a antiga, entao nao ha como colidir.
+    conn.execute(text(
+        "ALTER TABLE places_cache DROP CONSTRAINT IF EXISTS places_cache_query_lat_grid_lng_grid_key"))
+    conn.execute(text(
+        """CREATE UNIQUE INDEX IF NOT EXISTS places_cache_chave
+           ON places_cache (query, lat_grid, lng_grid, raio_grid)"""))
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS places_ranking (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4779,6 +4804,26 @@ def alternar_teto_places(req: PlacesTetoUpdate, auth: dict = Depends(exigir_gere
     return ler_cota_places(auth)
 
 
+def _bias_localizacao(lat: float, lng: float, raio_m: int) -> dict:
+    """Area de busca para o `locationBias` do searchText.
+
+    Ate 50 km usa circulo, que e o que a API aceita e o que descreve melhor um
+    raio. Acima disso a API recusa o circulo, entao vira um retangulo que
+    ENVOLVE o circulo pedido -- area um pouco maior nos cantos, o que para
+    prospeccao e aceitavel (rede mais larga), e nao ha alternativa de circulo
+    grande na API."""
+    if raio_m <= RAIO_CIRCULO_MAX_M:
+        return {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(raio_m)}}
+    graus_lat = raio_m / 111_320.0
+    # Longitude encurta com a latitude; o cos evita um retangulo estreito demais
+    # longe do equador. O piso impede divisao por ~zero perto dos polos.
+    graus_lng = raio_m / (111_320.0 * max(math.cos(math.radians(lat)), 0.01))
+    return {"rectangle": {
+        "low": {"latitude": max(lat - graus_lat, -89.9), "longitude": max(lng - graus_lng, -179.9)},
+        "high": {"latitude": min(lat + graus_lat, 89.9), "longitude": min(lng + graus_lng, 179.9)},
+    }}
+
+
 @app.post("/places/search")
 async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)):
     usuario_email = auth["email"]
@@ -4789,6 +4834,11 @@ async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)
     lng = req.lng or -47.9292
     lat_grid = round(lat, 1)
     lng_grid = round(lng, 1)
+    # Raio em km inteiros, dentro dos limites. Arredondar agrupa buscas quase
+    # iguais (99,6 km e 100 km sao a mesma coisa) sem deixar o cache servir um
+    # raio visivelmente diferente do pedido.
+    raio_m = max(1_000, min(int(req.radius or 15000), RAIO_MAX_M))
+    raio_grid = round(raio_m / 1000)
     query_norm = _normalizar_query(req.query)
 
     # Bloqueia queries vazias/curtas demais para não gastar chamada paga.
@@ -4807,9 +4857,10 @@ async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)
             text("""
                 SELECT id, results FROM places_cache
                 WHERE query=:q AND lat_grid=:lat AND lng_grid=:lng
+                AND COALESCE(raio_grid, 15)=:raio
                 AND updated_at >= NOW() - INTERVAL '30 days'
             """),
-            {"q": query_norm, "lat": lat_grid, "lng": lng_grid},
+            {"q": query_norm, "lat": lat_grid, "lng": lng_grid, "raio": raio_grid},
         ).fetchone()
         if cached:
             conn.execute(
@@ -4826,7 +4877,7 @@ async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)
     # 3. Chama Google Places API
     payload = {
         "textQuery": req.query,
-        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(req.radius)}},
+        "locationBias": _bias_localizacao(lat, lng, raio_m),
         "languageCode": "pt-BR",
         "regionCode": "BR",
         "maxResultCount": 20,
@@ -4939,12 +4990,13 @@ async def search_places(req: PlacesSearchRequest, auth: dict = Depends(get_auth)
         garantir_tabelas_places_cache(conn)
         conn.execute(
             text("""
-                INSERT INTO places_cache (id, query, lat_grid, lng_grid, results, search_count, created_at, updated_at)
-                VALUES (:id, :q, :lat, :lng, CAST(:results AS JSONB), 1, NOW(), NOW())
-                ON CONFLICT (query, lat_grid, lng_grid)
+                INSERT INTO places_cache (id, query, lat_grid, lng_grid, raio_grid, results, search_count, created_at, updated_at)
+                VALUES (:id, :q, :lat, :lng, :raio, CAST(:results AS JSONB), 1, NOW(), NOW())
+                ON CONFLICT (query, lat_grid, lng_grid, raio_grid)
                 DO UPDATE SET results=CAST(:results AS JSONB), search_count=places_cache.search_count+1, updated_at=NOW()
             """),
-            {"id": str(uuid.uuid4()), "q": query_norm, "lat": lat_grid, "lng": lng_grid, "results": json.dumps(result)},
+            {"id": str(uuid.uuid4()), "q": query_norm, "lat": lat_grid, "lng": lng_grid,
+             "raio": raio_grid, "results": json.dumps(result)},
         )
 
     return result
