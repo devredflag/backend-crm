@@ -992,10 +992,11 @@ class ReuniaoGoogle(BaseModel):
 
 class EquipamentoCreate(BaseModel):
     nome: str
-    codigo: Optional[str] = None      # SKU — identificador único do item na conta
+    codigo: Optional[str] = None      # SKU — identificador único dentro do catálogo
     descricao: Optional[str] = None
     preco_base: float = 0
     quantidade: Optional[int] = 0
+    tipo: Optional[str] = None        # "equipamento" (padrão) ou "servico"
 
 
 class EquipamentoUpdate(BaseModel):
@@ -1005,6 +1006,7 @@ class EquipamentoUpdate(BaseModel):
     preco_base: Optional[float] = None
     quantidade: Optional[int] = None
     ativo: Optional[bool] = None
+    tipo: Optional[str] = None
 
 
 class ObservacaoCreate(BaseModel):
@@ -1401,6 +1403,21 @@ def garantir_tabela_notificacoes(conn):
 # Status possíveis de um orçamento, na ordem do fluxo.
 ORCAMENTO_STATUS = ["rascunho", "enviado", "em_negociacao", "aprovado", "recusado"]
 
+# Os dois catalogos de venda. Moram na mesma tabela, separados por `tipo`.
+TIPOS_CATALOGO = ["equipamento", "servico"]
+
+
+def _tipo_catalogo(valor, padrao="equipamento"):
+    """Normaliza o `tipo` vindo de query/body/form. Recusa valor desconhecido em
+    vez de cair no padrao: filtrar por um tipo que nao existe devolveria o
+    catalogo inteiro e o usuario veria servico na aba de equipamento."""
+    if valor is None or valor == "":
+        return padrao
+    limpo = str(valor).strip().lower()
+    if limpo not in TIPOS_CATALOGO:
+        raise HTTPException(400, f"Tipo invalido: use {' ou '.join(TIPOS_CATALOGO)}")
+    return limpo
+
 
 @uma_vez
 def garantir_vendas(conn):
@@ -1463,6 +1480,19 @@ def garantir_vendas(conn):
     # cria um item novo ou atualiza um existente.
     conn.execute(text("ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS codigo TEXT"))
     conn.execute(text("ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS quantidade INTEGER DEFAULT 0"))
+    # `tipo` separa os dois catalogos que a tela de vendas mostra em abas.
+    # Nao existe tabela `servicos`: servico e equipamento tem exatamente os
+    # mesmos campos e o mesmo papel (virar item de orcamento), e a unica
+    # diferenca e que servico nao tem estoque. Com um discriminador, servico
+    # entra em orcamento, nas metricas por item e na ficha da empresa sem
+    # alterar `orcamento_itens` nem nenhuma consulta existente. Decisao
+    # consciente, igual a de nao criar tabela `equipes`.
+    conn.execute(text(
+        "ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'equipamento'"))
+    # Linha nascida antes da coluna existir fica com NULL, e NULL nao casa com
+    # `tipo = 'equipamento'` no filtro — sumiria da aba de equipamentos.
+    conn.execute(text(
+        "UPDATE equipamentos SET tipo = 'equipamento' WHERE tipo IS NULL"))
     conn.execute(
         text(
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_equipamentos_codigo
@@ -6403,47 +6433,70 @@ def _escopo_vendas(conn, auth: dict, alias: str = "o"):
 
 
 @app.get("/equipamentos")
-def listar_equipamentos(auth: dict = Depends(get_auth), incluir_inativos: bool = False):
-    """Catálogo de equipamentos da conta, usado para montar orçamentos."""
+def listar_equipamentos(auth: dict = Depends(get_auth), incluir_inativos: bool = False,
+                        tipo: Optional[str] = None):
+    """Catálogo da conta usado para montar orçamentos.
+
+    Sem `tipo`, devolve equipamentos E serviços — é assim que a tela de vendas
+    busca uma vez só e separa as abas do lado dela, em vez de fazer duas
+    requisições para dois recortes da mesma tabela."""
     with engine.begin() as conn:
         garantir_vendas(conn)
         filtro = "" if incluir_inativos else " AND ativo = TRUE"
+        params = {"cid": auth["conta_id"]}
+        if tipo is not None:
+            filtro += " AND COALESCE(tipo, 'equipamento') = :tipo"
+            params["tipo"] = _tipo_catalogo(tipo)
         rows = conn.execute(
             text(
                 f"""SELECT equipamento_id, codigo, nome, descricao, preco_base,
-                           COALESCE(quantidade, 0) AS quantidade, ativo, criado_em
+                           COALESCE(quantidade, 0) AS quantidade,
+                           COALESCE(tipo, 'equipamento') AS tipo, ativo, criado_em
                     FROM equipamentos WHERE conta_id = :cid{filtro} ORDER BY nome ASC"""
             ),
-            {"cid": auth["conta_id"]},
+            params,
         )
         return [dict(r._mapping) for r in rows]
 
 
 @app.post("/equipamentos")
 def criar_equipamento(dados: EquipamentoCreate, auth: dict = Depends(get_auth)):
+    tipo = _tipo_catalogo(dados.tipo)
     nome = (dados.nome or "").strip()
     if not nome:
-        raise HTTPException(400, "Nome do equipamento é obrigatório")
+        rotulo = "serviço" if tipo == "servico" else "equipamento"
+        raise HTTPException(400, f"Nome do {rotulo} é obrigatório")
     with engine.begin() as conn:
         garantir_vendas(conn)
         codigo = (dados.codigo or "").strip() or None
         if codigo:
+            # Codigo e unico DENTRO do catalogo, nao na conta inteira: o usuario
+            # ve duas listas separadas na tela, e recusar "SRV-01" porque existe
+            # um equipamento com esse codigo seria uma colisao invisivel para
+            # ele. A importacao casa pelo mesmo par (tipo, codigo).
             ja_existe = conn.execute(
-                text("SELECT 1 FROM equipamentos WHERE conta_id = :cid AND lower(codigo) = lower(:c)"),
-                {"cid": auth["conta_id"], "c": codigo},
+                text("""SELECT 1 FROM equipamentos
+                        WHERE conta_id = :cid AND lower(codigo) = lower(:c)
+                          AND COALESCE(tipo, 'equipamento') = :t"""),
+                {"cid": auth["conta_id"], "c": codigo, "t": tipo},
             ).fetchone()
             if ja_existe:
                 raise HTTPException(400, f"Já existe um item com o código '{codigo}'")
         row = conn.execute(
             text(
-                """INSERT INTO equipamentos (conta_id, codigo, nome, descricao, preco_base, quantidade)
-                   VALUES (:cid, :c, :n, :d, :p, :q)
+                """INSERT INTO equipamentos (conta_id, codigo, nome, descricao, preco_base, quantidade, tipo)
+                   VALUES (:cid, :c, :n, :d, :p, :q, :t)
                    RETURNING equipamento_id, codigo, nome, descricao, preco_base,
-                             COALESCE(quantidade, 0) AS quantidade, ativo, criado_em"""
+                             COALESCE(quantidade, 0) AS quantidade,
+                             COALESCE(tipo, 'equipamento') AS tipo, ativo, criado_em"""
             ),
             {
                 "cid": auth["conta_id"], "c": codigo, "n": nome, "d": dados.descricao,
-                "p": dados.preco_base or 0, "q": dados.quantidade or 0,
+                "p": dados.preco_base or 0,
+                # Servico nao tem estoque: gravar 0 evita que a tela mostre um
+                # saldo que ninguem controla.
+                "q": 0 if tipo == "servico" else (dados.quantidade or 0),
+                "t": tipo,
             },
         ).fetchone()
         return dict(row._mapping)
@@ -6452,6 +6505,8 @@ def criar_equipamento(dados: EquipamentoCreate, auth: dict = Depends(get_auth)):
 @app.put("/equipamentos/{equipamento_id}")
 def atualizar_equipamento(equipamento_id: str, dados: EquipamentoUpdate, auth: dict = Depends(get_auth)):
     campos = {k: v for k, v in dados.dict().items() if v is not None}
+    if "tipo" in campos:
+        campos["tipo"] = _tipo_catalogo(campos["tipo"])
     if not campos:
         raise HTTPException(400, "Nada para atualizar")
     with engine.begin() as conn:
@@ -6463,7 +6518,8 @@ def atualizar_equipamento(equipamento_id: str, dados: EquipamentoUpdate, auth: d
                 f"""UPDATE equipamentos SET {sets}
                     WHERE equipamento_id = :eid AND conta_id = :cid
                     RETURNING equipamento_id, codigo, nome, descricao, preco_base,
-                              COALESCE(quantidade, 0) AS quantidade, ativo, criado_em"""
+                              COALESCE(quantidade, 0) AS quantidade,
+                              COALESCE(tipo, 'equipamento') AS tipo, ativo, criado_em"""
             ),
             params,
         ).fetchone()
@@ -6710,12 +6766,17 @@ def _analisar_planilha(conteudo: bytes, existentes: dict) -> dict:
     }
 
 
-def _catalogo_existente(conn, conta_id: str) -> dict:
+def _catalogo_existente(conn, conta_id: str, tipo: str = "equipamento") -> dict:
     """Chaves de duplicidade do catálogo atual → equipamento_id.
-    Prioriza o código (SKU); só cai no nome quando o item não tem código."""
+    Prioriza o código (SKU); só cai no nome quando o item não tem código.
+
+    Recortado por `tipo`: importar a planilha de serviços não pode atualizar um
+    equipamento que por acaso tem o mesmo nome — "Instalação" pode existir nos
+    dois catálogos e significar coisas diferentes."""
     rows = conn.execute(
-        text("SELECT equipamento_id, codigo, nome FROM equipamentos WHERE conta_id = :cid"),
-        {"cid": conta_id},
+        text("""SELECT equipamento_id, codigo, nome FROM equipamentos
+                WHERE conta_id = :cid AND COALESCE(tipo, 'equipamento') = :t"""),
+        {"cid": conta_id, "t": tipo},
     ).fetchall()
     mapa = {}
     for r in rows:
@@ -6727,7 +6788,7 @@ def _catalogo_existente(conn, conta_id: str) -> dict:
 
 
 @app.get("/equipamentos/modelo-importacao")
-def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
+def modelo_importacao_equipamentos(auth: dict = Depends(get_auth), tipo: Optional[str] = None):
     """Modelo .xlsx gerado a partir dos campos reais do catálogo, com uma linha
     de exemplo. É o arquivo que o usuário preenche e devolve na importação."""
     try:
@@ -6736,10 +6797,15 @@ def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
         raise HTTPException(503, "Geração de Excel indisponível no servidor (openpyxl ausente)")
     from openpyxl.styles import Font, PatternFill, Alignment
 
+    tipo = _tipo_catalogo(tipo)
+    servico = tipo == "servico"
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Catálogo"
-    cabecalhos = [ROTULOS_IMPORTACAO[c] for c, _, _, _ in CAMPOS_IMPORTACAO]
+    ws.title = "Serviços" if servico else "Catálogo"
+    # Servico nao tem estoque: a coluna sai do modelo em vez de vir e ser
+    # ignorada — planilha com coluna morta e convite para preencher errado.
+    campos = [c for c in CAMPOS_IMPORTACAO if not (servico and c[0] == "quantidade")]
+    cabecalhos = [ROTULOS_IMPORTACAO[c] for c, _, _, _ in campos]
     ws.append(cabecalhos)
     for i, _ in enumerate(cabecalhos, start=1):
         cel = ws.cell(row=1, column=i)
@@ -6747,22 +6813,30 @@ def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
         cel.fill = PatternFill("solid", fgColor="2980B9")
         cel.alignment = Alignment(horizontal="center")
         ws.column_dimensions[cel.column_letter].width = 26
-    ws.append(["EQ-001", "Gerador 15 kVA", "Gerador a diesel silenciado", 3, 1250.00])
+    ws.append(
+        ["SRV-001", "Instalação em campo", "Instalação e comissionamento no cliente", 800.00]
+        if servico else
+        ["EQ-001", "Gerador 15 kVA", "Gerador a diesel silenciado", 3, 1250.00]
+    )
     ws.freeze_panes = "A2"
 
     ajuda = wb.create_sheet("Instruções")
     for linha in [
         ["Como importar"],
         [""],
-        ["1. Preencha uma linha por item, a partir da linha 2 da aba 'Catálogo'."],
+        [f"1. Preencha uma linha por item, a partir da linha 2 da aba '{ws.title}'."],
         ["2. As colunas são reconhecidas PELO NOME do cabeçalho, não pela posição."],
         ["   Você pode reordenar as colunas à vontade — não deixe de renomear o cabeçalho."],
         ["3. Colunas obrigatórias: " + ", ".join(ROTULOS_IMPORTACAO[c] for c in CAMPOS_OBRIGATORIOS) + "."],
         ["4. Código (SKU) é opcional, mas é ele que identifica o item numa reimportação:"],
         ["   mesmo código = atualiza o item existente; código novo = cria."],
         ["   Sem código, a identificação cai para o Nome do item."],
-        ["5. Preço aceita 1.234,56 ou 1234.56. Quantidade deve ser um número inteiro."],
+        ["5. Preço aceita 1.234,56 ou 1234.56. Quantidade deve ser um número inteiro."]
+        if not servico else
+        ["5. Preço aceita 1.234,56 ou 1234.56. Serviço não tem estoque, por isso não há coluna Quantidade."],
         ["6. Linhas em branco são ignoradas."],
+        ["7. Esta planilha importa " + ("SERVIÇOS" if servico else "EQUIPAMENTOS")
+         + " — use a aba correspondente do sistema para enviá-la."],
     ]:
         ajuda.append(linha)
     ajuda["A1"].font = Font(bold=True, size=13)
@@ -6773,7 +6847,8 @@ def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="modelo-catalogo-prospectageo.xlsx"'},
+        headers={"Content-Disposition":
+                 f'attachment; filename="modelo-{"servicos" if servico else "catalogo"}-prospectageo.xlsx"'},
     )
 
 
@@ -6781,6 +6856,7 @@ def modelo_importacao_equipamentos(auth: dict = Depends(get_auth)):
 async def importar_equipamentos(
     arquivo: UploadFile = File(...),
     confirmar: bool = False,
+    tipo: Optional[str] = None,
     auth: dict = Depends(get_auth),
 ):
     """Importa catálogo/estoque de um .xlsx.
@@ -6801,9 +6877,11 @@ async def importar_equipamentos(
     if len(conteudo) > 5 * 1024 * 1024:
         raise HTTPException(400, "Arquivo muito grande (máximo 5 MB)")
 
+    tipo = _tipo_catalogo(tipo)
     with engine.begin() as conn:
         garantir_vendas(conn)
-        analise = _analisar_planilha(conteudo, _catalogo_existente(conn, auth["conta_id"]))
+        analise = _analisar_planilha(conteudo, _catalogo_existente(conn, auth["conta_id"], tipo))
+        analise["tipo"] = tipo
 
         if not confirmar:
             analise["gravado"] = False
@@ -6838,7 +6916,8 @@ async def importar_equipamentos(
                     ),
                     {
                         "n": item["nome"], "c": item["codigo"], "d": item["descricao"],
-                        "p": item["preco_base"], "q": item["quantidade"],
+                        "p": item["preco_base"],
+                        "q": 0 if tipo == "servico" else item["quantidade"],
                         "eid": item["equipamento_id"], "cid": auth["conta_id"],
                     },
                 )
@@ -6846,23 +6925,28 @@ async def importar_equipamentos(
             else:
                 conn.execute(
                     text(
-                        """INSERT INTO equipamentos (conta_id, codigo, nome, descricao, preco_base, quantidade)
-                           VALUES (:cid, :c, :n, :d, :p, :q)"""
+                        """INSERT INTO equipamentos
+                               (conta_id, codigo, nome, descricao, preco_base, quantidade, tipo)
+                           VALUES (:cid, :c, :n, :d, :p, :q, :t)"""
                     ),
                     {
                         "cid": auth["conta_id"], "c": item["codigo"], "n": item["nome"],
-                        "d": item["descricao"], "p": item["preco_base"], "q": item["quantidade"],
+                        "d": item["descricao"], "p": item["preco_base"],
+                        "q": 0 if tipo == "servico" else item["quantidade"],
+                        "t": tipo,
                     },
                 )
                 criados += 1
 
         registrar_auditoria(
-            usuario=auth, acao="CATALOGO_IMPORTADO", recurso="equipamentos",
-            quantidade=criados + atualizados, conn=conn,
+            usuario=auth,
+            acao="SERVICOS_IMPORTADOS" if tipo == "servico" else "CATALOGO_IMPORTADO",
+            recurso="equipamentos", quantidade=criados + atualizados, conn=conn,
         )
 
     return {
         "gravado": True,
+        "tipo": tipo,
         "criados": criados,
         "atualizados": atualizados,
         "total": criados + atualizados,
@@ -7273,6 +7357,7 @@ def insights_vendas(auth: dict = Depends(get_auth)):
         por_equipamento = conn.execute(
             text(
                 f"""SELECT COALESCE(eq.nome, i.descricao) AS nome,
+                           COALESCE(eq.tipo, 'equipamento') AS tipo,
                            SUM(i.quantidade) AS quantidade,
                            COALESCE(SUM(i.quantidade * i.preco_unitario),0) AS valor,
                            COALESCE(SUM(i.quantidade)
@@ -7289,9 +7374,9 @@ def insights_vendas(auth: dict = Depends(get_auth)):
                     JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
                     LEFT JOIN equipamentos eq ON eq.equipamento_id = i.equipamento_id
                     WHERE {escopo}
-                    GROUP BY COALESCE(eq.nome, i.descricao)
+                    GROUP BY COALESCE(eq.nome, i.descricao), COALESCE(eq.tipo, 'equipamento')
                     ORDER BY valor_aprovado DESC, quantidade DESC
-                    LIMIT 20"""
+                    LIMIT 40"""
             ),
             params,
         )
@@ -7301,6 +7386,9 @@ def insights_vendas(auth: dict = Depends(get_auth)):
             decidido = ganhou + perdeu
             equipamentos.append({
                 "nome": r.nome,
+                # Item avulso (sem equipamento_id) conta como equipamento: e
+                # onde ele sempre apareceu, e mudar isso escondia historico.
+                "tipo": r.tipo,
                 "quantidade": int(r.quantidade or 0),
                 "valor": float(r.valor or 0),
                 "qtd_aprovada": ganhou,
