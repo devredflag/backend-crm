@@ -5056,6 +5056,19 @@ def listar_rascunhos(auth: dict = Depends(get_auth)):
 
 @app.post("/empresas/rascunho", status_code=201)
 def criar_rascunho(rascunho: RascunhoCreate, auth: dict = Depends(get_auth)):
+    """Cria a empresa como RASCUNHO -- fora do funil ate alguem completar.
+
+    `status` nasce 'Rascunho', nao 'Lead'. As duas colunas existem e parecem
+    redundantes, mas quem manda na interface e `status`: toda a tela decide "isto
+    e rascunho?" com `status === 'Rascunho'` e nenhuma linha do frontend le
+    `status_cadastro`. Nascendo como 'Lead', a empresa entrava direto no funil,
+    contava na conversao e na base -- sem ninguem ter olhado para ela. Isso
+    importa mais agora que da para criar 20 de uma vez pela busca.
+
+    `status_cadastro` continua 'rascunho' porque as contagens do backend
+    (/empresas/rascunhos, /gerencia/dashboard) filtram por ele.
+
+    Vira Lead quando o usuario abre a ficha, edita e salva."""
     with engine.begin() as conn:
         garantir_colunas_places(conn)
         garantir_campos_pipeline(conn)
@@ -5076,7 +5089,7 @@ def criar_rascunho(rascunho: RascunhoCreate, auth: dict = Depends(get_auth)):
                     conta_id, vendedor_id, ultima_interacao, status_atualizado_em)
                 VALUES (:id, :nome, :cidade, :endereco_completo, :site, :telefone_empresa,
                     :google_place_id, :latitude, :longitude, :google_rating, :google_rating_count, :business_status,
-                    'Lead', 'rascunho', 'Google Maps', 'Frio', :responsavel_principal,
+                    'Rascunho', 'rascunho', 'Google Maps', 'Frio', :responsavel_principal,
                     :conta_id, :vendedor_id, NOW(), NOW())
             """),
             {
