@@ -646,6 +646,54 @@ ROLES_VALIDAS = ("vendedor", "supervisor", "gerente")
 ROTULO_FUNCAO = {"vendedor": "Vendedor", "supervisor": "Supervisor", "gerente": "Gerente"}
 
 
+# =========================================================================
+# RECURSOS POR PLANO (feature flags da assinatura)
+# =========================================================================
+# Fonte unica do que cada plano libera. A UI NAO decide isso: ela recebe a
+# lista pronta em /me e pergunta `temRecurso("insights")` num helper so. Sem
+# isto, "recurso pago" vira `if (plano === 'x')` espalhado por tela, e a
+# primeira mudanca de pacote passa a exigir cacar ocorrencia.
+#
+# Insights e o primeiro recurso adicional: a tela de analise que o gerente usa
+# para cravar meta. Todo mundo esta em 'completo' hoje, entao ninguem perde
+# nada -- o gating existe, ligado.
+RECURSOS_POR_PLANO: dict[str, set[str]] = {
+    "completo": {"insights"},
+    "essencial": set(),
+}
+PLANO_PADRAO = "completo"
+
+
+def recursos_do_plano(plano: str | None) -> list[str]:
+    """Recursos liberados. Plano desconhecido cai no padrao em vez de bloquear:
+    conta com plano digitado errado no banco perdendo tela e pior do que conta
+    vendo tela a mais."""
+    return sorted(RECURSOS_POR_PLANO.get((plano or "").strip().lower(),
+                                         RECURSOS_POR_PLANO[PLANO_PADRAO]))
+
+
+def exigir_recurso(nome: str):
+    """Dependencia para fechar uma rota atras do plano.
+
+    Preparada e nao aplicada: nenhuma rota e gateada hoje porque toda conta
+    esta em 'completo'. Quando houver plano sem insights, e so somar
+    `Depends(exigir_recurso("insights"))` na rota -- a checagem ja e server
+    side, entao esconder o item no menu nao vira a unica barreira.
+    """
+
+    def _checar(auth: dict = Depends(get_auth)) -> dict:
+        with engine.connect() as conn:
+            plano = conn.execute(
+                text("SELECT plano FROM contas WHERE conta_id = :cid"),
+                {"cid": auth["conta_id"]},
+            ).scalar()
+        if nome not in recursos_do_plano(plano):
+            raise HTTPException(403, f"Recurso '{nome}' nao esta incluido no seu plano")
+        return auth
+
+    return _checar
+
+
 def normalizar_role(valor: str | None, padrao: str = "vendedor") -> str:
     """Aceita só as três funções conhecidas; qualquer outra coisa vira o padrão.
     Mantém o formato já usado no banco (string minúscula), sem enum novo."""
@@ -1374,6 +1422,12 @@ def garantir_multiusuario(conn):
     """
         )
     )
+    # Plano da assinatura. Default 'completo' de proposito: a cobranca por
+    # modulo ainda nao existe, e nascer com tudo ligado significa que ligar o
+    # gating nao tira nada de ninguem hoje. O dia de cobrar e mudar o default
+    # e o plano das contas -- nao mexer em tela.
+    conn.execute(text("ALTER TABLE contas ADD COLUMN IF NOT EXISTS plano text DEFAULT 'completo'"))
+    conn.execute(text("UPDATE contas SET plano = 'completo' WHERE plano IS NULL"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS conta_id uuid"))
     conn.execute(text("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS role text DEFAULT 'vendedor'"))
     # Hierarquia Gerente → Supervisor → Vendedor. O vínculo é uma auto-referência
@@ -4110,6 +4164,7 @@ def get_me(auth: dict = Depends(get_auth)):
                 """
                 SELECT u.usuario_id, u.nome, u.email, u.telefone, u.cargo, u.empresa_nome, u.bio,
                        u.data_criacao, u.role, u.conta_id, u.supervisor_id, ct.nome AS conta_nome,
+                       ct.plano AS plano,
                        s.nome AS supervisor_nome,
                        COALESCE(u.mfa_ativado, FALSE) AS mfa_ativado
                 FROM usuarios u
@@ -4129,6 +4184,11 @@ def get_me(auth: dict = Depends(get_auth)):
     dados["is_supervisor"] = role == "supervisor"
     # Rótulo pronto para a interface — o card do usuário mostra a função, não o cargo.
     dados["funcao"] = ROTULO_FUNCAO[role]
+    # Recursos da assinatura, prontos para a UI. Lista e nao plano cru: a tela
+    # pergunta "posso mostrar insights?", nao "que pacote e esse?" -- assim
+    # renomear plano ou remontar pacote nao toca em nenhum componente.
+    dados["plano"] = dados.get("plano") or PLANO_PADRAO
+    dados["recursos"] = recursos_do_plano(dados["plano"])
     return dados
 
 
