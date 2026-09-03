@@ -17,6 +17,7 @@ from slowapi.errors import RateLimitExceeded
 import uuid
 import jwt
 import functools
+import difflib
 import os
 import re
 import time
@@ -1098,6 +1099,11 @@ class OrcamentoItemIn(BaseModel):
     descricao: str
     quantidade: int = 1
     preco_unitario: float = 0
+    # So faz sentido em item AVULSO: quando ha equipamento_id, o tipo e o do
+    # catalogo e gravar copia aqui criaria duas verdades que divergem no dia em
+    # que alguem reclassificar o item. Sem esta coluna, servico avulso caia no
+    # grafico de equipamentos -- era o buraco do item 1.3.
+    tipo: Optional[str] = None
 
 
 class OrcamentoCreate(BaseModel):
@@ -1582,6 +1588,12 @@ def garantir_vendas(conn):
     # consciente, igual a de nao criar tabela `equipes`.
     conn.execute(text(
         "ALTER TABLE equipamentos ADD COLUMN IF NOT EXISTS tipo TEXT DEFAULT 'equipamento'"))
+    # Mesmo discriminador para o item AVULSO, que nao tem linha no catalogo.
+    # Sem default: NULL aqui significa "veja o tipo do catalogo pelo
+    # equipamento_id", e so o avulso preenche. Aditivo e idempotente, no mesmo
+    # padrao das colunas acima -- nenhuma linha existente e reescrita.
+    conn.execute(text(
+        "ALTER TABLE orcamento_itens ADD COLUMN IF NOT EXISTS tipo TEXT"))
     # Linha nascida antes da coluna existir fica com NULL, e NULL nao casa com
     # `tipo = 'equipamento'` no filtro — sumiria da aba de equipamentos.
     conn.execute(text(
@@ -6573,6 +6585,219 @@ def _escopo_vendas(conn, auth: dict, alias: str = "o"):
     return f"{alias}.conta_id = :cid {trecho}", params
 
 
+
+# ── Busca tolerante de itens (autocomplete do orcamento) ─────────────────────
+#
+# POR QUE NAO pg_trgm: exigiria CREATE EXTENSION no Postgres de producao para
+# ganhar performance que este volume nao pede. Substring normalizado resolve em
+# milissegundos, e a ordenacao fina acontece em Python.
+#
+# TODO o SQL de busca de item mora em buscar_itens_similares(). Migrar para
+# pg_trgm um dia e reescrever o corpo daquela funcao, e nada mais.
+
+# Mapa de acentos do lado do SQL: os DOIS lados da comparacao (coluna e termo)
+# passam pelo mesmo lower() + translate(), senao a comparacao e assimetrica.
+#
+# O destino e TODO minusculo, inclusive para as 24 maiusculas. Em Postgres com
+# locale C, lower('Á') devolve 'Á' intacto -- mapear para 'A' faria "ÁGUA"
+# nunca casar com "agua" digitado, e o erro so apareceria nesse item.
+_ACENTOS_DE = "áàâãäéèêëíìîïóòôõöúùûüçñÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇÑ"
+_ACENTOS_PARA = "aaaaaeeeeiiiiooooouuuucn" * 2
+# translate() ignora em silencio o excedente do lado maior: um mapa desalinhado
+# nao levanta erro, so para de normalizar de um caractere em diante.
+assert len(_ACENTOS_DE) == len(_ACENTOS_PARA) == 48, "mapa de acentos desalinhado"
+
+# Uma letra casa com quase tudo, e a pessoa ainda esta digitando.
+MIN_TERMO_SUGESTAO = 2
+# Piso da passada tolerante a erro de digitacao.
+SIMILARIDADE_MINIMA = 0.6
+# A partir daqui a UI oferece o item existente em vez de deixar criar outro.
+SIMILARIDADE_AVISO = 0.85
+
+
+def _sem_acento_sql(expr: str) -> str:
+    """Expressao SQL equivalente ao normalizar_texto() do lado Python."""
+    return f"translate(lower({expr}), :ac_de, :ac_para)"
+
+
+def _ordem_sugestao(alvo: str, texto: str):
+    """Chave de ordenacao: prefixo exato > comeca com > contem > parecenca.
+
+    Empate resolve por uso mais recente -- o item que a equipe acabou de usar e
+    o palpite melhor entre dois nomes igualmente parecidos.
+    """
+    if texto == alvo:
+        faixa = 0
+    elif texto.startswith(alvo):
+        faixa = 1
+    elif alvo in texto:
+        faixa = 2
+    else:
+        faixa = 3
+    return faixa
+
+
+def buscar_itens_similares(conn, auth: dict, termo: str,
+                           tipo: Optional[str] = None, limite: int = 10) -> list[dict]:
+    """Sugestoes de item para o autocomplete do orcamento.
+
+    Une o catalogo da conta com as descricoes de itens AVULSOS ja usadas em
+    orcamentos anteriores, deduplicadas pela descricao normalizada.
+
+    Escopo: catalogo e por conta (e compartilhado); historico passa pelo
+    _escopo_vendas, senao vendedor veria o que o colega digitou.
+
+    Devolve, por sugestao:
+        descricao       str
+        tipo            "equipamento" | "servico"
+        ultimo_preco    float | None   -- do orcamento mais recente, nao a media
+        origem          "catalogo" | "historico"
+        equipamento_id  str | None     -- so quando origem == "catalogo"
+        similaridade    float          -- 0..1, para a UI avisar sobre duplicata
+    """
+    alvo = normalizar_texto(termo or "")
+    if len(alvo) < MIN_TERMO_SUGESTAO:
+        return []
+
+    escopo, params = _escopo_vendas(conn, auth)
+    params = dict(params)
+    params.update({
+        "cid": auth["conta_id"],
+        "ac_de": _ACENTOS_DE,
+        "ac_para": _ACENTOS_PARA,
+        "q": alvo,
+    })
+
+    filtro_cat = filtro_hist = ""
+    if tipo is not None:
+        params["tipo"] = _tipo_catalogo(tipo)
+        filtro_cat = " AND COALESCE(e.tipo, 'equipamento') = :tipo"
+        filtro_hist = " AND h.tipo = :tipo"
+
+    nome_norm = _sem_acento_sql("e.nome")
+    desc_norm = _sem_acento_sql("u.descricao")
+
+    def consultar(predicado_cat: str, predicado_hist: str) -> list:
+        sql = f"""
+            WITH usados AS (
+                SELECT i.equipamento_id, i.descricao, i.preco_unitario,
+                       COALESCE(i.tipo, 'equipamento') AS tipo, o.criado_em
+                FROM orcamento_itens i
+                JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
+                WHERE {escopo}
+            )
+            SELECT e.equipamento_id::text          AS equipamento_id,
+                   e.nome                          AS descricao,
+                   COALESCE(e.tipo, 'equipamento') AS tipo,
+                   e.preco_base                    AS ultimo_preco,
+                   'catalogo'                      AS origem,
+                   (SELECT MAX(u2.criado_em) FROM usados u2
+                     WHERE u2.equipamento_id = e.equipamento_id) AS usado_em
+            FROM equipamentos e
+            WHERE e.conta_id = :cid AND e.ativo = TRUE{filtro_cat}
+              AND {predicado_cat}
+            UNION ALL
+            SELECT NULL AS equipamento_id, h.descricao, h.tipo,
+                   h.preco_unitario AS ultimo_preco,
+                   'historico'      AS origem,
+                   h.criado_em      AS usado_em
+            FROM (
+                SELECT DISTINCT ON ({desc_norm})
+                       u.descricao, u.tipo, u.preco_unitario, u.criado_em
+                FROM usados u
+                WHERE u.equipamento_id IS NULL
+                ORDER BY {desc_norm}, u.criado_em DESC NULLS LAST
+            ) h
+            WHERE TRUE{filtro_hist}
+              AND {predicado_hist}
+            LIMIT 500
+        """
+        return conn.execute(text(sql), params).fetchall()
+
+    # 1a passada: substring normalizado. Cobre "almoco" -> "Almoço", que e o caso
+    # que motivou a feature, e devolve pouca linha.
+    #
+    # POSITION e nao LIKE, por dois motivos. O SQLAlchemy dobra sozinho o '%'
+    # literal ao compilar para o paramstyle do psycopg2, entao escrever '%%' na
+    # fonte vira '%%' de verdade na consulta e nao casa com nada -- falha calada,
+    # ainda por cima coberta pela 2a passada. E LIKE trataria '%' ou '_'
+    # digitados pela pessoa como curinga: buscar "50%" devolveria o catalogo
+    # inteiro. POSITION compara texto literal e nao tem escape nenhum.
+    linhas = consultar(
+        f"POSITION(:q IN {nome_norm}) > 0",
+        f"POSITION(:q IN {_sem_acento_sql('h.descricao')}) > 0",
+    )
+    # 2a passada, so quando a primeira nao encheu a lista: erro de digitacao
+    # ("almco") nao casa por substring, e sem isto o typeahead ficaria mudo
+    # justamente para quem mais precisa dele. Custa uma varredura do catalogo,
+    # que e barata nesta ordem de grandeza -- e nao roda no caminho comum.
+    if len(linhas) < limite:
+        vistos = {(r.origem, normalizar_texto(r.descricao)) for r in linhas}
+        for r in consultar("TRUE", "TRUE"):
+            if (r.origem, normalizar_texto(r.descricao)) not in vistos:
+                linhas.append(r)
+
+    # Dedupe entre as duas fontes: mesmo nome no catalogo e no historico e o
+    # mesmo item, e o catalogo ganha -- ele tem preco de tabela e equipamento_id.
+    por_nome: dict[str, dict] = {}
+    for r in linhas:
+        chave = normalizar_texto(r.descricao)
+        if not chave:
+            continue
+        parecenca = difflib.SequenceMatcher(None, alvo, chave).ratio()
+        faixa = _ordem_sugestao(alvo, chave)
+        # Fora da faixa de substring, so entra quem se parece de verdade.
+        if faixa == 3 and parecenca < SIMILARIDADE_MINIMA:
+            continue
+        atual = por_nome.get(chave)
+        if atual and not (atual["origem"] == "historico" and r.origem == "catalogo"):
+            continue
+        por_nome[chave] = {
+            "equipamento_id": r.equipamento_id,
+            "descricao": r.descricao,
+            "tipo": r.tipo or "equipamento",
+            "ultimo_preco": float(r.ultimo_preco) if r.ultimo_preco is not None else None,
+            "origem": r.origem,
+            "similaridade": round(parecenca, 3),
+            "_faixa": faixa,
+            "_usado_em": r.usado_em,
+        }
+
+    ordenadas = sorted(
+        por_nome.values(),
+        key=lambda s: (
+            s["_faixa"],
+            -s["similaridade"],
+            # Mais usado recentemente primeiro; nunca usado vai para o fim.
+            -(s["_usado_em"].timestamp() if s["_usado_em"] else 0),
+            s["descricao"].lower(),
+        ),
+    )
+    for s in ordenadas:
+        s.pop("_faixa", None)
+        s.pop("_usado_em", None)
+    return ordenadas[:limite]
+
+
+@app.get("/catalogo/sugestoes")
+def sugestoes_catalogo(q: str = "", tipo: Optional[str] = None, limite: int = 10,
+                       auth: dict = Depends(get_auth)):
+    """Autocomplete da descricao do item no editor de orcamento.
+
+    Existe para padronizar nomenclatura na ENTRADA: sem ela, "almoço", "almoco"
+    e "Almoço equipe" viram tres itens distintos e os graficos de historico
+    agrupam errado. Orienta, nao bloqueia -- texto novo continua permitido.
+    """
+    try:
+        teto = int(limite)
+    except (TypeError, ValueError):
+        teto = 10
+    teto = max(1, min(teto, 25))
+    with engine.begin() as conn:
+        garantir_vendas(conn)
+        return buscar_itens_similares(conn, auth, q, tipo=tipo, limite=teto)
+
+
 @app.get("/equipamentos")
 def listar_equipamentos(auth: dict = Depends(get_auth), incluir_inativos: bool = False,
                         tipo: Optional[str] = None):
@@ -7101,7 +7326,7 @@ async def importar_equipamentos(
 def _carregar_itens(conn, orcamento_id: str):
     rows = conn.execute(
         text(
-            """SELECT item_id, equipamento_id, descricao, quantidade, preco_unitario
+            """SELECT item_id, equipamento_id, descricao, quantidade, preco_unitario, tipo
                FROM orcamento_itens WHERE orcamento_id = :oid ORDER BY descricao ASC"""
         ),
         {"oid": orcamento_id},
@@ -7117,11 +7342,19 @@ def _regravar_itens(conn, orcamento_id: str, itens: list) -> float:
         qtd = max(1, int(item.quantidade or 1))
         preco = float(item.preco_unitario or 0)
         total += qtd * preco
+        # Tipo so do avulso (ver comentario em OrcamentoItemIn.tipo). Valor
+        # desconhecido vira NULL em vez de 400: o tipo e uma dica de
+        # classificacao vinda da UI, e derrubar o salvamento do orcamento
+        # inteiro por causa dela seria desproporcional.
+        tipo_item = None
+        if not item.equipamento_id:
+            bruto = (getattr(item, "tipo", None) or "").strip().lower()
+            tipo_item = bruto if bruto in TIPOS_CATALOGO else None
         conn.execute(
             text(
                 """INSERT INTO orcamento_itens
-                   (orcamento_id, equipamento_id, descricao, quantidade, preco_unitario)
-                   VALUES (:oid, :eq, :d, :q, :p)"""
+                   (orcamento_id, equipamento_id, descricao, quantidade, preco_unitario, tipo)
+                   VALUES (:oid, :eq, :d, :q, :p, :tp)"""
             ),
             {
                 "oid": orcamento_id,
@@ -7129,6 +7362,7 @@ def _regravar_itens(conn, orcamento_id: str, itens: list) -> float:
                 "d": (item.descricao or "").strip() or "Item",
                 "q": qtd,
                 "p": preco,
+                "tp": tipo_item,
             },
         )
     conn.execute(
@@ -7504,7 +7738,7 @@ def insights_vendas(auth: dict = Depends(get_auth)):
         por_equipamento = conn.execute(
             text(
                 f"""SELECT COALESCE(eq.nome, i.descricao) AS nome,
-                           COALESCE(eq.tipo, 'equipamento') AS tipo,
+                           COALESCE(eq.tipo, i.tipo, 'equipamento') AS tipo,
                            SUM(i.quantidade) AS quantidade,
                            COALESCE(SUM(i.quantidade * i.preco_unitario),0) AS valor,
                            COALESCE(SUM(i.quantidade)
@@ -7521,7 +7755,7 @@ def insights_vendas(auth: dict = Depends(get_auth)):
                     JOIN orcamentos o ON o.orcamento_id = i.orcamento_id
                     LEFT JOIN equipamentos eq ON eq.equipamento_id = i.equipamento_id
                     WHERE {escopo}
-                    GROUP BY COALESCE(eq.nome, i.descricao), COALESCE(eq.tipo, 'equipamento')
+                    GROUP BY COALESCE(eq.nome, i.descricao), COALESCE(eq.tipo, i.tipo, 'equipamento')
                     ORDER BY valor_aprovado DESC, quantidade DESC
                     LIMIT 200"""
             ),
