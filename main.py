@@ -120,6 +120,74 @@ PLACES_FUSO_HORAS = float(os.getenv("PLACES_FUSO_HORAS", "-3"))
 # por minuto ou o teto da conta no Google Cloud. Seguramos a tela essa janela.
 PLACES_ESPERA_GOOGLE_MIN = int(os.getenv("PLACES_ESPERA_GOOGLE_MIN", "15"))
 
+# =========================================================================
+# GUARDA DE AMBIENTE: nao subir contra producao a partir da maquina de alguem
+# =========================================================================
+# O Postgres de producao e alcancavel de qualquer lugar pelo proxy TCP do
+# Railway, e as migracoes deste arquivo sao LAZY: disparam sozinhas na primeira
+# chamada autenticada, sem passo manual e sem confirmacao. Basta subir o app
+# local com a DATABASE_URL errada para um ALTER TABLE cair nos dados reais.
+#
+# A checagem e por HOST, nao por nome de arquivo de env: renomear o `.env`
+# ajuda, mas nao impede ninguem de exportar a variavel na mao. Dentro do Railway
+# a plataforma injeta RAILWAY_ENVIRONMENT; fora dela a variavel nao existe, e e
+# esse o sinal de "isto aqui e a maquina de alguem".
+HOSTS_PRODUCAO = tuple(
+    h.strip().lower()
+    for h in os.getenv(
+        "HOSTS_PRODUCAO", "shortline.proxy.rlwy.net,.railway.internal"
+    ).split(",")
+    if h.strip()
+)
+
+_LINHA = "=" * 72
+
+_TEXTO_RECUSA = """
+  RECUSANDO SUBIR: a DATABASE_URL aponta para o banco de PRODUCAO
+  (%s)
+  e este processo nao esta rodando no Railway.
+
+  As migracoes deste arquivo sao lazy: subir assim escreve nos dados
+  reais na primeira chamada autenticada.
+
+  Para desenvolver, aponte para o banco de dev:
+      uvicorn main:app --reload --env-file .env.dev
+
+  Se voce REALMENTE quer producao a partir daqui, seja explicito:
+      PERMITIR_PROD_LOCAL=1 uvicorn main:app --env-file .env.production
+"""
+
+_TEXTO_PERMITIDO = """
+  ATENCAO: conectado ao Postgres de PRODUCAO fora do Railway.
+  PERMITIR_PROD_LOCAL=1 esta setado -- as migracoes lazy vao rodar
+  contra os dados reais na primeira chamada autenticada.
+"""
+
+
+def _e_host_de_producao(url):
+    """True quando a URL de conexao aponta para um host de producao conhecido."""
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith(h) for h in HOSTS_PRODUCAO)
+
+
+_FORA_DO_RAILWAY = not (
+    os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_SERVICE_ID")
+)
+
+if _e_host_de_producao(DATABASE_URL) and _FORA_DO_RAILWAY:
+    if os.getenv("PERMITIR_PROD_LOCAL") == "1":
+        print(_LINHA + _TEXTO_PERMITIDO + _LINHA)
+    else:
+        raise SystemExit(
+            _LINHA + (_TEXTO_RECUSA % _url_sem_credencial(DATABASE_URL)) + _LINHA
+        )
+
+
 engine = create_engine(DATABASE_URL)
 
 # =========================================================================
