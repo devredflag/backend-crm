@@ -5482,6 +5482,71 @@ def _tentativas_nominatim(r) -> list[dict]:
     return tentativas
 
 
+# User-Agent proprio e exigencia da politica do Nominatim -- cliente sem
+# identificacao e bloqueado. Fica numa constante porque agora sao dois
+# consumidores: o backfill em lote e a busca avulsa do planejador de rota.
+NOMINATIM_UA = "CRM-Prospeccao/1.0 (https://frontend-crm-xi-plum.vercel.app)"
+
+# Janela minima entre chamadas ao Nominatim, por processo. A politica do OSM e
+# de no maximo 1 req/seg para o servico publico; o backfill respeita isso com
+# sleep entre os itens do lote, e aqui o controle e por relogio porque a busca
+# avulsa e disparada por gente digitando, sem lote nenhum.
+_NOMINATIM_INTERVALO = 1.1
+_nominatim_ultima_chamada = 0.0
+_nominatim_trava = threading.Lock()
+
+
+@app.get("/geo/buscar")
+async def buscar_endereco(q: str = "", auth: dict = Depends(get_auth)):
+    """Endereco digitado -> coordenada, para o planejador de rota.
+
+    Custo zero: Nominatim/OpenStreetMap, o mesmo servico que ja faz o backfill
+    de coordenadas das empresas. Nao encosta na cota do Google Places.
+
+    Passa pelo backend em vez de ir direto do navegador para manter num lugar
+    so o User-Agent exigido pela politica do OSM e o limite de 1 req/seg -- do
+    cliente, cada aba abriria sua propria torneira.
+    """
+    termo = (q or "").strip()
+    if len(termo) < 4:
+        raise HTTPException(400, "Digite ao menos 4 caracteres")
+
+    global _nominatim_ultima_chamada
+    with _nominatim_trava:
+        espera = _NOMINATIM_INTERVALO - (time.time() - _nominatim_ultima_chamada)
+        _nominatim_ultima_chamada = time.time() + max(0.0, espera)
+    if espera > 0:
+        await asyncio.sleep(espera)
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": NOMINATIM_UA}) as client:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"format": "json", "limit": 1, "countrycodes": "br",
+                        "addressdetails": 1, "q": termo},
+            )
+        dados = resp.json() if resp.status_code == 200 else []
+    except Exception as e:  # noqa: BLE001 - servico publico: indisponivel nao e erro nosso
+        print(f"[NOMINATIM] falha ao buscar {termo!r}: {e}")
+        raise HTTPException(502, "Servico de endereco indisponivel no momento")
+
+    if not dados:
+        # 200 com achado=False, e nao 404: "nao encontrei este endereco" e uma
+        # resposta valida da busca, nao um erro de rota.
+        return {"achado": False, "lat": None, "lon": None, "endereco": None}
+
+    primeiro = dados[0]
+    try:
+        return {
+            "achado": True,
+            "lat": float(primeiro["lat"]),
+            "lon": float(primeiro["lon"]),
+            "endereco": primeiro.get("display_name") or termo,
+        }
+    except (KeyError, ValueError, TypeError):
+        return {"achado": False, "lat": None, "lon": None, "endereco": None}
+
+
 @app.post("/empresas/geocodificar")
 async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(get_current_user)):
     """Backfill de coordenadas (custo zero) via Nominatim/OpenStreetMap a partir do
@@ -5505,7 +5570,7 @@ async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(g
 
     geocodificadas = 0
     falharam = 0
-    headers = {"User-Agent": "CRM-Prospeccao/1.0 (https://frontend-crm-xi-plum.vercel.app)"}
+    headers = {"User-Agent": NOMINATIM_UA}
     async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
         primeira = True
         for r in rows:
