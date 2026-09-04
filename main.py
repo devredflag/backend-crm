@@ -5511,6 +5511,15 @@ async def buscar_endereco(q: str = "", auth: dict = Depends(get_auth)):
     if len(termo) < 4:
         raise HTTPException(400, "Digite ao menos 4 caracteres")
 
+    # Cache antes da fila: endereco nao muda de lugar, e sem isto a mesma busca
+    # repetida paga 1s de espera de novo. Reaproveita o cache do proxy do OSRM
+    # -- e o mesmo problema (servico comunitario, 1 req/s) e nao ha razao para
+    # duas implementacoes de cache no arquivo.
+    chave_busca = "nominatim|" + termo.lower()
+    em_cache = _osrm_cache_ler(chave_busca)
+    if em_cache is not None:
+        return em_cache
+
     global _nominatim_ultima_chamada
     with _nominatim_trava:
         espera = _NOMINATIM_INTERVALO - (time.time() - _nominatim_ultima_chamada)
@@ -5532,17 +5541,22 @@ async def buscar_endereco(q: str = "", auth: dict = Depends(get_auth)):
 
     if not dados:
         # 200 com achado=False, e nao 404: "nao encontrei este endereco" e uma
-        # resposta valida da busca, nao um erro de rota.
-        return {"achado": False, "lat": None, "lon": None, "endereco": None}
+        # resposta valida da busca, nao um erro de rota. Vai para o cache pelo
+        # mesmo motivo: quem digitou errado costuma tentar de novo igual.
+        vazio = {"achado": False, "lat": None, "lon": None, "endereco": None}
+        _osrm_cache_gravar(chave_busca, vazio)
+        return vazio
 
     primeiro = dados[0]
     try:
-        return {
+        achado = {
             "achado": True,
             "lat": float(primeiro["lat"]),
             "lon": float(primeiro["lon"]),
             "endereco": primeiro.get("display_name") or termo,
         }
+        _osrm_cache_gravar(chave_busca, achado)
+        return achado
     except (KeyError, ValueError, TypeError):
         return {"achado": False, "lat": None, "lon": None, "endereco": None}
 
