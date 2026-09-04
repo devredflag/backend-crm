@@ -5581,7 +5581,16 @@ async def buscar_endereco(q: str = "", auth: dict = Depends(get_auth)):
 #   - ha cache, porque rua nao muda de lugar e o planejador repete muito a
 #     mesma consulta (mexer no raio, tirar e repor a mesma parada).
 
-OSRM_BASE = "https://router.project-osrm.org"
+# Base do OSRM. Configuravel para o dia em que o demo publico bloquear ou sair
+# do ar: apontar para uma instancia propria vira preencher uma variavel no
+# Railway e reiniciar, em vez de um commit e um deploy feitos as pressas.
+#
+# O demo publico e a politica dele -- 1 req/s, nao comercial, "nao recomendado
+# para producao" -- sao o padrao apenas enquanto nao ha instancia propria. Uma
+# instancia auto-hospedada fala a MESMA API, entao esta linha e a unica coisa
+# que muda: /route e /table continuam identicos, e nada mais no proxy precisa
+# ser tocado. Foi por isso que se manteve OSRM em vez de trocar de motor.
+OSRM_BASE = os.getenv("OSRM_BASE", "https://router.project-osrm.org").rstrip("/")
 
 # 1 req/s e a politica; a folga de 5% cobre a imprecisao do relogio.
 _OSRM_INTERVALO = 1.05
