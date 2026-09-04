@@ -27,6 +27,14 @@ ETAPAS_FUNIL_ORDEM = [
 # gravado com a grafia antiga desapareça do funil.
 SINONIMOS_ETAPA = {"Ganho": "Fechado", "Cliente": "Fechado"}
 
+# Todas as grafias que significam "negocio ganho", para uso em SQL.
+#
+# Existe porque `/gerencia/dashboard` contava `status = 'Ganho'` enquanto o app
+# grava `Fechado` — o card "Ganhos" da tela /equipe mostrou zero desde sempre.
+# Com a lista num lugar so, as consultas nao voltam a divergir do que o app
+# escreve. `Fechado` vem primeiro: e a unica grafia que o codigo atual produz.
+STATUS_GANHO = ["Fechado", "Ganho", "Cliente"]
+
 POSICAO_ETAPA = {nome: i for i, nome in enumerate(ETAPAS_FUNIL_ORDEM)}
 SAIDA_PERDIDO = "Perdido"
 

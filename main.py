@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, date, timezone
 
-from funil import agregar_funil, janela_meses
+from funil import STATUS_GANHO, agregar_funil, janela_meses
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -6652,13 +6652,17 @@ def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
         trecho, params = filtro_escopo(conn, auth)
         ids = escopo_vendedores(conn, auth)
         filtro_usuarios = "" if ids is None else "AND u.usuario_id = ANY(CAST(:vids AS uuid[]))"
+        # O app grava `Fechado`; estas consultas comparavam com `Ganho` e por
+        # isso os dois contadores de "ganhos" devolviam zero desde sempre. A
+        # lista vive em funil.py para as duas nao voltarem a divergir.
+        params["ganhos"] = STATUS_GANHO
 
         totais = conn.execute(
             text(
                 f"""
                 SELECT
                     COUNT(*) AS total_empresas,
-                    COUNT(*) FILTER (WHERE status = 'Ganho') AS ganhos,
+                    COUNT(*) FILTER (WHERE status = ANY(CAST(:ganhos AS text[]))) AS ganhos,
                     COUNT(*) FILTER (WHERE status = 'Perdido') AS perdidos,
                     COUNT(*) FILTER (WHERE status_cadastro = 'rascunho') AS rascunhos
                 FROM empresas WHERE conta_id = :cid {trecho}
@@ -6701,7 +6705,7 @@ def dashboard_gerente(auth: dict = Depends(exigir_gestor)):
                 f"""
                 SELECT u.usuario_id, u.nome, u.email, u.ativo, u.supervisor_id,
                        COUNT(e.empresa_id) AS total_empresas,
-                       COUNT(e.empresa_id) FILTER (WHERE e.status = 'Ganho') AS ganhos,
+                       COUNT(e.empresa_id) FILTER (WHERE e.status = ANY(CAST(:ganhos AS text[]))) AS ganhos,
                        COUNT(e.empresa_id) FILTER (WHERE e.status = 'Perdido') AS perdidos,
                        COUNT(e.empresa_id) FILTER (WHERE e.status_cadastro = 'rascunho') AS rascunhos,
                        COALESCE((

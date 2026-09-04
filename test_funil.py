@@ -15,7 +15,7 @@ nunca executou.
 from collections import namedtuple
 from datetime import datetime
 
-from funil import agregar_funil, janela_meses, mediana, normalizar_etapa
+from funil import STATUS_GANHO, agregar_funil, janela_meses, mediana, normalizar_etapa
 
 Linha = namedtuple("Linha", "empresa_id status_anterior status_novo alterado_em")
 
@@ -63,6 +63,15 @@ checar("dezembro não estoura para o mês 13", ini == datetime(2026, 12, 1) and 
 print("\nnormalizar_etapa")
 
 checar("grafia legada 'Ganho' vira 'Fechado'", normalizar_etapa("Ganho") == "Fechado")
+# STATUS_GANHO alimenta o SQL de /gerencia/dashboard e SINONIMOS_ETAPA alimenta
+# o funil. Se as duas listas divergirem, o card "Ganhos" volta a contar um
+# conjunto diferente do que o funil considera fechado — que é exatamente o bug
+# que existia (o SQL procurava 'Ganho', o app grava 'Fechado').
+checar("toda grafia de STATUS_GANHO normaliza para 'Fechado'",
+       all(normalizar_etapa(g) == "Fechado" for g in STATUS_GANHO),
+       f"({[ (g, normalizar_etapa(g)) for g in STATUS_GANHO ]})")
+checar("'Fechado' — a grafia que o app realmente grava — está na lista",
+       "Fechado" in STATUS_GANHO)
 checar("'Perdido' não é etapa do funil", normalizar_etapa("Perdido") is None)
 checar("'Rascunho' não é etapa do funil", normalizar_etapa("Rascunho") is None)
 checar("None não quebra", normalizar_etapa(None) is None)
