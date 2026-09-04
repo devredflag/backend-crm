@@ -5547,6 +5547,256 @@ async def buscar_endereco(q: str = "", auth: dict = Depends(get_auth)):
         return {"achado": False, "lat": None, "lon": None, "endereco": None}
 
 
+
+
+# =========================================================================
+# PROXY DO OSRM -- rota e matriz de distancias para o planejador de rota
+# =========================================================================
+#
+# Por que passar pelo backend em vez de chamar o OSRM do navegador (que e como
+# isso nasceu): o demo publico do OSRM pede no maximo 1 req/s e bloqueia por
+# ENDERECO IP, nao por aba nem por tela. Throttle no cliente nao e garantia
+# nenhuma -- duas abas abertas ja sao 2 req/s, e o planejador dispara rajada.
+# Com tudo saindo daqui existe uma torneira so, e ela e de verdade.
+#
+# Mesmo padrao do /geo/buscar (Nominatim), com tres diferencas:
+#   - a fila reserva o horario e dorme FORA da trava, senao uma requisicao
+#     lenta seguraria todas as outras enquanto espera resposta do OSRM;
+#   - ha teto de espera: com fila grande, negar rapido e melhor que deixar o
+#     usuario olhando para um spinner por meio minuto;
+#   - ha cache, porque rua nao muda de lugar e o planejador repete muito a
+#     mesma consulta (mexer no raio, tirar e repor a mesma parada).
+
+OSRM_BASE = "https://router.project-osrm.org"
+
+# 1 req/s e a politica; a folga de 5% cobre a imprecisao do relogio.
+_OSRM_INTERVALO = 1.05
+# Horario (relogio monotonico) em que a proxima chamada pode sair.
+_osrm_proxima_vaga = 0.0
+_osrm_trava = asyncio.Lock()
+
+# Acima disto a fila ja esta tao longa que a resposta chegaria tarde demais
+# para ser util. 8s ~= 8 pedidos enfileirados.
+_OSRM_ESPERA_MAXIMA = 8.0
+
+# Teto do proprio OSRM demo, medido contra o servidor: 100 coordenadas passam,
+# 120 voltam code TooBig. O frontend ja corta antes, mas quem publica a rota
+# nao pode confiar em validacao que mora no cliente.
+OSRM_MAX_COORD_MATRIZ = 100
+# Rota desenhada: origem + 5 paradas + destino = 7. O teto folgado cobre a
+# previa do hover sem virar porta para pedido absurdo.
+OSRM_MAX_COORD_ROTA = 25
+
+# Cache em memoria do processo. Geometria de rua nao muda em horas, entao TTL
+# longo. O limite de tamanho existe para isto nao virar vazamento de memoria
+# num processo que fica semanas de pe.
+_OSRM_CACHE_TTL = 6 * 3600
+_OSRM_CACHE_MAX = 400
+_osrm_cache = {}
+
+
+def _osrm_cache_ler(chave: str):
+    item = _osrm_cache.get(chave)
+    if not item:
+        return None
+    nascido, valor = item
+    if time.monotonic() - nascido > _OSRM_CACHE_TTL:
+        _osrm_cache.pop(chave, None)
+        return None
+    return valor
+
+
+def _osrm_cache_gravar(chave: str, valor: dict) -> None:
+    # Descarte burro (os mais antigos pela ordem de insercao do dict) em vez de
+    # LRU: com 400 entradas e um punhado de vendedores, LRU seria complexidade
+    # sem ganho observavel.
+    if len(_osrm_cache) >= _OSRM_CACHE_MAX:
+        for velho in list(_osrm_cache)[: _OSRM_CACHE_MAX // 4]:
+            _osrm_cache.pop(velho, None)
+    _osrm_cache[chave] = (time.monotonic(), valor)
+
+
+async def _osrm_aguardar_vez() -> None:
+    """Segura a chamada ate a vaga dela na fila de 1 req/s.
+
+    A vaga e reservada dentro da trava e o sono acontece fora: manter a trava
+    durante o sleep serializaria as ESPERAS, e ai N pedidos custariam
+    N*intervalo de latencia acumulada em vez de se distribuirem no tempo.
+    """
+    global _osrm_proxima_vaga
+    async with _osrm_trava:
+        agora = time.monotonic()
+        vaga = max(agora, _osrm_proxima_vaga)
+        espera = vaga - agora
+        if espera > _OSRM_ESPERA_MAXIMA:
+            raise HTTPException(503, "Servico de rotas congestionado. Tente de novo em instantes.")
+        _osrm_proxima_vaga = vaga + _OSRM_INTERVALO
+    if espera > 0:
+        await asyncio.sleep(espera)
+
+
+def _osrm_pontos(bruto: str, maximo: int):
+    """Converte "lng,lat;lng,lat;..." em lista validada. Formato ruim e 400.
+
+    Validar aqui nao e paranoia com o nosso proprio frontend: e o que impede a
+    rota de virar repassadora de string arbitraria para dentro da URL do OSRM.
+    """
+    pontos = []
+    for parte in (bruto or "").split(";"):
+        parte = parte.strip()
+        if not parte:
+            continue
+        pedacos = parte.split(",")
+        if len(pedacos) != 2:
+            raise HTTPException(400, "Ponto invalido: use lng,lat")
+        try:
+            lng, lat = float(pedacos[0]), float(pedacos[1])
+        except ValueError:
+            raise HTTPException(400, "Coordenada nao numerica")
+        if not (-180 <= lng <= 180) or not (-90 <= lat <= 90):
+            raise HTTPException(400, "Coordenada fora do intervalo valido")
+        pontos.append((lng, lat))
+    if len(pontos) < 2:
+        raise HTTPException(400, "Sao necessarios ao menos dois pontos")
+    if len(pontos) > maximo:
+        raise HTTPException(400, f"No maximo {maximo} pontos por chamada")
+    return pontos
+
+
+def _osrm_chave(pontos, sufixo: str) -> str:
+    # 5 casas ~= 1 metro. Arredondar e o que faz o cache acertar: a mesma
+    # empresa clicada duas vezes traz float identico, mas GPS e hover trazem
+    # ruido nas ultimas casas, que geraria chave nova a cada passada.
+    return sufixo + "|" + ";".join(f"{lng:.5f},{lat:.5f}" for lng, lat in pontos)
+
+
+async def _osrm_get(caminho: str, params: dict) -> dict:
+    """Chamada crua ao OSRM, ja enfileirada. Levanta HTTPException em falha.
+
+    IMPORTANTE: nada aqui pode escapar como excecao nao tratada. Um 500 do
+    FastAPI sai SEM os cabecalhos de CORS, e o navegador reporta isso como erro
+    de CORS -- mandando quem for depurar para o middleware errado.
+    """
+    await _osrm_aguardar_vez()
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(f"{OSRM_BASE}{caminho}", params=params)
+    except Exception as e:  # noqa: BLE001 - servidor publico sem SLA
+        print(f"[OSRM] falha de rede em {caminho}: {e}")
+        raise HTTPException(502, "Servico de rotas indisponivel no momento")
+
+    if resp.status_code != 200:
+        print(f"[OSRM] status {resp.status_code} em {caminho}")
+        # 429 do OSRM significa que a nossa fila nao foi suficiente. Log
+        # separado porque e o sintoma de que o processo deixou de ser unico.
+        if resp.status_code == 429:
+            print("[OSRM] ATENCAO: 429 mesmo com fila local. Ha mais de um worker saindo por este IP?")
+        raise HTTPException(502, "Servico de rotas indisponivel no momento")
+
+    try:
+        dados = resp.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(502, "Resposta invalida do servico de rotas")
+
+    if dados.get("code") != "Ok":
+        # NoRoute e resposta legitima (ilha, ponto no meio do mar), nao falha de
+        # infraestrutura: 422 para o frontend distinguir e nao oferecer "tentar
+        # de novo" para algo que nunca vai dar certo.
+        if dados.get("code") in ("NoRoute", "NoSegment", "NoTable"):
+            raise HTTPException(422, "Nao ha rota por ruas entre estes pontos")
+        print(f"[OSRM] code={dados.get('code')} em {caminho}")
+        raise HTTPException(502, "Servico de rotas indisponivel no momento")
+    return dados
+
+
+@app.get("/geo/rota")
+async def geo_rota(
+    pontos: str = "",
+    overview: str = "full",
+    _email: str = Depends(get_current_user),
+):
+    """Rota viaria passando pelos pontos na ordem dada.
+
+    Devolve a geometria ja em [lat, lng] -- ordem do Leaflet, inversa a do
+    GeoJSON que o OSRM manda. A conversao mora aqui para o cache guardar o
+    formato final e nao repetir a transformacao a cada consumidor.
+
+    Autenticacao por `get_current_user` (so o JWT) e nao por `get_auth`: esta
+    rota nao filtra dado de carteira nenhum, e `get_auth` custa uma ida ao banco
+    que se pagaria a cada traco de rota desenhado.
+    """
+    if overview not in ("full", "simplified", "false"):
+        raise HTTPException(400, "overview invalido")
+    lista = _osrm_pontos(pontos, OSRM_MAX_COORD_ROTA)
+
+    chave = _osrm_chave(lista, f"rota:{overview}")
+    em_cache = _osrm_cache_ler(chave)
+    if em_cache is not None:
+        return em_cache
+
+    caminho = "/route/v1/driving/" + ";".join(f"{lng},{lat}" for lng, lat in lista)
+    dados = await _osrm_get(caminho, {"overview": overview, "geometries": "geojson"})
+
+    rotas = dados.get("routes") or []
+    if not rotas:
+        raise HTTPException(422, "Nao ha rota por ruas entre estes pontos")
+    r = rotas[0]
+    resultado = {
+        "coords": [[c[1], c[0]] for c in (r.get("geometry") or {}).get("coordinates", [])],
+        "km": (r.get("distance") or 0) / 1000.0,
+        "min": (r.get("duration") or 0) / 60.0,
+    }
+    _osrm_cache_gravar(chave, resultado)
+    return resultado
+
+
+@app.get("/geo/matriz")
+async def geo_matriz(
+    pontos: str = "",
+    _email: str = Depends(get_current_user),
+):
+    """Matriz de distancia/tempo entre todos os pontos, numa chamada so.
+
+    E o que substitui o padrao antigo do planejador: uma chamada de /route por
+    candidato (ate 12 em rajada) so para descobrir o custo do desvio de cada um.
+    Com a matriz, o desvio de qualquer candidato -- e de qualquer posicao de
+    insercao dele na rota -- sai de aritmetica local, sem tocar a rede de novo.
+
+    `distancias_km[i][j]` e a distancia de i ate j. Nao e simetrica: mao unica
+    faz a ida diferir da volta.
+    """
+    lista = _osrm_pontos(pontos, OSRM_MAX_COORD_MATRIZ)
+
+    chave = _osrm_chave(lista, "matriz")
+    em_cache = _osrm_cache_ler(chave)
+    if em_cache is not None:
+        return em_cache
+
+    caminho = "/table/v1/driving/" + ";".join(f"{lng},{lat}" for lng, lat in lista)
+    dados = await _osrm_get(caminho, {"annotations": "distance,duration"})
+
+    distancias = dados.get("distances") or []
+    duracoes = dados.get("durations") or []
+    if not distancias or not duracoes:
+        raise HTTPException(502, "Matriz incompleta do servico de rotas")
+
+    # None aparece quando o OSRM nao acha caminho entre um par especifico. Vira
+    # None no JSON tambem, e nao 0: zero seria lido como "coladinho" e o
+    # candidato inalcancavel apareceria como o melhor de todos.
+    def _km(v):
+        return None if v is None else v / 1000.0
+
+    def _minutos(v):
+        return None if v is None else v / 60.0
+
+    resultado = {
+        "distancias_km": [[_km(v) for v in linha] for linha in distancias],
+        "duracoes_min": [[_minutos(v) for v in linha] for linha in duracoes],
+    }
+    _osrm_cache_gravar(chave, resultado)
+    return resultado
+
+
 @app.post("/empresas/geocodificar")
 async def geocodificar_empresas(limite: int = 15, usuario_email: str = Depends(get_current_user)):
     """Backfill de coordenadas (custo zero) via Nominatim/OpenStreetMap a partir do
