@@ -9,6 +9,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, date, timezone
+
+from funil import agregar_funil, janela_meses
 from typing import Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -5321,6 +5323,127 @@ def historico_status_empresa(empresa_id: str, auth: dict = Depends(get_auth)):
             {"id": empresa_id},
         )
         return [dict(row._mapping) for row in result]
+
+
+@app.get("/funil/transicoes")
+def funil_transicoes(
+    meses: int = 6,
+    vendedor_id: str | None = None,
+    segmento: str | None = None,
+    auth: dict = Depends(exigir_gestor),
+):
+    """Taxa de passagem entre as etapas do funil, por coorte de entrada.
+
+    ── Por que esta rota existe ────────────────────────────────────────────────
+    A tela de Insights media desfecho (fechou/perdeu) e o retrato do funil hoje,
+    mas nao a PASSAGEM: "quanto de Lead vira Proposta". O dado sempre esteve em
+    `empresa_status_historico`; faltava le-lo em lote. `GET
+    /empresas/{id}/historico-status` serve uma empresa so, e a tela precisaria de
+    uma chamada por empresa da carteira.
+
+    A agregacao mora em `funil.py`, sem banco e sem FastAPI, para poder ser
+    testada (`python test_funil.py`) — este processo recusa subir contra
+    producao fora do Railway e o `.env.dev` esta sem banco, entao logica de
+    coorte escrita aqui dentro seria inverificavel. Esta funcao so faz o SQL.
+
+    ── O que o historico NAO cobre ────────────────────────────────────────────
+    `POST /empresas` grava a linha inicial (`status_anterior` NULL) e o `PUT`
+    grava toda mudanca. Mas:
+
+    - **`POST /empresas/rascunho` NAO grava historico** — de proposito: rascunho
+      esta fora do funil ate alguem completar. A empresa entra na contagem na
+      transicao `Rascunho -> Lead`, que e o momento certo.
+    - Empresa cadastrada antes de o historico existir nao tem linha nenhuma e e
+      invisivel aqui. `cobertura.sem_historico` diz quantas sao, para a tela
+      avisar em vez de apresentar uma taxa sobre metade da base como se fosse
+      sobre a base inteira.
+    """
+    meses = max(1, min(int(meses or 6), 24))
+    inicio, fim = janela_meses(meses)
+
+    with engine.begin() as conn:
+        garantir_campos_pipeline(conn)
+        trecho, params = filtro_escopo(conn, auth, prefixo="e.")
+
+        # Os mesmos recortes da barra de filtro da tela. Vem DEPOIS do escopo e
+        # so estreita o que ele ja permitiu: `filtro_escopo` continua sendo a
+        # unica coisa que decide o que este usuario pode ver, e um vendedor_id
+        # de fora do escopo devolve lista vazia, nao dado de outra equipe.
+        if vendedor_id:
+            trecho += " AND e.vendedor_id = CAST(:vend AS uuid)"
+            params["vend"] = vendedor_id
+        if segmento:
+            trecho += " AND COALESCE(NULLIF(TRIM(e.segmento), ''), :sem_seg) = :seg"
+            params["seg"] = segmento
+            # Espelha o rotulo que o frontend usa para empresa sem segmento
+            # (`segmentosDisponiveis` em utils/metricas.ts); sem isso, filtrar
+            # por "Nao informado" na tela nao casaria com nada aqui.
+            params["sem_seg"] = "Não informado"
+
+        # Denominador honesto: quantas empresas do escopo existem e de quantas
+        # da para contar a historia. Rascunho fica fora das duas contas — ele
+        # ainda nao entrou no funil, entao nao e "cobertura faltando".
+        cobertura = conn.execute(
+            text(
+                f"""
+                SELECT COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE EXISTS (
+                           SELECT 1 FROM empresa_status_historico h
+                           WHERE h.empresa_id = e.empresa_id
+                       )) AS com_historico
+                FROM empresas e
+                WHERE e.conta_id = :cid AND COALESCE(e.status, '') <> 'Rascunho' {trecho}
+            """
+            ),
+            params,
+        ).fetchone()
+
+        primeiro = conn.execute(
+            text(
+                f"""
+                SELECT MIN(h.alterado_em)
+                FROM empresa_status_historico h
+                JOIN empresas e ON e.empresa_id = h.empresa_id
+                WHERE e.conta_id = :cid {trecho}
+            """
+            ),
+            params,
+        ).scalar()
+
+        # Uma linha por mudanca de status. O volume e da ordem de
+        # (empresas x mudancas) e a agregacao e feita em Python de proposito: a
+        # logica de coorte tem condicoes temporais encadeadas que em SQL virariam
+        # tres window functions aninhadas — ilegiveis, piores de depurar e sem
+        # ganho nenhum nesta escala.
+        linhas = conn.execute(
+            text(
+                f"""
+                SELECT h.empresa_id, h.status_anterior, h.status_novo, h.alterado_em
+                FROM empresa_status_historico h
+                JOIN empresas e ON e.empresa_id = h.empresa_id
+                WHERE e.conta_id = :cid {trecho}
+                ORDER BY h.empresa_id, h.alterado_em ASC
+            """
+            ),
+            params,
+        ).fetchall()
+
+    resultado = agregar_funil(linhas, inicio, fim)
+    total = cobertura.total or 0
+    com_hist = cobertura.com_historico or 0
+    resultado["janela"] = {"inicio": inicio.isoformat(), "fim": fim.isoformat(), "meses": meses}
+    resultado["cobertura"] = {
+        "empresas_no_escopo": total,
+        "com_historico": com_hist,
+        # O numero que a tela precisa mostrar junto da taxa: empresa cadastrada
+        # antes de o historico existir nao aparece em etapa nenhuma, e uma taxa
+        # sobre metade da base apresentada como se fosse sobre a base inteira e
+        # pior do que nao ter a taxa.
+        "sem_historico": max(total - com_hist, 0),
+        "na_coorte": resultado["coorte"]["entraram"],
+        "primeiro_registro": primeiro.isoformat() if primeiro else None,
+    }
+    return resultado
 
 
 @app.get("/empresas/{empresa_id}/contatos")
