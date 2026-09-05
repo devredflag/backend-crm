@@ -6392,7 +6392,14 @@ def listar_usuarios(auth: dict = Depends(exigir_gestor)):
     """Lista de usuários com função, status, supervisor e resumo da carteira.
 
     Gerente vê a conta inteira. Supervisor vê apenas ele mesmo e os vendedores
-    atribuídos a ele — nunca os vendedores de outro supervisor."""
+    atribuídos a ele — nunca os vendedores de outro supervisor.
+
+    `convite_pendente` separa dois estados que `ativo = false` juntava num só:
+    quem nunca criou a senha (convite no ar) e quem o gerente desativou. Os dois
+    apareciam iguais na tela de Equipe, e a ação certa para cada um é oposta —
+    reenviar convite para o primeiro, reativar para o segundo. A pergunta é
+    sempre `senha_hash IS NULL`: ativar a conta é justamente o passo que grava a
+    senha, então quem não tem senha nunca passou por ele."""
     with engine.connect() as conn:
         ids = escopo_vendedores(conn, auth)
         filtro = "" if ids is None else "AND u.usuario_id = ANY(CAST(:ids AS uuid[]))"
@@ -6404,13 +6411,14 @@ def listar_usuarios(auth: dict = Depends(exigir_gestor)):
                 f"""
                 SELECT u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo, u.data_criacao,
                        u.supervisor_id, s.nome AS supervisor_nome,
+                       (u.senha_hash IS NULL) AS convite_pendente,
                        COUNT(e.empresa_id) AS total_empresas
                 FROM usuarios u
                 LEFT JOIN usuarios s ON s.usuario_id = u.supervisor_id
                 LEFT JOIN empresas e ON e.vendedor_id = u.usuario_id
                 WHERE u.conta_id = :cid {filtro}
                 GROUP BY u.usuario_id, u.nome, u.email, u.telefone, u.role, u.ativo,
-                         u.data_criacao, u.supervisor_id, s.nome
+                         u.data_criacao, u.supervisor_id, s.nome, u.senha_hash
                 ORDER BY u.role DESC, u.nome ASC
             """
             ),
@@ -6534,17 +6542,32 @@ async def reenviar_convite(usuario_id: str, auth: dict = Depends(exigir_gerente)
 
     Serve para o caso em que o usuário foi criado mas o email não saiu: em vez
     de apagar e recadastrar (que esbarra em "Email já cadastrado"), o gerente
-    reenvia. Só vale para quem ainda não ativou a conta — quem já tem senha não
-    precisa de convite."""
+    reenvia. Só vale para quem NUNCA criou a senha.
+
+    ⚠️ A guarda é `senha_hash IS NULL`, e não `ativo = false`. Quem já ativou e
+    depois foi DESATIVADO pelo gerente também tem `ativo = false`, e para esse a
+    rota gerava um token novo — que `/ativar-conta` troca por senha nova e
+    `ativo = TRUE`. Ou seja: o botão "reenviar convite" desfazia a desativação
+    pelas costas de quem a fez, e ainda por cima devolvia o acesso com uma senha
+    escolhida por quem recebeu o link. Devolver acesso é `PATCH /usuarios/{id}`
+    com `ativo = true`, que é explícito e fica no log de auditoria como tal."""
     with engine.begin() as conn:
         alvo = conn.execute(
-            text("SELECT usuario_id, nome, email, conta_id, ativo FROM usuarios WHERE usuario_id = :id"),
+            text(
+                """SELECT usuario_id, nome, email, conta_id, ativo,
+                          (senha_hash IS NULL) AS convite_pendente
+                   FROM usuarios WHERE usuario_id = :id"""
+            ),
             {"id": usuario_id},
         ).fetchone()
         if not alvo or str(alvo.conta_id) != auth["conta_id"]:
             raise HTTPException(404, "Usuário não encontrado")
-        if alvo.ativo:
-            raise HTTPException(400, "Este usuário já ativou a conta e não precisa de convite")
+        if not alvo.convite_pendente:
+            raise HTTPException(
+                400,
+                "Este usuário já criou a senha. Para devolver o acesso, use Reativar — "
+                "reenviar convite trocaria a senha dele.",
+            )
         token_novo = str(uuid.uuid4())
         conn.execute(
             text("UPDATE usuarios SET token_ativacao = :t WHERE usuario_id = :id"),
